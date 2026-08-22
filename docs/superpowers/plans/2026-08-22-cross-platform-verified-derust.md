@@ -522,6 +522,16 @@ In `tools/extract_bun.py` add the PE magic constant beside the others:
 PE_MAGIC = b"MZ"
 ```
 
+Two stale claims live in this same file and must be corrected here, because
+Task 9's staleness grep looks only for "never executed" / "not yet runnable" /
+"NEVER EXECUTED" / "SCAFFOLD" and would not catch either one:
+
+- the module docstring's "This tool implements the Mach-O (64-bit
+  little-endian) case." — it now implements Mach-O and ELF, and refuses PE.
+  Rewrite that sentence accordingly.
+- the fallback `die()` message's "(only 64-bit little-endian Mach-O ported)" —
+  replace with "(supported: 64-bit little-endian Mach-O and ELF)".
+
 Add the PE branch at the top of `find_bun_section`, before the u32 unpack:
 
 ```python
@@ -532,7 +542,12 @@ def find_bun_section(buf):
             "       JS needs a Windows Bun; see docs/status.md. Only Mach-O and ELF\n"
             "       are supported.")
     magic = struct.unpack_from("<I", buf, 0)[0]
-    ...
+    if magic == MH_MAGIC_64:
+        return find_bun_section_macho(buf)
+    if magic == ELF_MAGIC_LE:
+        return find_bun_section_elf(buf)
+    die(f"unrecognized magic 0x{magic:08x} "
+        f"(supported: 64-bit little-endian Mach-O and ELF)")
 ```
 
 Extract the payload parsing out of `main` into a reusable function:
