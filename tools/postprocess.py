@@ -3,24 +3,17 @@
 postprocess.py - turn an extracted Bun standalone entry module (cli.original.js)
 into a CommonJS file a stock external Bun can require and run.
 
-╔══════════════════════════════════════════════════════════════════════════╗
-║ 🟡 SCAFFOLD / BACKBONE — NEVER EXECUTED. Do not trust; complete & verify.  ║
-║ The transforms below are ported from ClawGod's post-process.mjs and are    ║
-║ plausible, but this file has not been run against any binary. Every regex  ║
-║ targets MINIFIED code that changes each release and is a hypothesis, not   ║
-║ a contract. See docs/status.md work item #2 for how to verify each         ║
-║ transform and how to fix it when a count comes back 0.                     ║
-╚══════════════════════════════════════════════════════════════════════════╝
-
 What it does (see docs/findings.md §6):
   1. Strip the leading `// @bun ...` pragma comment lines so the file starts
      with `(function` — Bun's CJS loader requires that.
-  2. Rewrite  require('/$bunfs/root/X.node')  →  a require() of the extracted
-     assets/X.node on real disk.
+  2. Rewrite every `/$bunfs/root/<name>` string literal — whether it appears
+     inside a `require(...)` call (native .node addons) or as a bare string
+     constant later read via `fs/promises.readFile` (file-loader assets like
+     chart.umd.min.js) — to a `require('path').join(__dirname,'assets',...)`
+     expression pointing at the extracted assets/ directory on real disk.
   3. Rewrite build-time fileURLToPath()/import.meta.url leaks to __filename.
   4. Append the CJS IIFE invocation so require()-ing the file actually runs it.
-  5. Report any leftover /$bunfs/ references (file-loader assets that may still
-     need a rewrite for that feature to work).
+  5. Report any leftover /$bunfs/ references (should be none after step 2).
 
 Usage:
   ./postprocess.py <extract-dir>
@@ -28,9 +21,35 @@ Usage:
       cli.original.js and an assets/ directory. Writes cli.original.cjs beside it.
 """
 
+import json
 import os
 import re
 import sys
+
+# A /$bunfs/root/<name> string literal. This single pattern covers BOTH shapes
+# observed in the real minified cli.js (see docs/findings.md §6):
+#   require("/$bunfs/root/image-processor.node")   -> native addon
+#   var _qo="/$bunfs/root/chart.umd.min.js"        -> file asset read via
+#                                                     fs/promises.readFile
+# The .node case simply becomes a dynamic require of an absolute path.
+BUNFS_LITERAL = re.compile(r"""(['"])/\$bunfs/root/([\w.\-]+)\1""")
+LEFTOVER_BUNFS = re.compile(r"/\$bunfs/root/[\w.\-]*")
+
+
+def _asset_expr(match):
+    name = match.group(2)
+    return "require('path').join(__dirname,'assets'," + json.dumps(name) + ")"
+
+
+def transform(code):
+    """Pure text transform. Returns (new_code, counts)."""
+    counts = {}
+    code, counts["pragma"] = re.subn(r"^(?:\/\/[^\n]*\n)+", "", code, count=1)
+    code, counts["assets"] = BUNFS_LITERAL.subn(_asset_expr, code)
+    counts["file_urls"] = 0
+    counts["iife"] = 0
+    counts["leftovers"] = sorted(set(LEFTOVER_BUNFS.findall(code)))
+    return code, counts
 
 
 def die(msg):
