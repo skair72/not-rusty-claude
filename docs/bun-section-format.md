@@ -188,19 +188,44 @@ module record (52 bytes):
   `/$bunfs/root/src/entrypoints/cli.js` on linux-x64 2.1.222
   ([findings.md](./findings.md) §4).
 
-### Loader enum
+### Loader enum ✅
+
+Bun's own table, transcribed from
+[`src/bundler/options.zig`](https://raw.githubusercontent.com/oven-sh/bun/bun-v1.3.14/src/bundler/options.zig)
+at tag `bun-v1.3.14` (`pub const Loader = enum(u8)`, lines 568-589):
 
 ```
-0 jsx   1 js    2 ts    3 tsx   4 css    5 file   6 json    7 toml
-8 wasm  9 napi  10 base64  11 dataurl  12 text  13 bunsh  14 sqlite
+ 0 jsx    1 js      2 ts      3 tsx     4 css     5 file    6 json
+ 7 jsonc  8 toml    9 wasm   10 napi   11 base64 12 dataurl 13 text
+14 bunsh 15 sqlite 16 sqlite_embedded 17 html 18 yaml 19 json5 20 md
 ```
 
-**Critical:** the **content is always the raw stored bytes**. The loader id
-tells Bun how to *present* the module to JS at runtime — e.g. `base64` means
-"expose this asset to JS as a base64 string" — it does **not** mean the stored
-bytes are base64-encoded. Native `.node` addons on current Claude builds use the
-`base64` loader but are stored as raw Mach-O (macOS) or raw ELF (Linux).
-**Do not decode.** (See [findings.md](./findings.md) §5a.)
+> **This table was wrong here until 2026-08-22, and the error was consequential.**
+> An earlier revision omitted `jsonc = 7`, which shifts every id from 7 upward
+> down by one. Under that table the `.node` addons — which carry raw loader
+> **byte 10** — read as `base64` instead of `napi`, and a whole (false) story
+> about a "`base64` loader that stores raw bytes" was written to rationalise
+> it. See [findings.md](./findings.md) §5a for the post-mortem. Transcribe this
+> from Bun's source, not from another extractor.
+
+**Measured** ✅ — the raw loader byte at record offset 49, read by a
+standalone parser (not this repo's tools) on both shipped binaries:
+
+| Binary | Bytes present | Which modules |
+|---|---|---|
+| `linux-x64` 2.1.222 | `1`, `5`, `10` | entry + 2 shims = `js`; 3 assets = `file`; **both `.node` addons = `napi`** |
+| `darwin-arm64` 2.1.239 | `1`, `5`, `10` | entry + 5 shims = `js`; 4 assets = `file`; **all 5 `.node` addons = `napi`** |
+
+Neither binary contains byte 9 (`wasm`) or byte 11 (a genuine `base64`
+module).
+
+**Critical, and independent of the enum:** the **content is always the raw
+stored bytes**. The loader id tells Bun how to *present* the module to JS at
+runtime — `base64` would mean "expose this asset to JS as a base64 string" — it
+never means the stored bytes are base64-encoded. That holds for every loader,
+including a real `base64` one: **do not decode.** The `.node` addons are stored
+as raw Mach-O (macOS) or raw ELF (Linux) because *all* stored content is raw,
+not because of anything specific to their loader.
 
 ---
 
@@ -218,6 +243,14 @@ the final path component (e.g. `/$bunfs/root/image-processor.node` →
 
 Driving this off the loader id — rather than a filename list — is what makes the
 same code work across platforms whose module sets differ (8 vs 15 vs 9 modules).
+
+On the binaries measured here only `napi` and `file` actually fire; `base64`
+is in the set because a genuine `base64` module would also need writing out,
+and under the pre-2026-08-22 enum it would have been silently dropped.
+`wasm` deliberately is **not** in the set: no shipped binary contains one, so
+there is nothing measured to write, and adding it would be a guess. If a
+`.wasm` module ever appears, the rewritten JS will reference an asset the
+extractor did not write — see [status.md](./status.md) § Remaining work.
 
 ---
 

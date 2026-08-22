@@ -7,9 +7,17 @@ ever *read*: not modified, not re-signed, not executed by this pipeline.
 
 > **Why.** Claude Code ships as a Bun *standalone* executable — runtime and app
 > baked into one signed binary (Mach-O on macOS, ELF on Linux, PE on Windows).
-> Bun is being rewritten from Zig to Rust; 1.3.14 is the last Zig release. You
-> cannot swap the embedded runtime, so instead we extract `cli.js` + assets and
-> run them on an external Zig Bun.
+> Bun is being rewritten from Zig to Rust; **1.3.14 is the last Zig release**.
+> You cannot swap the embedded runtime, so instead we extract `cli.js` + assets
+> and run them on an **external** Bun — and choose the Zig one.
+>
+> Two precisions, because this repo's rule is that claims trace to
+> measurements. *Pre-Rust* describes the **rewrite of Bun's core**, not the
+> binary: 1.3.14's `.comment` reads `rustc 1.94.0-nightly` and it links
+> vendored Rust crates (`lolhtml`, `cssparser`, `encoding_rs`, `selectors`).
+> And 1.3.14 is *sufficient*, not *necessary* — the same artifact also runs on
+> Bun 1.4.0, the Rust build. Running on Zig is the **point**, not a
+> constraint.
 
 ## Status — it works, on Linux, and here is exactly how far that goes
 
@@ -23,25 +31,43 @@ a command whose output is pasted in
 | Post-process (`postprocess.py`) | ✅ executed | ✅ executed | ⛔ |
 | `scripts/build.sh` end to end | ✅ executed | ✅ executed | ⛔ |
 | Output accepted by Bun 1.3.14's own parser | 🔎 exit 0 | 🔎 exit 0 | ⛔ |
-| **Runs under external Bun 1.3.14** | ✅ `--version`, `--help`, `mcp list` | 🖥️ needs a Mac | ⛔ would also need a Windows Bun |
-| Runtime asset loading | 🔎 unverified | 🔎 unverified | ⛔ |
+| **Runs under external Bun** | ✅ `doctor`, `mcp list`, `--help`, `--version` — on **1.3.14 *and* 1.4.0** | ✅ the JS boots under **Linux** Bun → `2.1.239 (Claude Code)` | ⛔ would also need a Windows Bun |
+| Runtime asset loading | ✅ `image-processor.node` loads and works — but the CLI never asks for it | 🖥️ Mach-O addons cannot load on Linux | ⛔ |
+| Behaves the same as the shipped binary | ⚠️ **no** — see the equivalence gap below | ⚠️ no | ⛔ |
 
 ✅ executed here · 🔎 static check only, nothing executed · 🖥️ needs hardware
-we do not have · ⛔ deliberately not implemented
+we do not have · ⚠️ measured difference from the native binary · ⛔ deliberately
+not implemented
 
 **The headline result:** the extracted, post-processed `cli.original.cjs` from
-the real Linux binary starts under vanilla Bun 1.3.14 and answers `--version`,
-`--help`, and `mcp list` — the last of which really reads and writes
-`.claude.json`. That is a positive answer, **for Claude Code 2.1.222, on Linux,
-on those code paths**, to the risk in
-[`docs/findings.md`](docs/findings.md) §10. It is a measurement, not a
-guarantee.
+the real Linux binary runs under vanilla Bun 1.3.14 and answers `doctor` and
+`mcp list` (which really read and write `.claude.json`), plus `--help` and
+`--version`. Driven by a **loopback mock** of the Messages API it also completes
+a full agentic loop — SSE streaming, multi-turn tool use, the Bash tool spawning
+a real subprocess — and renders the Ink TUI under a pty, with no Bun-API failure
+anywhere. That is a positive answer, **for Claude Code 2.1.222, on Linux**, to
+the risk in [`docs/findings.md`](docs/findings.md) §10. It is a measurement, not
+a guarantee.
 
-**What is honestly not known:** the macOS artifact has never been executed (that
-needs Apple hardware; emulation was evaluated and rejected here, with evidence).
-No executed command has ever loaded a runtime asset — proven, not assumed, by
-renaming `assets/` away and watching `--version` and `--help` still succeed. No
-network call, model request, TUI render, or tool execution has been exercised.
+> **Don't lead with `--version`.** It initialises **0 of the bundle's 6748 lazy
+> modules** — a hardcoded fast path. It proves the file parses and the CJS
+> wrapper is invoked, and nothing at all about Bun's API surface. `doctor` and
+> `mcp list` initialise ~2760.
+
+**⚠️ The equivalence gap — read this before using it.** `Bun.isStandaloneExecutable`
+is undefined outside a standalone, so the CLI takes its non-standalone branch in
+~21 places. Measured consequences: **native image processing is silently
+disabled** (a 3000×3000 PNG fails to resize as shipped, and returns a correct
+469,774-byte JPEG when the flag is forced true — the addon itself is fine), the
+**seccomp sandbox is off**, embedded ripgrep becomes a **system `rg`** (so `rg`
+is a de facto prerequisite), and install identity reports `unknown`. Both addon
+loaders swallow failure, so **exit 0 is not evidence that the asset wiring
+works**. Full detail: [`docs/findings.md`](docs/findings.md) §11.
+
+**What is honestly not known:** no request from this build has ever gone to
+Anthropic — the agentic loop above was a loopback mock. macOS-*specific*
+behaviour is unverified: the darwin JS boots here, but its `.node` addons are
+Mach-O and cannot load on Linux, and `process.platform` is `linux`.
 
 [`docs/status.md`](docs/status.md) is the full matrix, the Windows/PE picture,
 and the remaining work.
@@ -59,17 +85,26 @@ chmod +x "$HOME/.bun-1.3.14/bun"
 # 2. extract + post-process (installs nothing, writes nothing to the binary)
 BUN_BIN="$HOME/.bun-1.3.14/bun" scripts/build.sh /usr/bin/claude
 
-# 3. run it, by full path, with a scratch config dir
-CLAUDE_CONFIG_DIR="$(mktemp -d)" \
-  "$HOME/.bun-1.3.14/bun" build/extract/cli.original.cjs --version
-#   → 2.1.222 (Claude Code)
+# 3. run it, by full path, with a scratch config dir.
+#    DISABLE_AUTOUPDATER=1 is NOT optional - without it this build can try to
+#    install a different, npm-based Claude Code onto your machine. See
+#    docs/runbook.md § Surviving Claude updates.
+DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \
+  "$HOME/.bun-1.3.14/bun" build/extract/cli.original.cjs mcp list
+#   → No MCP servers configured. Use `claude mcp add` to add a server.
 ```
 
 `build.sh` deliberately **installs nothing on `PATH`** — a file named `claude`
 there could shadow your real installation. It prints the full-path command
-instead. One consequence to know about: the old design's launcher exported
-`CLAUDE_CODE_EXECPATH`; see [`docs/runbook.md`](docs/runbook.md) § Shell
-integrations for when to set it yourself.
+instead. It also writes a one-line `cli.js` beside `cli.original.cjs`, because
+Claude's own code resolves a sibling `cli.js` for two MCP self-spawns.
+
+One consequence to know about: under a native install `process.execPath` *is*
+`claude`; here it is **bun**, and the CLI unconditionally exports
+`CLAUDE_CODE_EXECPATH=<bun>` into every shell it spawns. Setting that variable
+yourself does nothing — the CLI never reads it. See
+[`docs/runbook.md`](docs/runbook.md) § Shell integrations for what actually
+happens.
 
 Step-by-step, including the macOS path and troubleshooting:
 [`docs/runbook.md`](docs/runbook.md).
@@ -92,11 +127,12 @@ not-rusty-claude/
 ├── scripts/
 │   ├── build.sh                    extract → post-process → print the run command
 │   └── syntax-check.js             fast secondary syntax check (JSC, not Bun)
-└── tests/                          31 tests: hermetic fixtures + real-binary integration
+└── tests/                          43 tests: hermetic fixtures + real-binary integration
 ```
 
-Everything runs on stock `python3` (3.9+) with no dependencies. `python3 -m
-pytest tests/ -q` → 31 passed. The integration tests need the real binaries and
+The tools themselves need no third-party packages — stock `python3` (3.9+) is
+enough. Running the test suite additionally needs `pytest`: `python3 -m pytest
+tests/ -q` → 43 passed. The integration tests need the real binaries and
 skip cleanly without them; their hardcoded counts are a deliberate tripwire for
 the next Claude release (see [`docs/status.md`](docs/status.md)).
 
@@ -104,8 +140,10 @@ the next Claude release (see [`docs/status.md`](docs/status.md)).
 
 **A — Extract & run under Bun (this project's default).** No modification to the
 signed binary, so signing and notarization never enter the picture; the JS is
-plain text with no length limit. Needs an external Zig Bun. This is the
-"de-rust" path, and the one verified above.
+plain text with no length limit. Needs an **external Bun** — using the Zig
+1.3.14 is this project's deliberate choice, not a requirement of the artifact,
+which also runs on the Rust 1.4.0. This is the "de-rust" path, and the one
+verified above.
 
 **B — Byte-patch & re-sign** ([`tools/patch_claude.py`](tools/patch_claude.py)).
 Edit bytes inside the Mach-O (length-preserving) and ad-hoc re-sign with the
@@ -117,11 +155,16 @@ the JS layer. Details in [`docs/findings.md`](docs/findings.md) §7.
 ## The one risk to know
 
 Anthropic builds Claude with Bun's *canary* channel. For 2.1.222 that turned out
-fine — 1.3.14 ran it — but if a future Claude build uses Bun APIs newer than
-1.3.14, its `cli.js` will not run on Zig, and the only newer Bun is the Rust
-rewrite. That defeats the goal for that version. Watch for `Expected CommonJS
-module to have a function wrapper` and missing-API errors, keep the last working
-`build/extract/`, and pin that Claude version. Full discussion:
+fine — 1.3.14 ran it, with room to spare: the same entry module also runs on
+**1.3.13** in a pragma-preserving build shape, so the "Bun ≥ 1.3.14" floor is a
+property of *this project's transform*, not of Claude. But if a future Claude
+build uses Bun APIs newer than 1.3.14, its `cli.js` will not run on Zig, and the
+only newer Bun is the Rust rewrite. That defeats the goal for that version.
+
+The signal to watch for is a **missing-API error**. `Expected CommonJS module to
+have a function wrapper` is *not* a reliable canary — this project's own
+transform produces that exact panic when the pragma/IIFE shape is wrong. Keep
+the last working `build/extract/` and pin that Claude version. Full discussion:
 [`docs/findings.md`](docs/findings.md) §10.
 
 A related, cheaper surprise: nothing here is a constant across versions or
@@ -135,9 +178,13 @@ entry module's *name* differs — which is why extraction keys off
 [bun-demincer](https://github.com/vicnaum/bun-demincer),
 [unbuned](https://github.com/vibheksoni/unbuned),
 [bun-decompile](https://github.com/lafkpages/bun-decompile),
-[tweakcc](https://github.com/Piebald-AI/tweakcc). Comparison, and the two places
-ClawGod's transforms silently do nothing on current builds:
-[`docs/findings.md`](docs/findings.md) §8.
+[tweakcc](https://github.com/Piebald-AI/tweakcc). Comparison in
+[`docs/findings.md`](docs/findings.md) §8 — including a correction: this README
+used to claim ClawGod's transforms "silently do nothing on current builds".
+Measured, they do not. ClawGod extracts the native addons correctly and its
+`fileURLToPath` transform matches all 7 real sites; the narrower, real
+differences are that it drops `file`-loader assets and rewrites only
+`require("….node")` (§5b).
 
 ## Not affiliated with Anthropic. For personal, local use; you run modified code
 at your own risk.

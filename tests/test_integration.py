@@ -31,7 +31,8 @@ def test_real_elf_binary_extracts(extract_bun, real_elf_binary, tmp_path):
     assets = sorted(p.name for p in (out / "assets").iterdir())
     assert "image-processor.node" in assets
     assert "mermaid.min.js" in assets
-    # findings 5a: base64-loader addons are stored raw, so this must be an ELF
+    # findings 5a: stored content is ALWAYS raw bytes, whatever the loader id
+    # says (these addons are napi, id 10) - so this must be a real ELF
     assert (out / "assets" / "image-processor.node").read_bytes()[:4] == b"\x7fELF"
 
 

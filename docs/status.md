@@ -6,11 +6,20 @@ release before Bun's Zig→Rust rewrite.
 
 **As of 2026-08-22 the pipeline has been run end to end on this host.** The
 extracted, post-processed `cli.original.cjs` from the real Linux binary
-(Claude Code **2.1.222**) starts under external Bun 1.3.14 and answers
-`--version`, `--help`, and `mcp list` — the last of which really reads and
-writes config state on disk. That is the first empirical answer to the risk in
-[findings.md](./findings.md) §10, and it is a *positive* one **for that version,
-on that platform, on those code paths** — nothing wider.
+(Claude Code **2.1.222**) starts under external Bun 1.3.14 and answers `doctor`,
+`mcp list`, `--help` and `--version`. Lead with `doctor` or `mcp list`: they
+initialise ~2760 of the bundle's 6748 lazy modules, whereas `--version`
+initialises **0** and therefore proves nothing about Bun's API surface
+([findings.md](./findings.md) §10). That is the first empirical answer to the
+risk in §10, and it is a *positive* one **for that version, on that platform,
+on those code paths** — nothing wider.
+
+⚠️ **"It runs" is not "it behaves the same as the shipped binary."** Because
+`Bun.isStandaloneExecutable` is not defined outside a standalone, ~21 branches
+in the CLI take their non-standalone path: native image processing is
+unreachable, the seccomp sandbox is off, embedded ripgrep becomes a system
+`rg`, and install identity reports `unknown`. Read
+[findings.md](./findings.md) **§11** before relying on this build.
 
 The single evidence record is
 [**verification-2026-08-22.md**](./verification-2026-08-22.md): every command
@@ -25,13 +34,16 @@ Statuses distinguish *how* something is known, not how likely it is:
 
 - ✅ **Executed here** — actually run on this host (Linux x86_64, Debian 12,
   glibc 2.36) on 2026-08-22, with command and output pasted in
-  [verification-2026-08-22.md](./verification-2026-08-22.md).
+  [verification-2026-08-22.md](./verification-2026-08-22.md) — in its original
+  body, or in the **2026-08-22 addendum** appended after the review fleet.
 - 🔎 **Static check here** — real bytes of a real binary were parsed or
   transformed on this host, or the output was accepted by Bun's own
   parser/transpiler — but **nothing was executed**.
 - 🖥️ **Needs hardware we do not have** — the remaining step requires Apple
   Silicon (or Windows). Evaluated and rejected here; see
-  [§ macOS execution](#macos-execution-the-one-real-gap).
+  [§ macOS execution](#macos-execution-what-actually-needs-a-mac).
+- ⚠️ **Measured difference from the native binary** — it runs, but it does not
+  behave the same. See [findings.md](./findings.md) §11.
 - ⛔ **Deliberately not implemented** — a scoped-out choice, not an oversight.
 - 📓 **Prior-session record** — observed on a Mac on 2026-08-21 against Claude
   Code 2.1.238; **not** re-checked on this host, and not covered by the
@@ -57,32 +69,56 @@ installed on this host, the macOS and Windows binaries were downloaded from npm
 | `postprocess.py` transforms | ✅ 5 `/$bunfs/` rewrites, 7 `file://`, 1 IIFE, 0 leftovers (Step 2) | ✅ 9 `/$bunfs/` rewrites, 8 `file://`, 1 IIFE, 0 leftovers (Step 3b) | ⛔ (and the regexes would not match — see below) |
 | `scripts/build.sh` end to end | ✅ (Step 2) | ✅ (Step 3b) | ⛔ |
 | Output accepted by Bun 1.3.14's parser | 🔎 `bun build --no-bundle`, exit 0 (Step 3) | 🔎 `bun build --no-bundle`, exit 0 (Step 3b) | ⛔ |
-| **Runs under external Bun 1.3.14** | ✅ `--version`, `--help`, `mcp list` all exit 0 (Steps 5, 5b) | 🖥️ not executed here — needs Apple Silicon | ⛔ would also need a Windows Bun |
-| Runtime asset (`assets/*`) resolution | 🔎 **static only** — paths rewritten and files on disk; no executed command loaded one (Step 4) | 🔎 static only | ⛔ |
-| Test suite (31 tests) | ✅ 31 passed, incl. 4 integration tests against the real ELF **and** Mach-O binaries | ✅ same run | — |
+| **Runs under external Bun** | ✅ `doctor`, `mcp list`, `--help`, `--version` all exit 0 on **1.3.14 and 1.4.0** (Steps 5, 5b + addendum) | ✅ the darwin JS boots under **Linux** Bun → `2.1.239 (Claude Code)`; macOS-*specific* behaviour still needs a Mac | ⛔ would also need a Windows Bun |
+| Runtime asset (`assets/*`) resolution | ✅ `image-processor.node` loads and works through the rewritten path; but the CLI never asks for it — [findings.md](./findings.md) §11 | 🔎 static only (Mach-O addons cannot dlopen on Linux) | ⛔ |
+| Test suite (43 tests) | ✅ 43 passed, incl. 4 integration tests against the real ELF **and** Mach-O binaries (see the verification record's 2026-08-22 addendum) | ✅ same run | — |
 | Approach B: byte-patch + re-sign (`tools/patch_claude.py`) | n/a (macOS-only concern) | 📓 verified 2026-08-21 on 2.1.238; not re-checked here | n/a |
 
 Step numbers refer to sections of
 [verification-2026-08-22.md](./verification-2026-08-22.md).
 
-The macOS column is worth reading twice: **extraction and post-processing of the
-real Mach-O binary are not a projection — they were executed here**, on this
-Linux host, against the genuine 325 MB `darwin-arm64` binary. Parsing a
-container is byte arithmetic and needs no Mac. Only *running* the resulting
-JavaScript does.
+The macOS column is worth reading twice: **extraction, post-processing *and*
+execution of the real Mach-O binary's JavaScript are not a projection — they
+were done here**, on this Linux host, against the genuine 325 MB `darwin-arm64`
+binary. Parsing a container is byte arithmetic and needs no Mac, and neither
+does running the JS it yields. What needs a Mac is the macOS-specific layer:
+the Mach-O `.node` addons, and every branch that depends on
+`process.platform === "darwin"`.
 
 ---
 
-## macOS execution: the one real gap
+## macOS execution: what actually needs a Mac
 
-The darwin artifact (`cli.original.cjs`, 28,244,063 bytes) was built and checked here,
-and Bun 1.3.14's own parser accepts it (`bun build --no-bundle --target=bun`,
-exit 0). **It has never been executed.** Nothing below the parser is known: not
-that it boots, not that it loads its `.node` addons, not that it resolves a
-single Bun API at runtime.
+**Corrected 2026-08-22.** This section used to say the darwin artifact "has
+never been executed" and that "running it needs Apple hardware". Both are
+wrong as stated, and the truth is *better* evidence than the claim they
+replaced.
 
-Running it needs Apple hardware. Emulation was evaluated on this host and
-rejected on observed evidence, not on preference:
+The darwin artifact (`cli.original.cjs`, 28,244,063 bytes) was built and checked
+here, Bun 1.3.14's own parser accepts it (`bun build --no-bundle --target=bun`,
+exit 0) — **and it has now been executed, on this Linux host** ✅:
+
+```
+$ DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR=$(mktemp -d) \
+    ~/.bun-1.3.14/bun <darwin-build>/extract/cli.original.cjs --version
+2.1.239 (Claude Code)          rc=0
+```
+
+The JavaScript boots and runs. What still needs a Mac is verifying
+**macOS-specific behaviour**, precisely:
+
+- **The darwin `.node` addons cannot load here.** They are Mach-O —
+  `cffaedfe` (thin arm64) or `cafebabe` (universal) — and `require()`-ing one
+  under Linux Bun fails with `ERR_DLOPEN_FAILED … invalid ELF header` ✅. The
+  whole darwin native layer is unexercised.
+- **`process.platform` is `linux`.** Every platform-conditional branch takes
+  the Linux path, so nothing that depends on running *on* macOS is exercised —
+  the `ClaudeCode.app` wrapper, the darwin paths, Keychain, TCC, none of it.
+- Everything in [findings.md](./findings.md) §11 applies on macOS too, and is
+  likewise unverified there.
+
+Emulation was evaluated on this host and rejected on observed evidence, not on
+preference:
 
 | Route | Blocker observed here |
 |---|---|
@@ -90,10 +126,12 @@ rejected on observed evidence, not on preference:
 | Darling (translation layer, no VM) | needs the `darling-mach` kernel module; `/lib/modules` absent and `modprobe` fails even `--privileged` |
 | QEMU TCG (pure software) | hours-long boots on shared vCPUs, and it would exercise the darwin-**x64** build, not arm64 |
 
-Apple's licence also restricts macOS virtualization to Apple hardware. So this
-gap closes only on a real Mac: run
+Apple's licence also restricts macOS virtualization to Apple hardware. So the
+*remaining* part of this gap closes only on a real Mac: run
 `scripts/build.sh <native-binary>` there, then the printed
-`bun .../cli.original.cjs --version`, and record the result.
+`bun .../cli.original.cjs mcp list` (not `--version` — see
+[findings.md](./findings.md) §10), confirm an addon actually loads, and record
+the result.
 
 ---
 
@@ -126,9 +164,15 @@ mysterious.
    different: module names are `B:/~BUN/root/...`, not `/$bunfs/root/...`
    (observed directly in `claude.exe` 2.1.239 — 6 such literals in the entry
    module, and **zero** `/$bunfs/` ones). `postprocess.py`'s `BUNFS_LITERAL`
-   regex would therefore rewrite **nothing**, and the output would be silently
-   asset-less rather than loudly broken. Anyone implementing PE support must
-   generalise that pattern *and* the leftover check first.
+   regex would therefore rewrite **nothing**. That outcome — zero rewrites with
+   a populated `assets/` — is now the third fatal condition in `check()`, so it
+   fails **loudly** rather than shipping silently asset-less output; that guard
+   is what `tools/postprocess.py`'s error message points at this section for.
+   (This paragraph used to give "silently asset-less rather than loudly broken"
+   as a *reason not to ship PE*; that stopped being true when the guard landed
+   in `59d9a98`.) The remaining work is real but bounded: generalise the
+   pattern *and* the leftover check, then find a Windows Bun to run the result
+   on.
 
 Everything else about the PE entry module matches the other platforms: it opens
 with the `// @bun @bytecode @bun-cjs` pragma and a CommonJS wrapper, and ends
@@ -166,33 +210,56 @@ version will change them again.
   and compare against [bun-section-format.md](./bun-section-format.md). Never
   match the entry module by name — use `entry_point_id` (findings §4).
 
-### 2. Run the darwin artifact on a Mac 🖥️
+### 2. Verify macOS-*specific* behaviour on a Mac 🖥️
 
-The only step that cannot be done here. See
-[§ macOS execution](#macos-execution-the-one-real-gap).
+The darwin JavaScript already boots here under Linux Bun. What is left is the
+part that genuinely needs the hardware. See
+[§ macOS execution](#macos-execution-what-actually-needs-a-mac).
 
-- **Verify:** on Apple Silicon with Bun 1.3.14 installed,
-  `bun <out>/extract/cli.original.cjs --version` should print the version
-  string of the binary you extracted from.
+- **Verify:** on Apple Silicon with Bun 1.3.14, run
+  `bun <out>/extract/cli.original.cjs mcp list` (not `--version` — it
+  initialises 0 lazy modules, findings §10), then load a darwin `.node` addon:
+  `bun -e 'console.log(Object.keys(require("<out>/extract/assets/image-processor.node")))'`.
+  That is the assertion Linux cannot make.
 - **Expected failure to plan for:** `Expected CommonJS module to have a function
-  wrapper` means Bun older than 1.3.14 or a pragma/IIFE problem; a missing-API
-  error means findings §10's risk materialised on darwin.
+  wrapper` is **ambiguous** — it means the module *shape* was rejected, which
+  covers a too-old Bun, a pragma/IIFE problem, *and* this project's own
+  transform. Rebuild in the pragma-preserving shape to tell them apart
+  (findings §10). Only a `TypeError` naming a missing `Bun.*` property means
+  findings §10's risk materialised.
 
-### 3. Verify runtime asset resolution 🔎
+### 3. Close the equivalence gap ⚠️
 
-Unclosed on **every** platform, including Linux. The rewritten
-`require('path').join(__dirname,'assets',…)` expressions exist as text and the
-files exist on disk, but no executed command has ever loaded one — proven, not
-assumed: with the whole `assets/` directory renamed away, `--version` and
-`--help` still exit 0 (verification Step 4).
+**Reframed 2026-08-22.** This item used to read "verify runtime asset
+resolution", on the assumption that nothing was known about whether the
+rewritten paths work. That much is now settled in the *good* direction, and a
+worse problem was found underneath it.
 
-- **Verify:** exercise a feature that actually needs an asset — syntax
-  highlighting (`hljsBundle.generated.min.js`), a mermaid diagram
-  (`mermaid.min.js`), image handling (`image-processor.node`) — and watch for
-  `ENOENT` / `Cannot find module`.
-- **Fix:** the rewrite shape is in `postprocess.py`; confirm the *call* shape in
-  the minified source first (`require`? `readFile`? `Bun.file`?) rather than
-  guessing, then extend the rewrite.
+- **Settled** ✅: `require("<extract>/assets/image-processor.node")` under Bun
+  1.3.14 loads and works — it reads a 3000×3000 PNG's metadata and resizes it
+  to a valid JPEG. The rewritten `require('path').join(__dirname,'assets',…)`
+  shape is correct. All three `file`-loader assets read back at their full
+  sizes.
+- **The real problem** (findings §11): the CLI *never asks* for the native
+  image processor, because that call site is gated on
+  `Bun.isStandaloneExecutable`, which is undefined outside a standalone.
+  Measured: as shipped, reading a 3000×3000 PNG fails with *"Unable to resize
+  image…"*; with the flag forced true, the same artifact returns a correct
+  469,774-byte JPEG. The seccomp sandbox is off, embedded ripgrep degrades to a
+  system `rg`, and install identity is `unknown`, for the same reason.
+- **Also settled, and it matters for every "exit 0" claim in this repo:** both
+  addon loaders swallow failure (`try{…}catch{ …=null }`), so a missing or
+  broken asset degrades silently. **Exit 0 is not evidence that asset wiring
+  works.**
+- **Fix:** shim `Bun.isStandaloneExecutable` **scoped to the image-processor
+  call site only**. A global flip breaks search: "embedded ripgrep" then means
+  re-exec `process.execPath` (bun) with argv0 `rg`, and a `Grep` for a string
+  that exists returns `No matches found` — silently wrong, not an error.
+  Deliberately not implemented yet.
+- **Still genuinely unverified:** whether `mermaid.min.js`,
+  `hljsBundle.generated.min.js` and `chart.umd.min.js` are read on their real
+  feature paths (they are read via `fs/promises.readFile` of the rewritten
+  literal, which resolves — but no command here has exercised the feature).
 
 ### 4. Update survival & version pinning
 
@@ -208,7 +275,10 @@ previous `build/extract/` intact.
 - **The project's kill switch (findings §10):** if a future Claude build is
   compiled against a canary Bun newer than 1.3.14, its `cli.js` will not run on
   Zig at all — the only newer Bun is the Rust rewrite. As of 2.1.222 this has
-  **not** happened; that is a measurement, not a guarantee.
+  **not** happened; that is a measurement, not a guarantee. Note the floor is
+  softer than it looks: 2.1.222 runs on **1.3.13** in the pragma-preserving
+  build shape, so "Bun ≥ 1.3.14" is a property of this project's transform, not
+  of Claude.
 - Keep the last working `build/extract/` and pin that Claude version. If it ever
   breaks, record the first version where it broke in findings §10.
 
@@ -216,15 +286,23 @@ previous `build/extract/` intact.
 
 ## Known unknowns
 
-- **Everything past the three executed commands.** No network call, no model API
-  request, no interactive TUI, no tool execution, no asset load has ever run
-  under Bun 1.3.14 here. `--version`, `--help`, and `mcp list` did.
+- **Real model traffic.** Every agentic-loop result recorded here was driven by
+  a **loopback mock** of the Messages API. Streaming, multi-turn tool use, the
+  Bash tool spawning a subprocess, the Read tool returning an image and the Ink
+  TUI under a pty all work on Bun 1.3.14 ✅ — but no request has ever gone to
+  Anthropic from this build, and no real account has been touched.
 - **Minified call shapes drift.** `postprocess.py`'s regexes target minified
   output that changes every release. They are measured against two real
   binaries, not contracts.
-- **`CLAUDE_CODE_EXECPATH`.** The old design's launcher exported it and no
-  longer exists. See [runbook.md](./runbook.md) § Shell integrations for what to
-  do instead and what is unknown about it.
+- **The equivalence gap is characterised, not closed.** findings §11 lists what
+  differs and why; only the image path has an A/B measurement behind it. The
+  other 20 `CE()` branches were read, not exercised.
+- **`CLAUDE_CODE_EXECPATH`.** Measured: the CLI **never reads** it (0
+  occurrences of `process.env.CLAUDE_CODE_EXECPATH`) and unconditionally
+  *writes* it as `process.execPath` — now the bun binary — into every spawned
+  shell's environment. The generated `find`/`grep` shell functions fall back to
+  it, so they get shadowed onto bun. Read from source, not observed live. See
+  [runbook.md](./runbook.md) § Shell integrations and findings §6.
 - **Universal vs thin addons.** Some darwin `.node` files are universal
   (x86_64 + arm64), others thin arm64; the linux ones are ELF. Matters only if
   you mix architectures.
@@ -237,14 +315,25 @@ previous `build/extract/` intact.
 
 - **Don't loosen the integration tests' hardcoded counts** to make a new Claude
   version pass. They are a tripwire; a failure means "go re-measure".
-- **Don't `base64`-decode the `base64`-loader modules** — they are raw
-  ELF/Mach-O bytes (findings §5a).
+- **Don't decode any module's stored content.** Stored content is *always* raw
+  bytes, whatever the loader id says — that includes a genuine `base64`-loader
+  module. The `.node` addons are `napi`-loader (byte 10) and are raw ELF/Mach-O
+  (findings §5a).
+- **Don't transcribe the loader enum from another extractor.** Read it from
+  Bun's `src/bundler/options.zig` at the matching tag. Doing otherwise is how
+  `jsonc=7` went missing here and every id from 7 up shifted (findings §5a).
+- **Don't lead with `--version`** when checking a build. It initialises 0 of
+  6748 lazy modules — a hardcoded fast path. Use `doctor` or `mcp list`
+  (findings §10).
+- **Don't read `exit 0` as "the assets resolve".** Both addon loaders swallow
+  failure (findings §11).
 - **Don't match the entry module by name.** It is `/$bunfs/root/cli` on darwin
   and `/$bunfs/root/src/entrypoints/cli.js` on linux. Use `entry_point_id`.
 - **Don't install a `claude` launcher on `PATH`.** `build.sh` deliberately
   installs nothing: a launcher named `claude` would shadow a real installation.
 - **Don't re-sign anything for the de-rust path** — the signed binary is never
   run. Re-signing only concerns Approach B (`patch_claude.py`).
-- **Don't assume ClawGod's extractor is a drop-in** — it only handles
-  `napi`-loader modules and misses the `base64` addons on current builds
-  (findings §5b).
+- **Don't assume ClawGod's extractor is a drop-in** — but not for the reason
+  this list used to give. It extracts the native addons **correctly**; what it
+  drops is the `file`-loader assets, and its rewrite covers only
+  `require("….node")` (findings §5b/§8).

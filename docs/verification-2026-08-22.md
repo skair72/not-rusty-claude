@@ -1,10 +1,27 @@
 # End-to-end verification run — 2026-08-22
 
+> ## 📌 This body is PINNED to commit `56e8877`. Read the addendum first.
+>
+> Everything from "## Host" down to "## Summary table" is the original
+> evidence record as it was produced, and is **deliberately not being
+> rewritten**: an evidence record whose history is edited is not evidence.
+> Two of its numbers are stale as a result — it pastes the label
+> `pragma lines stripped` (the code now prints `pragma block stripped`, renamed
+> in `59d9a98`) and a `22 passed` test run (HEAD is 43). Neither reflects a
+> behaviour change; both are the record stopping one commit short.
+>
+> An **8-reviewer audit on 2026-08-22 falsified several claims this document
+> and the rest of the docs made.** The corrections, and a fresh re-run at
+> current HEAD with pasted output, are in the
+> [**2026-08-22 addendum**](#addendum-2026-08-22-fleet-audit-wave-1-fixes-and-a-re-run-at-head)
+> at the end of this file. Where the body and the addendum disagree, **the
+> addendum is current.**
+
 *(Revised after code review, fix round 1/5: the original version overstated
 what the evidence proved in three places. Those claims are corrected below;
 the underlying commands were re-run against freshly rebuilt artifacts and
-every number reproduced identically. See the "fix round 1/5" note in
-`task-8-report.md` for the itemized changes.)*
+every number reproduced identically. The itemized changes were recorded in a
+task report that is not part of this repository.)*
 
 This document records the first real execution of the extraction + post-process
 pipeline against Bun's last Zig-era release, answering the open question in
@@ -848,3 +865,338 @@ Safety constraints (`/usr/bin/claude` never executed/written, nothing on
 `PATH`, no rc file touched, scratch `CLAUDE_CONFIG_DIR` for every real run):
 all held for the duration of this task, confirmed by before/after diffs
 pasted in the "Safety checks" section above.
+
+---
+
+# Addendum: 2026-08-22 fleet audit, wave-1 fixes, and a re-run at HEAD
+
+*Appended 2026-08-22, after the body above was already written and pinned to
+commit `56e8877`. Nothing above this line was edited except the pin notice at
+the top of the file. Where the two disagree, **this addendum is current**.*
+
+## What happened
+
+An eight-reviewer audit fleet was run against the branch — cold-start
+reproduction, adversarial input, claim falsification, transform completeness,
+code quality, mutation testing, spec conformance, and a devil's advocate whose
+brief was to break the headline. Two remediation waves followed:
+
+- **Wave 1 (correctness)** — commits `081b200`, `61957a6`, `c8467aa`,
+  `f7c05b9`, `1c510e7`. Tests 31 → 42.
+- **Wave 2 (documentation truth)** — this addendum, plus `306a72a` and the doc
+  corrections committed alongside it. Tests 42 → 43.
+
+## What the audit falsified
+
+Each of these was a claim this repository made in prose. Each is now corrected
+in place, with the correction marked in the file that carried it.
+
+| Claim, as it stood | Measured truth |
+|---|---|
+| The `.node` addons use the **`base64`** loader | Their raw loader byte is **10 = `napi`**, on both shipped binaries. The repo's loader enum omitted `jsonc = 7`, shifting every id ≥ 7 |
+| ClawGod handles only `napi`, so it extracts **zero** native modules | ClawGod's enum *is* Bun's; it labels them `napi` and **extracts them correctly**. What it drops is the `file`-loader assets |
+| ClawGod's `fileURLToPath` transform matches nothing on current binaries | It matches **7 sites** — the same 7 this project rewrites. The 0-match regex was *this repo's own* scaffolded port |
+| Approach A "needs an external **Zig** Bun" | It needs an external **Bun**. The same artifact runs on **1.4.0**, the Rust build |
+| Bun 1.3.14 is "pre-Rust" | True of the *rewrite*; false literally — its `.comment` reads `rustc 1.94.0-nightly` and it links vendored Rust crates |
+| The pragma line alone would make Bun panic | Pragma-kept + **not** invoking runs fine on 1.3.14 **and 1.3.13**. The panic needs pragma **plus** manual invocation |
+| Claude Code needs Bun ≥ 1.3.14 | 2.1.222 runs on **1.3.13** in the pragma-preserving shape. The floor is this project's transform, not Claude |
+| The darwin artifact "has never been executed / needs Apple hardware" | It runs **here, on Linux**, and prints `2.1.239 (Claude Code)`. What needs a Mac is macOS-*specific* behaviour |
+| Export `CLAUDE_CODE_EXECPATH` yourself for shell integrations | The CLI **never reads** it (0 occurrences of `process.env.CLAUDE_CODE_EXECPATH`). It *writes* it as `process.execPath` — now bun |
+| "The Rust rewrite is experimental and Linux-x64-only" | Stale. `bun-v1.4.0` shipped **2026-08-20**, before this work, targeting all platforms |
+| PR oven-sh/bun#30412 merged 2026-05-11 | Merged **2026-05-14T08:09:34Z** |
+| 12 `fileURLToPath` **calls** survive | 12 textual hits; **9** are calls, 3 are import lines in embedded script text |
+| Windows/PE "would be silently asset-less rather than loudly broken" | `check()` makes exactly that case **fatal** since `59d9a98` |
+
+Plus one whole subject the repository had never mentioned: the **equivalence
+gap** (`findings.md` §11). The word `isStandaloneExecutable` appeared in **zero**
+files here before this addendum.
+
+## Re-run at HEAD `306a72a`
+
+Same host as the body (Linux x86_64, Debian 12, glibc 2.36).
+`/usr/bin/claude` was read and never executed or written.
+
+### Build
+
+```
+$ OUT_DIR=<out> BUN_BIN=~/.bun-1.3.14/bun scripts/build.sh /usr/bin/claude
+==> native binary: /usr/bin/claude
+==> bun: 1.3.14 (/home/claude/.bun-1.3.14/bun)
+==> extracting cli.js + assets -> <out>/extract
+Size:    276.1 MB
+Section: offset=86904832 size=202513494 (193.1 MB)
+Payload: 202513486 bytes, trailer OK
+Modules: 8 (entry id=0)
+  entry   js       21.90 MB -> <out>/.extract.stage.NNNNN/cli.original.js
+  native  napi       1430 KB -> <out>/.extract.stage.NNNNN/assets/image-processor.node
+  native  napi        481 KB -> <out>/.extract.stage.NNNNN/assets/audio-capture.node
+  asset   file        204 KB -> <out>/.extract.stage.NNNNN/assets/chart.umd.min.js
+  asset   file        962 KB -> <out>/.extract.stage.NNNNN/assets/hljsBundle.generated.min.js
+  asset   file       3235 KB -> <out>/.extract.stage.NNNNN/assets/mermaid.min.js
+Extracted: 1 cli.js + 5 assets (2 loader shims left inlined in cli.js)
+==> post-processing cli.js for external Bun
+note: build-machine path still present: /home/runner/work/claude-cli-internal/claude-cli-internal/node_modules/@ant/computer-use-swift/js
+note: build-machine path still present: /home/runner/work/claude-cli-internal/claude-cli-internal/node_modules/@grpc/grpc-js/build/src
+note: build-machine path still present: /home/runner/work/claude-cli-internal/claude-cli-internal/src/frame
+pragma block stripped  : 1
+/$bunfs/ paths rewired : 5
+file:// leaks rewritten: 7
+IIFE invocations added : 1  (expected 1)
+size: 22960130 -> 22959448 bytes
+wrote: <out>/.extract.stage.NNNNN/cli.original.cjs
+wrote: <out>/.extract.stage.NNNNN/cli.js  (sibling for Claude's MCP self-spawns)
+==> staged build swapped into place -> <out>/extract
+```
+
+Two differences from the body: the label is now `pragma block stripped` (was
+`pragma lines stripped`), and there is a second `wrote:` line for the `cli.js`
+sibling that wave 1 added. Byte-identical output to the body's run:
+
+```
+$ md5sum <out>/extract/cli.original.cjs
+5e3662ee9e2cfd8143c7a6a1bb0662bb  <out>/extract/cli.original.cjs
+```
+
+### Run
+
+```
+$ DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR=$(mktemp -d) <bun-1.3.14> <out>/extract/cli.original.cjs doctor
+Claude Code doctor
+
+Running: unknown (2.1.222)
+Commit: fbf49312c284
+Platform: linux-x64
+Path: <bun-1.3.14>
+Invoked: <out>/extract/cli.original.cjs
+Config install method: not set
+Search: OK (/usr/bin/rg)
+Auto-updates: disabled (set by env: DISABLE_AUTOUPDATER)
+Auto-update channel: latest
+Last update attempt: none recorded
+(exit 0)
+```
+
+`Running: unknown` and `Search: OK (/usr/bin/rg)` are not cosmetic — they are
+the equivalence gap showing itself. See below, and `findings.md` §11.
+
+```
+$ … <bun-1.3.14> <out>/extract/cli.original.cjs mcp list
+No MCP servers configured. Use `claude mcp add` to add a server.        (exit 0)
+$ … <bun-1.4.0>  <out>/extract/cli.original.cjs mcp list
+No MCP servers configured. Use `claude mcp add` to add a server.        (exit 0)
+$ … <bun-1.3.14> <out>/extract/cli.js --version          # the wave-1 sibling shim
+2.1.222 (Claude Code)                                                  (exit 0)
+$ <bun-1.3.14> build --no-bundle --target=bun <out>/extract/cli.original.cjs --outfile=/dev/null
+  null  29.60 MB  (chunk)                                              (exit 0)
+```
+
+### Regression
+
+```
+$ python3 -m pytest tests/ -q
+...........................................                              [100%]
+43 passed in 8.81s
+
+$ python3 -m pytest tests/ -q -m integration
+....                                                                     [100%]
+4 passed, 39 deselected in 8.24s
+```
+
+43, not the body's 22 and not the 31 the docs claimed until wave 1: `+11` from
+wave 1 (loader-enum pinning, the genuine-`base64` latent bug, the `cli.js`
+shim's Bun-loadability matrix, and the `build.sh` staging suite) and `+1` from
+wave 2's split of the staging-leak test.
+
+### Safety
+
+```
+$ md5sum /usr/bin/claude            # before and after every command above
+94e673a283dd91d0456080cc05a09083  /usr/bin/claude
+```
+
+Unchanged. Never executed. Nothing installed on `PATH`; no file named `claude`
+created; no shell profile touched.
+
+## New measurements taken for wave 2
+
+Each of these backs a specific ✅ elsewhere in the docs.
+
+### Loader bytes, read with a standalone parser (not this repo's tools)
+
+```
+/usr/bin/claude              modules=8   entry=0
+  idx=0  byte=1   /$bunfs/root/src/entrypoints/cli.js        first4=b'// @'
+  idx=3  byte=10  /$bunfs/root/image-processor.node          first4=b'\x7fELF'
+  idx=4  byte=10  /$bunfs/root/audio-capture.node            first4=b'\x7fELF'
+  idx=5..7 byte=5 chart.umd.min.js / hljsBundle… / mermaid.min.js
+/tmp/ccmac/package/claude    modules=15  entry=0
+  idx=6,7,8,12,14  byte=10   *.node   first4=b'\xcf\xfa\xed\xfe' or b'\xca\xfe\xba\xbe'
+```
+
+Bun 1.3.14's `src/bundler/options.zig` (fetched at tag `bun-v1.3.14`):
+`jsx=0 js=1 ts=2 tsx=3 css=4 file=5 json=6 jsonc=7 toml=8 wasm=9 napi=10
+base64=11 dataurl=12 text=13 bunsh=14 sqlite=15 sqlite_embedded=16 html=17
+yaml=18 json5=19 md=20`. **Byte 10 is `napi`.**
+
+ClawGod at commit `4401fdb`, `install.sh`: `const LOADERS = { …, 7:'jsonc',
+…, 10:'napi', 11:'base64', … }` — Bun's table. Its `napi` branch writes the
+addons out. Its `.node`-only rewrite matches 2 of the 5 `/$bunfs/` literals
+here, leaving `chart.umd.min.js`, `hljsBundle.generated.min.js` and
+`mermaid.min.js` unrewritten and unextracted. Its `fileURLToPath` regex matches
+**7**.
+
+### Bun 1.3.14 vs 1.4.0
+
+```
+$ readelf -p .comment ~/.bun-1.3.14/bun
+  [    47]  rustc version 1.94.0-nightly (c61a3a44d 2025-12-09)
+$ strings ~/.bun-1.3.14/bun | grep -c '\.zig'      → 7
+$ strings ~/.bun-1.4.0/bun  | grep -c '\.zig'      → 0
+$ strings ~/.bun-1.3.14/bun | grep -i lolhtml | head -1
+  /var/lib/buildkite-agent/build/vendor/lolhtml/src/memory/arena.rs
+$ ~/.bun-1.3.14/bun -e 'console.log(Bun.isStandaloneExecutable)'   → undefined
+$ ~/.bun-1.4.0/bun  -e 'console.log(Bun.isStandaloneExecutable)'   → false
+```
+
+### The pragma/IIFE 2×2, run to completion
+
+Bun 1.3.13 was unpacked into a scratch directory for this (not on `PATH`).
+
+```
+                                              1.3.13   1.3.14
+pragma stripped + IIFE invoked (as shipped)   panic    2.1.222 (Claude Code)
+pragma kept     + IIFE not invoked            2.1.222  2.1.222 (Claude Code)
+pragma kept     + IIFE invoked                panic    panic
+pragma stripped + IIFE not invoked            panic    exit 0, no output
+```
+
+`panic` = `TypeError: Expected CommonJS module to have a function wrapper.`
+On 1.3.13 the pragma-preserving build also ran `--help`, `mcp list` and
+`doctor`, all exit 0.
+
+### Lazy-module initialisation per command
+
+The bundle's two lazy-module helpers were instrumented (`re` = CJS wrapper,
+1644 instances; `E` = ESM lazy init, 5104; 6748 total) and the count of
+*initialised* modules printed at exit:
+
+```
+--version  ->  LAZY re=0/1644    E=0/5104     TOTAL=0/6748
+--help     ->  LAZY re=394/1644  E=2331/5104  TOTAL=2725/6748
+doctor     ->  LAZY re=407/1644  E=2350/5104  TOTAL=2757/6748
+mcp list   ->  LAZY re=407/1644  E=2354/5104  TOTAL=2761/6748
+```
+
+### The darwin artifact under Linux Bun
+
+```
+$ OUT_DIR=<macout> scripts/build.sh /tmp/ccmac/package/claude
+Modules: 15 (entry id=0)
+Extracted: 1 cli.js + 9 assets (5 loader shims left inlined in cli.js)
+/$bunfs/ paths rewired : 9    file:// leaks rewritten: 8    IIFE: 1
+size: 28244743 -> 28244063 bytes
+
+$ DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR=$(mktemp -d) \
+    ~/.bun-1.3.14/bun <macout>/extract/cli.original.cjs --version
+2.1.239 (Claude Code)                                                  (exit 0)
+
+$ ~/.bun-1.3.14/bun -e 'require("<macout>/extract/assets/image-processor.node")'
+Error [ERR_DLOPEN_FAILED]: … invalid ELF header
+
+$ od -N4 -tx1 <macout>/extract/assets/*.node
+audio-capture.node        cf fa ed fe      computer-use-input.node   ca fe ba be
+computer-use-swift.node   ca fe ba be      image-processor.node      cf fa ed fe
+url-handler.node          cf fa ed fe
+```
+
+### The equivalence gap, measured end to end
+
+Driven by a **loopback-only** mock of the Messages API — `127.0.0.1`, a
+throwaway `HOME` and `CLAUDE_CONFIG_DIR`, a fake key. No traffic left the host;
+no real account was touched.
+
+The agentic loop itself works. `Bash`, through the full SSE + multi-turn path:
+
+```
+assistant tool_use  {"name":"Bash","input":{"command":"echo HELLO-FROM-SUBPROCESS; uname -s; echo $$"}}
+TOOL_RESULT is_error=False  "HELLO-FROM-SUBPROCESS\nLinux\n111033"
+assistant text      "MOCK-DONE"
+result num_turns=2 is_error=False
+```
+
+`Read`, on a 3000×3000 PNG — the same artifact, twice:
+
+```
+as shipped:
+  TOOL_RESULT is_error=True
+    "Unable to resize image — dimensions exceed the 2000x2000px limit and
+     image processing failed. Please resize the image to reduce its pixel
+     dimensions."
+
+with Object.defineProperty(Bun,'isStandaloneExecutable',{value:true}):
+  TOOL_RESULT IMAGE  media=image/jpeg  decoded_bytes=469774  magic=ff d8 ff e0
+```
+
+The addon is not the problem — it works when called directly:
+
+```
+$ ~/.bun-1.3.14/bun -e '…require("<out>/extract/assets/image-processor.node")…'
+exports: [ "processImage", "hasClipboardImage", "readClipboardImage", "ImageProcessor" ]
+metadata: {"width":3000,"height":3000,"format":"png"}
+resized JPEG bytes: 2534466  magic: ff d8 ff e0
+```
+
+`doctor`, same A/B:
+
+```
+as shipped                        forced isStandaloneExecutable=true
+  Running: unknown (2.1.222)        Running: native (2.1.222)
+  Search: OK (/usr/bin/rg)          Search: OK (bundled)
+```
+
+And why the global flip is **not** the fix — `Grep` for a string that exists:
+
+```
+as shipped        TOOL_RESULT  "hay/a.txt:1:NEEDLE-12345"
+flag forced true  TOOL_RESULT  "No matches found"
+```
+
+A silently wrong answer, not an error: with the flag set, "embedded ripgrep"
+means re-exec `process.execPath` — which is bun — with argv0 `rg`.
+
+The Ink TUI was also rendered under a pty on 1.3.14 (welcome screen, theme
+picker, syntax-highlighted diff preview).
+
+### Generalisation to a newer Claude
+
+`@anthropic-ai/claude-code-linux-x64@2.1.240` (18 releases after 2.1.222),
+downloaded from npm, run through an **unmodified** `scripts/build.sh`:
+
+```
+Modules: 11 (entry id=0)
+Extracted: 1 cli.js + 7 assets (3 loader shims left inlined in cli.js)
+  native  napi   1430 KB  image-processor.node
+  native  napi   1048 KB  clipboard-napi.node          <- new in 2.1.240
+  native  napi    481 KB  audio-capture.node
+  asset   file    204 KB  chart.umd.min.js
+  asset   file    962 KB  hljsBundle.generated.min.js
+  asset   file   3235 KB  mermaid.min.js
+  asset   file   2177 KB  payload.template.html.asset  <- new on linux
+/$bunfs/ paths rewired : 7    file:// leaks rewritten: 7    IIFE: 1
+
+$ … <bun-1.3.14> <out240>/extract/cli.original.cjs --version   → 2.1.240 (Claude Code)  rc=0
+$ … <bun-1.3.14> <out240>/extract/cli.original.cjs mcp list    → No MCP servers configured…  rc=0
+$ … <bun-1.4.0>  <out240>/extract/cli.original.cjs --version   → 2.1.240 (Claude Code)  rc=0
+$ … <bun-1.4.0>  <out240>/extract/cli.original.cjs mcp list    → No MCP servers configured…  rc=0
+```
+
+## What is still not verified
+
+- **No real model traffic.** Everything agentic above went to a loopback mock.
+- **macOS-specific behaviour.** The darwin JS boots here, but its addons are
+  Mach-O and `process.platform` is `linux`.
+- **Windows.** Unimplemented by choice (`status.md` § Windows/PE).
+- **20 of the 21 `CE()` branches** were read from source, not exercised. Only
+  the image path has an A/B measurement behind it.
+- **The `find`/`grep` shell-function shadowing** was reconstructed from the
+  shipped source, not observed live.

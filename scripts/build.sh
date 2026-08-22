@@ -17,7 +17,12 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="${OUT_DIR:-$HERE/build}"
-MIN_BUN="1.3.14"   # last Zig release AND the minimum that loads Claude's cli.js
+# Last Zig release, and the minimum Bun that loads the artifact THIS script
+# builds. It is not a floor of Claude's: the same entry module runs on 1.3.13
+# in a pragma-preserving build shape (docs/findings.md 6 and 10). Nor is Zig
+# required - the artifact also runs on 1.4.0, the Rust build. Pinning 1.3.14
+# is the project's goal, not a technical constraint.
+MIN_BUN="1.3.14"
 
 info() { printf '\033[36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
@@ -44,8 +49,9 @@ if [ -n "$BUN_BIN" ] && [ -x "$BUN_BIN" ]; then
     warn "bun $BUN_VER is below $MIN_BUN; it will panic with"
     warn "'Expected CommonJS module to have a function wrapper'."
   elif [ "$BUN_VER" != "$MIN_BUN" ]; then
-    warn "bun $BUN_VER is newer than $MIN_BUN - it may be a post-Zig (Rust) build,"
-    warn "which defeats the de-rust goal. Prefer exactly $MIN_BUN."
+    warn "bun $BUN_VER is newer than $MIN_BUN, so it is a post-Zig (Rust) build."
+    warn "The artifact does run there - measured on 1.4.0 - but running on Zig is"
+    warn "the point of this project. Prefer exactly $MIN_BUN."
   fi
 else
   warn "bun not found; artifacts will still be built. Install the last Zig release:"
@@ -98,7 +104,7 @@ printf '      %s\n' "$WORK/cli.original.cjs" "$WORK/cli.js" "$WORK/assets/"
 echo
 info "run it with:"
 printf '      DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \\\n'
-printf '        %s %s --version\n' "${BUN_BIN:-bun}" "$WORK/cli.original.cjs"
+printf '        %s %s mcp list\n' "${BUN_BIN:-bun}" "$WORK/cli.original.cjs"
 echo
 warn "DISABLE_AUTOUPDATER=1 matters: under an external Bun,"
 warn "Bun.isStandaloneExecutable is undefined, so Claude's install-method"
@@ -108,5 +114,12 @@ warn "Code on your machine instead of updating these artifacts. It also never"
 warn "updates them. Do not run 'claude update' against this build; rebuild"
 warn "from a new native binary instead."
 warn "CLAUDE_CONFIG_DIR keeps a first run away from your real ~/.claude."
+warn "Use 'mcp list' or 'doctor' as the smoke test, not '--version': --version"
+warn "initialises 0 of the bundle's 6748 lazy modules (a hardcoded fast path),"
+warn "so it proves the file parses and proves nothing about Bun's API surface."
+warn "It runs, but it does NOT behave identically to the native binary: native"
+warn "image processing is disabled, the seccomp sandbox is off, and embedded"
+warn "ripgrep becomes a system 'rg' (so rg must be on PATH). See docs/findings.md"
+warn "section 11 - the equivalence gap - before real use."
 warn "Nothing was installed on PATH. Creating a 'claude' launcher could shadow"
 warn "your real installation - run the command above by full path instead."

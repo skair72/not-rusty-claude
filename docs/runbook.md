@@ -10,10 +10,12 @@ Two platforms, and they are at different levels of confidence:
 - **Linux x64** — the whole path below was executed on 2026-08-22 against Claude
   Code 2.1.222, output pasted in
   [verification-2026-08-22.md](./verification-2026-08-22.md).
-- **macOS (Apple Silicon)** — steps 0–3 were executed here against the real
-  2.1.239 Mach-O binary; **step 4 (actually running it) has never been done by
-  this project** and is what you would be contributing. See
-  [status.md](./status.md) § macOS execution.
+- **macOS (Apple Silicon)** — steps 0–4 were executed here against the real
+  2.1.239 Mach-O binary; the extracted darwin JavaScript boots under **Linux**
+  Bun and prints `2.1.239 (Claude Code)`. What has **never** been exercised is
+  macOS-*specific* behaviour: the Mach-O `.node` addons cannot load on Linux,
+  and `process.platform` is `linux`. That is what you would be contributing.
+  See [status.md](./status.md) § macOS execution.
 - **Windows** — not supported; extraction refuses PE input by design
   ([status.md](./status.md) § Windows/PE).
 
@@ -28,7 +30,11 @@ Two platforms, and they are at different levels of confidence:
     `npm pack @anthropic-ai/claude-code-darwin-arm64` and friends
     ([findings.md](./findings.md) §9).
 - `python3` (stock `/usr/bin/python3` is fine — the tools target 3.9+, no
-  dependencies).
+  third-party packages; the test suite additionally wants `pytest`).
+- **`ripgrep` on `PATH`.** Not optional here, though it is optional for a
+  native install: the CLI only uses its *embedded* ripgrep when it detects it is
+  a Bun standalone, which this build is not, so it looks for `rg` on `PATH`
+  ([findings.md](./findings.md) §11).
 - This repo checked out. Nothing needs installing from it.
 
 Locate the binary and confirm it is a Bun standalone:
@@ -51,10 +57,16 @@ otool -l "$NATIVE" | grep -A2 __BUN          # expect __BUN / __bun
 
 ## 1. Install Bun 1.3.14 — without touching `PATH`
 
-1.3.14 is both the **last Zig release** and the **minimum** that can load
-Claude's `cli.js` (older Bun panics with *"Expected CommonJS module to have a
-function wrapper"*). Pin exactly 1.3.14: anything newer risks being a Rust
-build, which defeats the point.
+1.3.14 is the **last Zig release**, and the minimum that loads the artifact
+**this project builds** (older Bun panics with *"Expected CommonJS module to
+have a function wrapper"*). Two honest caveats ✅:
+
+- That floor is ours, not Claude's. The same entry module, rebuilt in the
+  pragma-preserving shape, runs fine on **1.3.13** — see
+  [findings.md](./findings.md) §6 and §10.
+- The artifact does not *require* a Zig Bun at all; it also runs on **1.4.0**,
+  the Rust build. Pinning 1.3.14 is the project's goal, not a technical
+  constraint.
 
 Preferred — a plain unpack, no installer script, no rc-file edits, not on
 `PATH` (this is exactly what the verification run did):
@@ -74,9 +86,13 @@ The upstream installer (`curl -fsSL https://bun.sh/install | bash -s
 "bun-v1.3.14"`) also works, but it writes to `~/.bun` and edits shell rc files.
 The unpack above keeps this experiment entirely self-contained.
 
-> On a CPU without AVX2, use the `-baseline` build instead. Bun 1.3.14 is a Zig
-> build on every platform regardless — the Rust rewrite is experimental and
-> Linux-x64-only.
+> On a CPU without AVX2, use the `-baseline` build instead. Bun 1.3.14 is the
+> last release built from the Zig codebase on every platform. **The "the Rust
+> rewrite is Linux-x64-only" note that used to sit here is stale:** `bun-v1.4.0`
+> shipped 2026-08-20 as the first Rust release targeting all supported
+> platforms ([findings.md](./findings.md) §1). ("Zig-era" also does not mean
+> Rust-free — 1.3.14 links vendored Rust crates and its `.comment` names
+> `rustc`; what it predates is the rewrite of Bun's own core.)
 
 ---
 
@@ -101,8 +117,16 @@ pragma block stripped  : 1
 /$bunfs/ paths rewired : 5
 file:// leaks rewritten: 7
 IIFE invocations added : 1  (expected 1)
-wrote: .../build/extract/cli.original.cjs
+size: 22960130 -> 22959448 bytes
+wrote: .../.extract.stage.NNNN/cli.original.cjs
+wrote: .../.extract.stage.NNNN/cli.js  (sibling for Claude's MCP self-spawns)
+==> staged build swapped into place -> .../build/extract
 ```
+
+(The `wrote:` lines name the **staging** directory; `build.sh` prints the final
+paths in its "artifacts ready" block immediately afterwards. The `cli.js`
+sibling is not optional — Claude's own code resolves `join(__filename,'..',
+'cli.js')` for two MCP self-spawns.)
 
 **Read the counts.** `IIFE invocations added` must be exactly 1 — if it is not,
 `postprocess.py` refuses to write the output at all rather than handing Bun a
@@ -133,31 +157,38 @@ Do not rely on it alone.
 
 ## 4. Run it — by full path
 
+Start with `doctor` or `mcp list`, **not** `--version`:
+
 ```bash
 DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \
-  "$BUN_BIN" build/extract/cli.original.cjs --version
+  "$BUN_BIN" build/extract/cli.original.cjs doctor
+DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \
+  "$BUN_BIN" build/extract/cli.original.cjs mcp list
 ```
 
-Expected: the version string of the binary you extracted from, e.g.
-`2.1.222 (Claude Code)`, exit 0.
+`doctor` prints the version, the search backend, install identity and updater
+state; `mcp list` reads config, initialises `.claude.json` and dispatches into
+the MCP subsystem. Both initialise ~2760 of the bundle's 6748 lazy modules.
+
+`--version` also works and prints e.g. `2.1.222 (Claude Code)` — but treat it as
+a smoke test only. Measured, it initialises **0 of 6748** lazy modules (a
+hardcoded fast path): it proves the file parses and the CJS wrapper is invoked,
+and nothing whatsoever about Bun's API surface
+([findings.md](./findings.md) §10). `--help` (2725 modules) renders the full
+command registry.
 
 The scratch `CLAUDE_CONFIG_DIR` keeps a first run away from your real
 `~/.claude` — worth doing until you trust the build. `DISABLE_AUTOUPDATER=1`
 keeps the build from trying to update *itself* down a route that would install
 a different, npm-based Claude Code on your machine — see
-[Surviving Claude updates](#surviving-claude-updates) before you drop it. Deeper smoke tests that
-were verified on Linux:
+[Surviving Claude updates](#surviving-claude-updates) before you drop it.
 
-```bash
-DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \
-  "$BUN_BIN" build/extract/cli.original.cjs --help
-DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \
-  "$BUN_BIN" build/extract/cli.original.cjs mcp list
-```
-
-`--help` renders the full command registry; `mcp list` actually reads and writes
-config state, which is the deepest path verified so far. Beyond that — real
-prompts, TUI, tools, asset loading — nothing is verified; you are exploring.
+Beyond that: an agentic loop against a **loopback mock** endpoint has been run
+here — SSE streaming, multi-turn tool use, the Bash tool spawning a real
+subprocess, the Read tool returning an image, and the Ink TUI under a pty — all
+with no Bun-API failure. No request from this build has ever gone to Anthropic.
+And "it runs" is not "it behaves like the native binary": read
+[findings.md](./findings.md) **§11** before real use.
 
 **Run it by full path.** Do not create a `claude` shim on `PATH`; it would
 shadow your real installation, and every command in this repo is written to be
@@ -175,26 +206,45 @@ exec "$BUN_BIN" .../cli.original.cjs "$@"
 ```
 
 **That launcher is gone and is not coming back** (it is exactly the `claude`-on-
-`PATH` shadowing hazard). The behavioural consequence is worth knowing:
-`CLAUDE_CODE_EXECPATH` is now simply unset unless you set it yourself.
+`PATH` shadowing hazard).
 
-What is known 🔎: the variable name appears in the extracted CLI among the
-environment variables it propagates to spawned shells and background sessions,
-alongside the shell-integration code. Under a normal native install the running
-executable *is* `claude`; under this setup `process.execPath` is the **Bun
-binary**, so anything that re-invokes "the Claude executable" from that path
-would get bare Bun instead.
+> **⚠️ Corrected 2026-08-22. This section used to tell you to export
+> `CLAUDE_CODE_EXECPATH` yourself. Do not — it has no effect.** Measured in the
+> post-processed artifact: `process.env.CLAUDE_CODE_EXECPATH` occurs **0**
+> times. The CLI never reads the variable. The advice was wrong.
 
-What is not known: none of the commands verified here (`--version`, `--help`,
-`mcp list`) needed it — they all exited 0 with it unset — so its exact runtime
-semantics were never exercised. If you use `cli.original.cjs` for real work and
-something involving shell snapshots or spawned sessions misbehaves, set it
-yourself for that invocation:
+What the CLI actually does with it ✅ is **write** it. In
+`getEnvironmentOverrides` it sets, unconditionally and without any
+standalone/install-method gate:
+
+```js
+c["CLAUDE_CODE_EXECPATH"] = process.execPath
+```
+
+Under a native install `process.execPath` *is* the `claude` binary. Under this
+setup it is **bun** — so every shell the CLI spawns gets
+`CLAUDE_CODE_EXECPATH=<path to bun>` in its environment.
+
+That matters because of what reads it: the shell functions the CLI injects into
+spawned shells for `find` and `grep` 🔎.
 
 ```bash
-CLAUDE_CODE_EXECPATH="$NATIVE" \
-  "$BUN_BIN" build/extract/cli.original.cjs "$@"
+function find {
+  local _cc_bin="${CLAUDE_CODE_EXECPATH:-}"
+  [[ -x $_cc_bin ]] || _cc_bin='<bundled bfs path>'
+  if [[ ! -x $_cc_bin ]]; then command find ${1+"$@"}; return; fi
+  ...
+  (exec -a bfs "$_cc_bin" -S dfs -regextype findutils-default ${1+"$@"})
+}
 ```
+
+The `[[ -x ]]` fallback does not rescue you: bun *is* executable, so the
+function resolves to bun invoked with `bfs`/`ugrep` arguments rather than to the
+real `find`/`grep`. Read out of the shipped source; **not observed live** here.
+This is the same family of problem as [findings.md](./findings.md) §11 — things
+that differ because this process is not a Bun standalone — and it has no
+supported workaround yet. If `find` or `grep` misbehave inside a Bash tool call,
+this is why.
 
 ---
 
@@ -233,7 +283,7 @@ network it performs the install.)
 
 ```bash
 DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \
-  "$BUN_BIN" build/extract/cli.original.cjs --version
+  "$BUN_BIN" build/extract/cli.original.cjs doctor
 ```
 
 `DISABLE_AUTOUPDATER` is read by the bundle (`if(te.DISABLE_AUTOUPDATER)`
@@ -253,7 +303,7 @@ artifacts keep running the version you extracted until you do.
 BUN_BIN="$HOME/.bun-1.3.14/bun" scripts/build.sh "$NATIVE"
 python3 -m pytest tests/ -q        # counts are version-specific; see below
 DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \
-  "$BUN_BIN" build/extract/cli.original.cjs --version
+  "$BUN_BIN" build/extract/cli.original.cjs mcp list   # not --version: findings §10
 ```
 
 A failed rebuild is safe: `build.sh` extracts into a staging directory and swaps
@@ -270,7 +320,10 @@ Two things to expect:
 2. ⚠️ **This is the moment the project can break for good** —
    [findings.md](./findings.md) §10. If the new build was compiled against a
    canary Bun newer than 1.3.14, its `cli.js` will not run on Zig at all. Keep
-   the previous working `build/extract/` and pin to that Claude version.
+   the previous working `build/extract/` and pin to that Claude version. To
+   tell that apart from a shape problem: a `TypeError` naming a missing `Bun.*`
+   property is the real signal; `Expected CommonJS module to have a function
+   wrapper` is not, because this project's own transform produces it.
 
 ---
 
@@ -278,11 +331,13 @@ Two things to expect:
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `Expected CommonJS module to have a function wrapper` | Bun older than 1.3.14, or the pragma/IIFE transform did not apply | Confirm `bun --version` is 1.3.14; confirm `cli.original.cjs` starts with `(function` and ends with the `(exports, require, module, …)` call |
-| `postprocess.py` exits non-zero and writes nothing | its `check()` found no trailing IIFE, or the file does not start with `(function` | Read the last ~200 bytes of `cli.original.js`; the file shape changed — re-measure before editing the regex |
-| Missing Bun API / `undefined is not a function` at startup | Claude built against a Bun **newer** than 1.3.14 (§10) | Pin to an older Claude version, or shim the API |
+| `Expected CommonJS module to have a function wrapper` | **Ambiguous** — Bun older than 1.3.14, *or* the pragma/IIFE transform did not apply, *or* the pragma was kept **and** the IIFE appended (findings §6's 2×2). Not a reliable "Claude needs a newer Bun" canary | Confirm `bun --version` is ≥ 1.3.14; confirm `cli.original.cjs` starts with `(function` and ends with the `(exports, require, module, …)` call |
+| `TypeError: … is not a function` naming a `Bun.*` property | **This** is the missing-API signal — findings §10's risk | Pin to an older Claude version, or shim the API |
+| Images are refused with *"Unable to resize image…"* | Expected, not a bug in your build: native image processing is unreachable outside a Bun standalone (findings §11) | No supported fix yet; do **not** flip `Bun.isStandaloneExecutable` globally — it silently breaks search |
+| `ripgrep not found on PATH` | Embedded ripgrep needs a standalone; this build uses a system `rg` (findings §11) | Install `ripgrep` |
+| `postprocess.py` exits non-zero and writes nothing | one of `check()`'s **three** fatal conditions: no trailing IIFE, the file does not start with `(function`, or **zero** `/$bunfs/` literals were rewritten while `assets/` has files (the silently-asset-less guard) | Read the last ~200 bytes of `cli.original.js`; the file shape changed — re-measure before editing the regex. Zero rewrites with populated assets means a different VFS prefix ([status.md](./status.md) § Windows/PE) |
 | `Cannot find module '.../assets/X.node'` | asset not extracted, or its path not rewritten | Confirm `assets/X.node` exists; check the `/$bunfs/ paths rewired` count and any leftover-bunfs warning |
-| A mermaid/highlight/chart feature breaks | a `file`-loader asset still referenced via `/$bunfs/`, or an unverified runtime path | Runtime asset resolution is **unverified** on every platform ([status.md](./status.md) remaining work #3) — this is a known open gap, not a misconfiguration |
+| A mermaid/highlight/chart feature breaks | a `file`-loader asset still referenced via `/$bunfs/`, or an unverified runtime path | The rewritten path shape is verified to work (`image-processor.node` loads through it), but no command here has exercised these three features — [status.md](./status.md) remaining work #3 |
 | `error: PE (Windows) executable detected` | you pointed the extractor at `claude.exe` | Not supported by design — [status.md](./status.md) § Windows/PE |
 | `error: ELF has no section headers (stripped?)` | the binary was stripped | Get an unstripped build; the shipped one is not stripped |
 
