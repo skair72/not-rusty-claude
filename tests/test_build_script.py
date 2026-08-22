@@ -80,9 +80,38 @@ def test_a_rejected_transform_leaves_the_previous_build_intact(tmp_path):
 
 
 def test_no_staging_directory_is_left_behind(tmp_path):
+    """The EXIT trap must clean up a build that failed *after* staging exists.
+
+    This has to use the rejected-transform binary, not `/bin/ls`. `/bin/ls`
+    dies inside `find_bun_section_elf` before `extract_bun.py` has created the
+    staging directory, so there is nothing to leak and the assertion passes
+    even with `cleanup()` emptied or `trap cleanup EXIT` deleted. The
+    untransformable entry gets all the way through extraction - the staging
+    directory exists and is populated - and only then does `postprocess.py`'s
+    `check()` refuse to write, leaving the trap as the only thing that removes
+    it.
+    """
     native = _synthetic_binary(tmp_path / "native")
     out = tmp_path / "out"
-    _build(out, native)
-    _build(out, shutil.which("ls") or "/bin/ls")
+    assert _build(out, native).returncode == 0
+    bad = _synthetic_binary(tmp_path / "bad", entry=UNTRANSFORMABLE_ENTRY)
 
+    assert _build(out, bad).returncode != 0
+
+    leaked = sorted(p.name for p in out.glob(".extract*"))
+    assert leaked == [], f"staging directories left behind: {leaked}"
     assert sorted(p.name for p in out.iterdir()) == ["extract"]
+
+
+def test_a_failed_extraction_leaves_no_staging_directory(tmp_path):
+    """The other failure mode, for completeness. Weaker by construction: the
+    extractor dies before it creates the staging directory, so this can only
+    ever confirm that nothing was created, never that it was cleaned up.
+    """
+    native = _synthetic_binary(tmp_path / "native")
+    out = tmp_path / "out"
+    assert _build(out, native).returncode == 0
+
+    assert _build(out, shutil.which("ls") or "/bin/ls").returncode != 0
+
+    assert sorted(p.name for p in out.glob(".extract*")) == []
