@@ -611,7 +611,7 @@ The core correctness fix. The scaffold rewrote only `require('…​.node')` —
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks.
-- Produces: `postprocess.transform(code: str) -> (str, dict)` where the dict has integer keys `pragma`, `assets`, `file_urls`, `iife` and list key `leftovers`. `postprocess.main` reads/writes files and reports.
+- Produces: `postprocess.transform(code: str) -> (str, dict)` where the dict has integer keys `pragma`, `assets`, `file_urls`, `iife` and list keys `leftovers` and `build_paths`. `postprocess.main` reads/writes files and reports.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -664,7 +664,13 @@ Expected: FAIL — `AttributeError: module 'postprocess' has no attribute 'trans
 
 - [ ] **Step 3: Write minimal implementation**
 
-Replace the transform section of `tools/postprocess.py` with a pure function. Add at module level:
+First delete the module docstring's scaffold banner — the box reading
+`🟡 SCAFFOLD / BACKBONE — NEVER EXECUTED` and the paragraph under it. It stops
+being true in this task, and Task 9 Step 5 greps for exactly that wording.
+Keep the "What it does" list, updating it to match the transforms below.
+
+Then replace the transform section of `tools/postprocess.py` with a pure
+function. Add at module level:
 
 ```python
 import json
@@ -720,7 +726,7 @@ git commit -m "fix: rewrite every /\$bunfs/ literal, not just .node requires"
 
 **Interfaces:**
 - Consumes: `postprocess.transform(code) -> (str, dict)` from Task 4.
-- Produces: the same `transform` with `pragma`, `file_urls`, `iife` populated, plus `postprocess.check(code, counts) -> list[str]` returning fatal error strings (empty when the output is sound).
+- Produces: the same `transform` with `pragma`, `file_urls`, `iife` populated and `build_paths` added, plus `postprocess.check(code, counts) -> list[str]` returning fatal error strings (empty when the output is sound).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -825,8 +831,9 @@ def check(code, counts):
                       "will panic with 'Expected CommonJS module to have a "
                       "function wrapper'")
     if counts["iife"] != 1:
-        errors.append(f"expected exactly 1 trailing IIFE to invoke, found "
-                      f"{counts['iife']} - the file does not end in '})'")
+        errors.append("expected exactly 1 trailing IIFE to invoke, found "
+                      + str(counts["iife"])
+                      + " - the file does not end in '})'")
     return errors
 ```
 
@@ -1130,51 +1137,123 @@ The payoff: answers `findings.md` §10 empirically. **Do not skip a rung, and do
 - Consumes: `scripts/build.sh` from Task 7.
 - Produces: a verification record with pasted command output, consumed by Task 9's doc rewrite.
 
-- [ ] **Step 1: Install Bun 1.3.14 into an isolated prefix**
+- [ ] **Step 1: Install Bun 1.3.14 without mutating the shell profile**
+
+Do **not** use `curl https://bun.sh/install | bash`. That installer
+unconditionally appends `export BUN_INSTALL=` / `export PATH=` to the first
+writable of `~/.bash_profile`, `~/.bashrc` or `~/.zshrc` with no opt-out, and
+runs `bun completions` — both violate this plan's "changes nothing on the box"
+constraint. Fetch the release archive directly instead:
 
 ```bash
-export BUN_INSTALL="$HOME/.bun-1.3.14"
-curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.14"
-"$BUN_INSTALL/bin/bun" --version
+mkdir -p "$HOME/.bun-1.3.14"
+curl -fsSL -o /tmp/bun-1.3.14.zip \
+  https://github.com/oven-sh/bun/releases/download/bun-v1.3.14/bun-linux-x64.zip
+unzip -o -j /tmp/bun-1.3.14.zip 'bun-linux-x64/bun' -d "$HOME/.bun-1.3.14"
+chmod +x "$HOME/.bun-1.3.14/bun"
+"$HOME/.bun-1.3.14/bun" --version
 ```
 
-Expected: `1.3.14`. The isolated prefix keeps it off `PATH` so nothing else on the box changes.
+Expected: `1.3.14`. Nothing is added to `PATH` and no rc file is touched.
+
+If the binary dies with `Illegal instruction`, this host lacks AVX2 — use the
+`bun-linux-x64-baseline.zip` asset instead. (Checked on this host: AVX2 is
+present, so the standard build is correct.)
 
 - [ ] **Step 2: L1+L2 — build from the real ELF binary**
 
 ```bash
-BUN_BIN="$HOME/.bun-1.3.14/bin/bun" scripts/build.sh /usr/bin/claude
+BUN_BIN="$HOME/.bun-1.3.14/bun" scripts/build.sh /usr/bin/claude
 ```
 
 Expected: 8 modules; `/$bunfs/ paths rewired : 5`; `file:// leaks rewritten: 7`; `IIFE invocations added : 1`; no leftover warnings.
 
 - [ ] **Step 3: L3 — syntactic validity of the CJS wrapper**
 
-```bash
-node --check build/extract/cli.original.cjs && echo "SYNTAX OK"
+**Do not use `node --check`.** Claude's `cli.js` uses ES explicit resource
+management — 30 `using x =` and 5 `await using x =` declarations on linux
+(31 and 12 on darwin). Node 22 rejects `using` outright, and rejects
+`await using` *even with* `--js-explicit-resource-management`. That failure is
+inherent to the source — it reproduces on the untransformed `cli.original.js` —
+so a `SyntaxError: Unexpected identifier` from node says nothing about our
+transforms and must never be mistaken for one.
+
+Use Bun, whose parser accepts the syntax. `new Function(src)` compiles without
+executing:
+
+Create `scripts/syntax-check.js`:
+
+```javascript
+// Compile-only syntax check. new Function() parses the source and throws on a
+// syntax error, but never runs it — so this is safe on a 23 MB CLI bundle.
+// Runs under Bun because Node rejects the `using` / `await using` declarations
+// the real cli.js contains.
+const fs = require("fs");
+
+const target = process.argv[2];
+if (!target) {
+  console.error("usage: bun scripts/syntax-check.js <file>");
+  process.exit(2);
+}
+
+try {
+  new Function(fs.readFileSync(target, "utf8"));
+  console.log("SYNTAX OK");
+} catch (err) {
+  console.error("SYNTAX FAIL:", err.message);
+  process.exit(1);
+}
 ```
 
-Expected: `SYNTAX OK`. This is the check that catches a broken pragma-strip or IIFE append without executing anything — the same check the darwin path relies on.
+```bash
+"$HOME/.bun-1.3.14/bun" scripts/syntax-check.js build/extract/cli.original.cjs
+```
+
+Expected: `SYNTAX OK`. This catches a broken pragma-strip or IIFE append
+without executing anything.
+
+- [ ] **Step 3b: L3 on the darwin output — the macOS path's real check**
+
+Parsing is platform-independent, so the Linux Bun can syntax-check the *darwin*
+extraction even though it cannot run it. This is the strongest verification the
+macOS path can get on this host, and it is stronger than the `node --check` the
+plan originally specified:
+
+```bash
+OUT_DIR=/tmp/macbuild scripts/build.sh /tmp/ccmac/package/claude
+"$HOME/.bun-1.3.14/bun" scripts/syntax-check.js /tmp/macbuild/extract/cli.original.cjs
+```
+
+Expected: post-process reports `/$bunfs/ paths rewired : 9` and
+`file:// leaks rewritten: 8`, then `SYNTAX OK`.
 
 - [ ] **Step 4: L5 — rewritten asset paths resolve**
 
 ```bash
 ls -la build/extract/assets/
-grep -c "require('path').join(__dirname,'assets'" build/extract/cli.original.cjs
+grep -o "require('path').join(__dirname,'assets'" build/extract/cli.original.cjs | wc -l
 ```
 
-Expected: 5 assets listed; grep count `5`.
+Expected: 5 assets listed; count `5`.
+
+Use `grep -o … | wc -l`, not `grep -c`. `grep -c` counts *matching lines*, and
+minified code puts several rewrites on one line — it reports 4 here, not 5.
 
 - [ ] **Step 5: L4 — the actual run under Zig-era Bun**
 
+Run it against a scratch config dir so the live session's `~/.claude` state is
+never touched:
+
 ```bash
-"$HOME/.bun-1.3.14/bin/bun" build/extract/cli.original.cjs --version
+CLAUDE_CONFIG_DIR="$(mktemp -d)" \
+  "$HOME/.bun-1.3.14/bun" build/extract/cli.original.cjs --version
 ```
 
 Expected: `2.1.222 (Claude Code)`.
 
 **If it fails**, that is the finding, not a blocker. Capture the complete error and classify it:
 - `Expected CommonJS module to have a function wrapper` → the wrapper transform is wrong; re-check Step 3 and the tail of `cli.original.js`.
+- `SyntaxError: Unexpected identifier` near a `using` declaration → you ran the check under Node, not Bun. Re-read Step 3; this is not a transform bug.
 - A missing Bun API / `undefined is not a function` → **findings §10 has materialised**: Claude 2.1.222 needs a Bun newer than the last Zig release. Record the exact API and stop; do not work around it.
 - `Cannot find module '.../assets/X.node'` → an asset was not extracted; re-check Step 4.
 
@@ -1216,14 +1295,30 @@ Replace the scaffold map with a verified-on-what matrix: component × platform �
 
 Add an ELF section-header walk and a PE note beside the existing Mach-O walk, keeping the payload spec as the shared core. State that all three containers were confirmed to wrap a byte-identical payload.
 
+**Fix a pre-existing arithmetic error while you are here:** the doc calls the
+trailer `"\n---- Bun! ----\n"` **15 bytes** and derives
+`start = len(payload) - 47`. It is **16 bytes**, so the offset is
+`len(payload) - 48`. The code is unaffected (it uses `len(TRAILER)`), but the
+prose is wrong and would mislead anyone reimplementing from the spec.
+
 - [ ] **Step 4: Update `docs/runbook.md` and `README.md`**
 
 Runbook: Linux and macOS paths; verification by full path with nothing installed. README: replace the status table with the verified matrix and drop "not yet runnable as-is".
 
+Also record a known behavioural difference: the old design's launcher exported
+`CLAUDE_CODE_EXECPATH=<native binary>` "for shell integrations" (findings §6).
+`build.sh` no longer writes a launcher, so anyone running `cli.original.cjs`
+directly for real use — not just `--version` — should export it themselves.
+Document the variable and why it exists; do not reintroduce the launcher.
+
 - [ ] **Step 5: Verify no stale claims remain**
 
-Run: `grep -rn "never executed\|not yet runnable\|NEVER EXECUTED\|SCAFFOLD" docs/ README.md tools/ scripts/`
+Run: `grep -rn --exclude-dir=superpowers "never executed\|not yet runnable\|NEVER EXECUTED\|SCAFFOLD" docs/ README.md tools/ scripts/`
 Expected: no output. Any hit is a stale claim to fix.
+
+`--exclude-dir=superpowers` is required: `docs/superpowers/` holds this plan and
+the design spec, which describe the scaffold state as **historical record**.
+Those must not be scrubbed — they are the account of what was true before.
 
 - [ ] **Step 6: Run the full suite one last time**
 
