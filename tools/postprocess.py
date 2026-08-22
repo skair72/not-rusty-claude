@@ -17,11 +17,15 @@ What it does (see docs/findings.md §6):
   6. Write a one-line sibling cli.js next to it, because Claude's own code
      resolves join(__filename,'..','cli.js') for two MCP self-spawns.
 
-check() then validates the transformed code is actually sound (starts with
-`(function`, has exactly one trailing IIFE invocation). If it isn't, main()
-prints the errors to stderr and exits non-zero WITHOUT writing cli.original.cjs
-— a silently-broken output file reaching Bun surfaces only as the confusing
-panic "Expected CommonJS module to have a function wrapper".
+check() then validates the transformed code is actually sound. It has THREE
+fatal conditions: the output starts with `(function`; exactly one trailing IIFE
+invocation was appended; and it is not the case that zero /$bunfs/ literals were
+rewritten while assets/ holds files on disk (the "silently asset-less" outcome a
+wrong VFS prefix produces — see docs/status.md's Windows/PE section). If any of
+them fails, main() prints the errors to stderr and exits non-zero WITHOUT
+writing cli.original.cjs — a silently-broken output file reaching Bun surfaces
+only as the confusing panic "Expected CommonJS module to have a function
+wrapper".
 
 Usage:
   ./postprocess.py <extract-dir>

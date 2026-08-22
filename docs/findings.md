@@ -230,7 +230,7 @@ luck — the mislabel landed inside the `{napi, base64, file}` accept-set — so
 nothing failed, and the wrong label was then *explained* instead of checked. A
 genuine `base64` module (real byte 11) would have been labelled `dataurl`,
 missed the accept-set and been **silently dropped**; a `sqlite` module (15)
-would have become `unknown(16)`. Fixed in `61957a6`, with
+would have fallen off the end of that 15-entry table entirely and been reported as `unknown(15)`. Fixed in `61957a6`, with
 `test_loader_ids_match_bun_1_3_14` pinning the table and
 `test_genuine_base64_module_is_written_to_disk` covering the latent bug.
 

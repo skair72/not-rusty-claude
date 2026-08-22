@@ -5,10 +5,18 @@
 > Everything from "## Host" down to "## Summary table" is the original
 > evidence record as it was produced, and is **deliberately not being
 > rewritten**: an evidence record whose history is edited is not evidence.
-> Two of its numbers are stale as a result — it pastes the label
-> `pragma lines stripped` (the code now prints `pragma block stripped`, renamed
-> in `59d9a98`) and a `22 passed` test run (HEAD is 43). Neither reflects a
-> behaviour change; both are the record stopping one commit short.
+> Three things in it are stale as a result:
+>
+> - it pastes the label `pragma lines stripped` (the code now prints
+>   `pragma block stripped`, renamed in `59d9a98`);
+> - it pastes a `22 passed` test run (HEAD is 43);
+> - **every `.node` line in its Step 2 and Step 3b extraction output is labelled
+>   `native base64`** (the code now correctly prints `native napi`). That label
+>   is the falsified loader-enum bug itself, frozen in the record. The *bytes*
+>   extracted were and are correct — only the label was wrong.
+>
+> None of the three reflects a behaviour change; all are the record stopping one
+> commit short of the code.
 >
 > An **8-reviewer audit on 2026-08-22 falsified several claims this document
 > and the rest of the docs made.** The corrections, and a fresh re-run at
@@ -982,13 +990,24 @@ the equivalence gap showing itself. See below, and `findings.md` §11.
 ```
 $ … <bun-1.3.14> <out>/extract/cli.original.cjs mcp list
 No MCP servers configured. Use `claude mcp add` to add a server.        (exit 0)
-$ … <bun-1.4.0>  <out>/extract/cli.original.cjs mcp list
-No MCP servers configured. Use `claude mcp add` to add a server.        (exit 0)
 $ … <bun-1.3.14> <out>/extract/cli.js --version          # the wave-1 sibling shim
 2.1.222 (Claude Code)                                                  (exit 0)
 $ <bun-1.3.14> build --no-bundle --target=bun <out>/extract/cli.original.cjs --outfile=/dev/null
   null  29.60 MB  (chunk)                                              (exit 0)
 ```
+
+The **same artifact on Bun 1.4.0** — the Rust build — all four commands, first
+line of each:
+
+```
+$ DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR=$(mktemp -d) <bun-1.4.0> <out>/extract/cli.original.cjs <cmd>
+  --version  ->  2.1.222 (Claude Code)                                 rc=0
+  --help     ->  Usage: claude [options] [command] [prompt]            rc=0
+  doctor     ->  Claude Code doctor                                    rc=0
+  mcp list   ->  No MCP servers configured. Use `claude mcp add` …     rc=0
+```
+
+This is what "1.3.14 is sufficient, not necessary" rests on.
 
 ### Regression
 
@@ -1086,6 +1105,60 @@ The bundle's two lazy-module helpers were instrumented (`re` = CJS wrapper,
 doctor     ->  LAZY re=407/1644  E=2350/5104  TOTAL=2757/6748
 mcp list   ->  LAZY re=407/1644  E=2354/5104  TOTAL=2761/6748
 ```
+
+### `CLAUDE_CODE_EXECPATH`: written, never read
+
+```
+$ python3 census.py <out>/extract/cli.original.cjs
+occurrences of CLAUDE_CODE_EXECPATH             : 3
+occurrences of process.env.CLAUDE_CODE_EXECPATH : 0
+constant site: '",QRo=1e4,hNs="CLAUDE_CODE_EXECPATH",Fa_="CLAUDE_C'
+write site   : 'onmentOverrides(s,a){let l=null,c={};if(c[hNs]=process.execPath,l)c.TMUX=l;if(a)'
+shell-fn site: 'urn[`function ${e} {`,...l,`  local _cc_bin="\${${hNs}:-}"`,
+                `  [[ -x $_cc_bin ]] || _cc_bin=${Tp([a])}`,
+                `  if [[ ! -x $_cc_bin ]]; then command ${e} \'
+occurrences of isStandaloneExecutable           : 1
+```
+
+Three occurrences: the constant, and two entries in lists of environment-variable
+names. **Zero** reads of the environment variable. One write, unconditional, in
+`getEnvironmentOverrides`. The only consumer is the generated shell function,
+which reads it at the *shell* level. And `isStandaloneExecutable` occurs exactly
+once — in `CE()`.
+
+### The `file`-loader assets read back through the rewritten shape
+
+```
+$ <bun-1.3.14> -e '…readFile(join("<out>/extract","assets",n),"utf8")…'
+chart.umd.min.js             208522 chars
+hljsBundle.generated.min.js  955678 chars
+mermaid.min.js              3312874 chars
+```
+
+Matches the extracted sizes exactly. The rewrite shape resolves; whether the
+*features* that consume them work is still unexercised.
+
+### Upstream dates, from the GitHub API
+
+```
+$ curl -s https://api.github.com/repos/oven-sh/bun/pulls/30412
+{
+  "number": 30412,
+  "title": "Rewrite Bun in Rust",
+  "created_at": "2026-05-08T22:14:50Z",
+  "merged_at": "2026-05-14T08:09:34Z",
+  "merged": true
+}
+
+$ curl -s https://api.github.com/repos/oven-sh/bun/releases/tags/bun-v1.4.0
+{
+  "tag_name": "bun-v1.4.0",
+  "name": "Bun v1.4",
+  "published_at": "2026-08-20T14:07:21Z"
+}
+```
+
+`findings.md` §1 said the PR merged 2026-05-11. It did not.
 
 ### The darwin artifact under Linux Bun
 

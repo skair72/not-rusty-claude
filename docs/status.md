@@ -128,9 +128,10 @@ preference:
 
 Apple's licence also restricts macOS virtualization to Apple hardware. So the
 *remaining* part of this gap closes only on a real Mac: run
-`scripts/build.sh <native-binary>` there, then the printed
-`bun .../cli.original.cjs mcp list` (not `--version` — see
-[findings.md](./findings.md) §10), confirm an addon actually loads, and record
+`scripts/build.sh <native-binary>` there, then the command it prints —
+`DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" bun
+.../cli.original.cjs mcp list` (not `--version` — see
+[findings.md](./findings.md) §10) — confirm an addon actually loads, and record
 the result.
 
 ---
@@ -217,8 +218,9 @@ part that genuinely needs the hardware. See
 [§ macOS execution](#macos-execution-what-actually-needs-a-mac).
 
 - **Verify:** on Apple Silicon with Bun 1.3.14, run
-  `bun <out>/extract/cli.original.cjs mcp list` (not `--version` — it
-  initialises 0 lazy modules, findings §10), then load a darwin `.node` addon:
+  `DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR=$(mktemp -d) bun
+  <out>/extract/cli.original.cjs mcp list` (not `--version` — it initialises 0
+  lazy modules, findings §10), then load a darwin `.node` addon:
   `bun -e 'console.log(Object.keys(require("<out>/extract/assets/image-processor.node")))'`.
   That is the assertion Linux cannot make.
 - **Expected failure to plan for:** `Expected CommonJS module to have a function
@@ -238,8 +240,8 @@ worse problem was found underneath it.
 - **Settled** ✅: `require("<extract>/assets/image-processor.node")` under Bun
   1.3.14 loads and works — it reads a 3000×3000 PNG's metadata and resizes it
   to a valid JPEG. The rewritten `require('path').join(__dirname,'assets',…)`
-  shape is correct. All three `file`-loader assets read back at their full
-  sizes.
+  shape is correct. The three `file`-loader assets also read back through the
+  same shape via `fs/promises.readFile`: 208,522 / 955,678 / 3,312,874 chars.
 - **The real problem** (findings §11): the CLI *never asks* for the native
   image processor, because that call site is gated on
   `Bun.isStandaloneExecutable`, which is undefined outside a standalone.
