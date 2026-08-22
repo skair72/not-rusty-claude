@@ -1,6 +1,7 @@
 import importlib.util
 import os
 import pathlib
+import shutil
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -43,3 +44,21 @@ def real_macho_binary():
     if not path:
         pytest.skip("no Mach-O Claude binary; set NRC_TEST_MACHO")
     return path
+
+
+@pytest.fixture(scope="session")
+def bun_bin():
+    """A stock external Bun to actually load our output with.
+
+    Defaults to the unpacked 1.3.14 the runbook installs (not on PATH), then
+    falls back to whatever `bun` is on PATH. Skips when neither exists.
+    """
+    candidates = [
+        os.environ.get("BUN_BIN"),
+        os.path.join(os.path.expanduser("~"), ".bun-1.3.14", "bun"),
+        shutil.which("bun"),
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    pytest.skip("no bun available; set BUN_BIN")

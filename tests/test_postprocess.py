@@ -117,3 +117,78 @@ def test_nonzero_rewrites_with_populated_assets_dir_is_fine(postprocess):
     assert counts["assets"] == 1
 
     assert postprocess.check(out, counts, assets_on_disk=1) == []
+
+
+# --- the cli.js sibling shim -------------------------------------------------
+#
+# Claude's own code resolves a sibling cli.js for two MCP self-spawns
+# (join(__filename,"..","cli.js") at the --claude-in-chrome-mcp and
+# --computer-use-mcp sites). Our artifact is cli.original.cjs, so without a
+# sibling those spawns point at a file that does not exist - and one of them
+# PERSISTS the broken path into a Chrome native-messaging-host manifest.
+
+import pathlib
+import subprocess
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+# A minimal stand-in for the real 28 MB entry module: same shape (pragma line,
+# `(function(...)` wrapper, trailing `})`) so postprocess.py accepts it.
+TINY_ENTRY = (
+    "// @bun @bytecode @bun-cjs\n"
+    "(function(exports, require, module, __filename, __dirname) {\n"
+    "console.log('2.1.222 (Claude Code)');\n"
+    "console.log('argv1=' + process.argv[1]);\n"
+    "console.log('filename=' + __filename);\n"
+    "})\n"
+)
+
+
+def _postprocess(d):
+    return subprocess.run(
+        [sys.executable, str(ROOT / "tools" / "postprocess.py"), str(d)],
+        capture_output=True, text=True)
+
+
+def test_postprocess_emits_a_cli_js_sibling_shim(tmp_path):
+    (tmp_path / "cli.original.js").write_text(TINY_ENTRY)
+
+    result = _postprocess(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    shim = tmp_path / "cli.js"
+    assert shim.is_file(), "no sibling cli.js: both MCP self-spawns stay broken"
+    assert 'require("./cli.original.cjs")' in shim.read_text()
+
+
+def test_no_shim_is_written_when_the_transform_is_rejected(tmp_path):
+    """check() failing must leave the directory without a cli.js promising an
+    entry point that was never written."""
+    (tmp_path / "cli.original.js").write_text("(function(){return 1}")
+
+    result = _postprocess(tmp_path)
+
+    assert result.returncode != 0
+    assert not (tmp_path / "cli.js").exists()
+    assert not (tmp_path / "cli.original.cjs").exists()
+
+
+@pytest.mark.parametrize("pkg", [None, '{"type":"commonjs"}', '{"type":"module"}'])
+def test_cli_js_shim_boots_the_entry_under_bun(tmp_path, bun_bin, pkg):
+    """The shim is CJS-shaped `.js`; Bun must load it regardless of any
+    package.json "type" that happens to sit next to the artifacts."""
+    (tmp_path / "cli.original.js").write_text(TINY_ENTRY)
+    if pkg is not None:
+        (tmp_path / "package.json").write_text(pkg)
+    assert _postprocess(tmp_path).returncode == 0
+
+    result = subprocess.run([bun_bin, str(tmp_path / "cli.js"), "--version"],
+                            capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
+    assert "2.1.222 (Claude Code)" in result.stdout
+    # the self-spawn helper re-invokes process.argv[1]; the hardcoded MCP sites
+    # resolve join(__filename,"..","cli.js") - both must land on the shim's dir
+    assert f"argv1={tmp_path / 'cli.js'}" in result.stdout
+    assert f"filename={tmp_path / 'cli.original.cjs'}" in result.stdout

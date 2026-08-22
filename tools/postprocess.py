@@ -14,6 +14,8 @@ What it does (see docs/findings.md §6):
   3. Rewrite build-time fileURLToPath()/import.meta.url leaks to __filename.
   4. Append the CJS IIFE invocation so require()-ing the file actually runs it.
   5. Report any leftover /$bunfs/ references (should be none after step 2).
+  6. Write a one-line sibling cli.js next to it, because Claude's own code
+     resolves join(__filename,'..','cli.js') for two MCP self-spawns.
 
 check() then validates the transformed code is actually sound (starts with
 `(function`, has exactly one trailing IIFE invocation). If it isn't, main()
@@ -24,7 +26,8 @@ panic "Expected CommonJS module to have a function wrapper".
 Usage:
   ./postprocess.py <extract-dir>
       <extract-dir> is the output of extract_bun.py: it must contain
-      cli.original.js and an assets/ directory. Writes cli.original.cjs beside it.
+      cli.original.js and an assets/ directory. Writes cli.original.cjs and a
+      cli.js shim beside it.
 """
 
 import json
@@ -51,6 +54,23 @@ FILE_URL_LEAK = re.compile(
     r"\((['\"])file://[^'\"]*\1\)"
 )
 BUILD_PATH_LEAK = re.compile(r"""['"](/home/runner/[^'"]*)['"]""")
+
+# Two sites in Claude's own code resolve a SIBLING cli.js of the running entry
+# module and spawn it as an MCP server (docs/findings.md; reviewer C1/A4):
+#   let e=__filename, t=join(e,".."), r=join(t,"cli.js")        --claude-in-chrome-mcp
+#   [join(__filename,"..","cli.js"), "--computer-use-mcp"]      --computer-use-mcp
+# Our entry module is cli.original.cjs, so both resolve a file that does not
+# exist - and the first one PERSISTS that broken path into a Chrome
+# native-messaging-host manifest that outlives the session. Renaming the
+# artifact would invalidate the whole evidence record, so emit a one-line
+# sibling instead. Bun loads this CJS-shaped .js with no package.json, with
+# {"type":"commonjs"} and with {"type":"module"} alike.
+SHIM_NAME = "cli.js"
+SHIM_SOURCE = (
+    "// not-rusty-claude: Claude's own code resolves a sibling cli.js for its MCP\n"
+    "// self-spawns (--claude-in-chrome-mcp, --computer-use-mcp). Provide it.\n"
+    'require("./cli.original.cjs");\n'
+)
 
 
 def _asset_expr(match):
@@ -142,6 +162,11 @@ def main():
     with open(out, "w", encoding="utf-8") as fh:
         fh.write(code)
     print(f"wrote: {out}")
+
+    shim = os.path.join(d, SHIM_NAME)
+    with open(shim, "w", encoding="utf-8") as fh:
+        fh.write(SHIM_SOURCE)
+    print(f"wrote: {shim}  (sibling for Claude's MCP self-spawns)")
 
     for name in counts["leftovers"]:
         sys.stderr.write(f"warning: leftover bunfs reference: {name}\n")
