@@ -52,18 +52,44 @@ else
   warn "  curl -fsSL https://bun.sh/install | bash -s \"bun-v$MIN_BUN\""
 fi
 
-# 3. Extract
+# 3. Extract into a staging sibling, never over the live artifacts.
+#
+# A previous version rm -rf'd $WORK before extracting, so a failed rebuild (bad
+# binary, a Claude release whose cli.js no longer transforms) destroyed the last
+# known-good build - exactly the artifacts the docs tell you to keep as the
+# recovery path when a new Claude version will not run. Build beside it and swap
+# only after post-processing has succeeded.
 WORK="$OUT_DIR/extract"
-info "extracting cli.js + assets -> $WORK"
-rm -rf "$WORK"
+STAGE="$OUT_DIR/.extract.stage.$$"
+PREV="$OUT_DIR/.extract.prev.$$"
+
+cleanup() {
+  rm -rf "$STAGE"
+  # if we were interrupted between the two moves of the swap, put the old
+  # build back rather than leaving the user with nothing
+  if [ -d "$PREV" ]; then
+    if [ -e "$WORK" ]; then rm -rf "$PREV"; else mv "$PREV" "$WORK"; fi
+  fi
+}
+trap cleanup EXIT
+
 mkdir -p "$OUT_DIR"
-"$HERE/tools/extract_bun.py" "$NATIVE" "$WORK"
-[ -f "$WORK/cli.original.js" ] || die "extraction failed: cli.original.js missing"
+rm -rf "$STAGE"
+info "extracting cli.js + assets -> $WORK"
+"$HERE/tools/extract_bun.py" "$NATIVE" "$STAGE"
+[ -f "$STAGE/cli.original.js" ] || die "extraction failed: cli.original.js missing"
 
 # 4. Post-process
 info "post-processing cli.js for external Bun"
-"$HERE/tools/postprocess.py" "$WORK"
-[ -f "$WORK/cli.original.cjs" ] || die "post-process failed: cli.original.cjs missing"
+"$HERE/tools/postprocess.py" "$STAGE"
+[ -f "$STAGE/cli.original.cjs" ] || die "post-process failed: cli.original.cjs missing"
+[ -f "$STAGE/cli.js" ] || die "post-process failed: cli.js sibling missing"
+
+# 4b. Swap the staged build in. Everything above this line is reversible; if any
+# of it failed, the previous $WORK is still untouched on disk.
+if [ -e "$WORK" ]; then mv "$WORK" "$PREV"; fi
+mv "$STAGE" "$WORK"
+rm -rf "$PREV"
 
 # 5. Report - no install
 info "artifacts ready:"
