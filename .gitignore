@@ -9,6 +9,8 @@ extracted/
 cli.original.js
 cli.original.cjs
 cli.cjs
+# the generated sibling shim (postprocess.py), not a source file
+cli.js
 
 # python
 __pycache__/
