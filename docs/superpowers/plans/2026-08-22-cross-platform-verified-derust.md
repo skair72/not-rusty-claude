@@ -1298,6 +1298,14 @@ git commit -m "docs: record the end-to-end verification run on Bun 1.3.14"
 
 Replace the scaffold map with a verified-on-what matrix: component × platform × evidence. Delete work items 1, 2 and 4 (now done); rewrite item 3 as "verified on Linux, pending on macOS"; keep item 5 (update survival). Every row cites the verification doc.
 
+**Add a Windows/PE section.** `find_bun_section`'s refusal message tells the
+user to "see docs/status.md", and today this document says nothing about
+Windows. State: the win32-x64 build is a PE carrying the same `.bun` section
+(confirmed: `.bun` at rawoff=95182336 in `claude.exe` 2.1.239), the payload
+format is identical, extraction is deliberately unimplemented, and running the
+extracted JS would additionally need a Windows Bun. Without this the error
+message points at nothing.
+
 - [ ] **Step 2: Update `docs/findings.md`**
 
 - §4: state that the module list is **per-platform and per-version** — 15 on darwin-arm64 2.1.239 vs 8 on linux-x64 2.1.222 — and that the entry module *name* differs (`/$bunfs/root/cli` vs `/$bunfs/root/src/entrypoints/cli.js`), so extractors must use `entry_point_id`, never a name match.
