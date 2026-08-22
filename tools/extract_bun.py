@@ -15,7 +15,7 @@ Only reads the binary; never modifies or signs it. Runs on the stock
 Format (see docs/bun-section-format.md): the Bun standalone embeds a serialized
 module graph in a platform section (Mach-O __BUN,__bun; ELF/PE .bun), ending
 with the trailer magic '\\n---- Bun! ----\\n'. This tool implements the Mach-O
-(64-bit little-endian) case. Entry module -> cli.original.js; napi/base64/file
+and ELF cases, and refuses PE. Entry module -> cli.original.js; napi/base64/file
 modules -> assets/<name> written as RAW bytes (the 'base64' loader labels how
 Bun exposes the asset to JS, NOT how it is stored — do not decode).
 
@@ -36,6 +36,7 @@ LOADERS = {0: "jsx", 1: "js", 2: "ts", 3: "tsx", 4: "css", 5: "file",
 
 MH_MAGIC_64 = 0xFEEDFACF
 ELF_MAGIC_LE = 0x464C457F
+PE_MAGIC = b"MZ"
 
 
 def die(msg):
@@ -101,35 +102,28 @@ def find_bun_section_elf(buf):
 
 
 def find_bun_section(buf):
+    if buf[:2] == PE_MAGIC:
+        die("PE (Windows) executable detected - extraction is not supported.\n"
+            "       The .bun payload format is identical, but running the extracted\n"
+            "       JS needs a Windows Bun; see docs/status.md. Only Mach-O and ELF\n"
+            "       are supported.")
     magic = struct.unpack_from("<I", buf, 0)[0]
     if magic == MH_MAGIC_64:
         return find_bun_section_macho(buf)
     if magic == ELF_MAGIC_LE:
         return find_bun_section_elf(buf)
-    die(f"unrecognized magic 0x{magic:08x} (only 64-bit little-endian Mach-O ported)")
+    die(f"unrecognized magic 0x{magic:08x} "
+        f"(supported: 64-bit little-endian Mach-O and ELF)")
 
 
-def main():
-    if len(sys.argv) != 3:
-        die("usage: extract-bun.py <binary> <out-dir>")
-    binary, out_dir = sys.argv[1], sys.argv[2]
-
-    with open(binary, "rb") as fh:
-        buf = fh.read()
-    print(f"Size:    {len(buf)/1024/1024:.1f} MB")
-
-    raw_off, raw_size = find_bun_section(buf)
-    print(f"Section: __BUN,__bun  offset={raw_off} size={raw_size} ({raw_size/1024/1024:.1f} MB)")
-    section = buf[raw_off:raw_off + raw_size]
-
-    # payload = u64 length prefix, then the graph, ending in the trailer magic
+def parse_payload(section):
+    """Validate a raw __bun/.bun section and return
+    (payload, modules_offset, modules_size, entry_point_id)."""
     payload_size = struct.unpack_from("<Q", section, 0)[0]
     payload = section[8:8 + payload_size]
     if payload[-len(TRAILER):] != TRAILER:
         die("trailer mismatch - not a Bun standalone graph, or wrong offsets")
-    print(f"Payload: {payload_size} bytes, trailer OK")
 
-    # offsets struct sits just before the trailer
     start = len(payload) - len(TRAILER) - OFFSET_STRUCT_SIZE
     modules_offset = struct.unpack_from("<I", payload, start + 8)[0]
     modules_size = struct.unpack_from("<I", payload, start + 12)[0]
@@ -138,6 +132,25 @@ def main():
     if modules_size % MODULE_RECORD_SIZE != 0:
         die(f"modules table size {modules_size} not a multiple of {MODULE_RECORD_SIZE}")
     count = modules_size // MODULE_RECORD_SIZE
+    if count == 0:
+        die("modules table is empty")
+    if entry_point_id >= count:
+        die(f"entry point id {entry_point_id} out of range (only {count} modules)")
+    return payload, modules_offset, modules_size, entry_point_id
+
+
+def extract(binary, out_dir):
+    with open(binary, "rb") as fh:
+        buf = fh.read()
+    print(f"Size:    {len(buf)/1024/1024:.1f} MB")
+
+    raw_off, raw_size = find_bun_section(buf)
+    print(f"Section: offset={raw_off} size={raw_size} ({raw_size/1024/1024:.1f} MB)")
+    section = buf[raw_off:raw_off + raw_size]
+
+    payload, modules_offset, modules_size, entry_point_id = parse_payload(section)
+    count = modules_size // MODULE_RECORD_SIZE
+    print(f"Payload: {len(payload)} bytes, trailer OK")
     print(f"Modules: {count} (entry id={entry_point_id})")
 
     assets_dir = os.path.join(out_dir, "assets")
@@ -183,6 +196,12 @@ def main():
           f"({shim_count} loader shims left inlined in cli.js)")
     if cli_count != 1:
         die(f"expected exactly 1 entry-point, got {cli_count}")
+
+
+def main():
+    if len(sys.argv) != 3:
+        die("usage: extract_bun.py <binary> <out-dir>")
+    extract(sys.argv[1], sys.argv[2])
 
 
 if __name__ == "__main__":
