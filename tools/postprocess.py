@@ -15,6 +15,12 @@ What it does (see docs/findings.md §6):
   4. Append the CJS IIFE invocation so require()-ing the file actually runs it.
   5. Report any leftover /$bunfs/ references (should be none after step 2).
 
+check() then validates the transformed code is actually sound (starts with
+`(function`, has exactly one trailing IIFE invocation). If it isn't, main()
+prints the errors to stderr and exits non-zero WITHOUT writing cli.original.cjs
+— a silently-broken output file reaching Bun surfaces only as the confusing
+panic "Expected CommonJS module to have a function wrapper".
+
 Usage:
   ./postprocess.py <extract-dir>
       <extract-dir> is the output of extract_bun.py: it must contain
@@ -35,6 +41,17 @@ import sys
 BUNFS_LITERAL = re.compile(r"""(['"])/\$bunfs/root/([\w.\-]+)\1""")
 LEFTOVER_BUNFS = re.compile(r"/\$bunfs/root/[\w.\-]*")
 
+# Bun's bundler resolves import.meta.url at build time into a literal file://
+# URL of the build machine, e.g.
+#   nwu.fileURLToPath("file:///home/runner/work/.../setup.ts")
+# The optional `ns.` / `(0, ns.fn)` callee prefix must be consumed as well,
+# otherwise the replacement yields the syntax error `nwu.__filename`.
+FILE_URL_LEAK = re.compile(
+    r"(?:\(0,\s*[\w$]+\.fileURLToPath\)|(?:[\w$]+\.)?fileURLToPath)"
+    r"\((['\"])file://[^'\"]*\1\)"
+)
+BUILD_PATH_LEAK = re.compile(r"""['"](/home/runner/[^'"]*)['"]""")
+
 
 def _asset_expr(match):
     name = match.group(2)
@@ -46,10 +63,28 @@ def transform(code):
     counts = {}
     code, counts["pragma"] = re.subn(r"^(?:\/\/[^\n]*\n)+", "", code, count=1)
     code, counts["assets"] = BUNFS_LITERAL.subn(_asset_expr, code)
-    counts["file_urls"] = 0
-    counts["iife"] = 0
+    code, counts["file_urls"] = FILE_URL_LEAK.subn("__filename", code)
+    code, counts["iife"] = re.subn(
+        r"\}\)\s*$",
+        "})(exports, require, module, __filename, __dirname)",
+        code)
+    counts["build_paths"] = sorted(set(BUILD_PATH_LEAK.findall(code)))
     counts["leftovers"] = sorted(set(LEFTOVER_BUNFS.findall(code)))
     return code, counts
+
+
+def check(code, counts):
+    """Return a list of fatal problems; empty means the output should load."""
+    errors = []
+    if not code.startswith("(function"):
+        errors.append("output does not start with '(function' - Bun's CJS loader "
+                      "will panic with 'Expected CommonJS module to have a "
+                      "function wrapper'")
+    if counts["iife"] != 1:
+        errors.append("expected exactly 1 trailing IIFE to invoke, found "
+                      + str(counts["iife"])
+                      + " - the file does not end in '})'")
+    return errors
 
 
 def die(msg):
@@ -71,53 +106,35 @@ def main():
         code = fh.read()
     orig_len = len(code)
 
-    # (1) strip leading `//` pragma comment lines (e.g. "// @bun @bytecode @bun-cjs")
-    code, n_pragma = re.subn(r"^(?:\/\/[^\n]*\n)+", "", code, count=1)
+    code, counts = transform(code)
+    errors = check(code, counts)
 
-    # (2) bunfs native .node requires → extracted assets/ on disk
-    #     require('/$bunfs/root/NAME.node')  →
-    #     require(require('path').join(__dirname,'assets','NAME.node'))
-    def node_repl(m):
-        name = m.group(1)
-        return (f"require(require('path').join(__dirname,'assets',"
-                f"{name!r}+'.node'))")
-    code, n_node = re.subn(
-        r"require\(['\"]\/\$bunfs\/root\/([\w-]+)\.node['\"]\)",
-        node_repl, code)
+    print(f"pragma lines stripped  : {counts['pragma']}")
+    print(f"/$bunfs/ paths rewired : {counts['assets']}")
+    print(f"file:// leaks rewritten: {counts['file_urls']}")
+    print(f"IIFE invocations added : {counts['iife']}  (expected 1)")
+    print(f"size: {orig_len} -> {len(code)} bytes")
 
-    # (3) build-time fileURLToPath(import.meta.url) leaks → __filename
-    code, n_url = re.subn(
-        r"\(0,\s*[\w$]+\.fileURLToPath\)\([\w$.]*import\.meta\.url\)",
-        "__filename", code)
-
-    # (4) invoke the trailing CJS IIFE:  ...})  →  ...})(exports, require, module, __filename, __dirname)
-    code, n_iife = re.subn(
-        r"\}\)\s*$",
-        "})(exports, require, module, __filename, __dirname)",
-        code)
+    if errors:
+        for e in errors:
+            sys.stderr.write(f"error: {e}\n")
+        sys.exit(1)
 
     out = os.path.join(d, "cli.original.cjs")
     with open(out, "w", encoding="utf-8") as fh:
         fh.write(code)
-
-    # (5) report leftover bunfs references (file-loader assets, etc.)
-    leftovers = sorted(set(re.findall(r"\/\$bunfs\/root\/[\w.\-]+", code)))
-
-    print(f"pragma lines stripped : {n_pragma}")
-    print(f".node requires rewired: {n_node}")
-    print(f"fileURLToPath leaks   : {n_url}")
-    print(f"IIFE invocations added: {n_iife}  (expected 1)")
-    print(f"size: {orig_len} -> {len(code)} bytes")
     print(f"wrote: {out}")
-    if n_iife != 1:
-        sys.stderr.write("warning: expected exactly 1 trailing IIFE to invoke; "
-                         "check the tail of cli.original.js\n")
-    if leftovers:
-        sys.stderr.write("\nleftover /$bunfs/ references (file-loader assets that "
-                         "may still need rewriting for that feature):\n")
-        for l in leftovers:
-            sys.stderr.write(f"  {l}\n")
-        sys.stderr.write("Basic use (--version, chat) does not touch these.\n")
+
+    for name in counts["leftovers"]:
+        sys.stderr.write(f"warning: leftover bunfs reference: {name}\n")
+    for path in counts["build_paths"]:
+        sys.stderr.write(f"note: build-machine path still present: {path}\n")
+
+    assets_dir = os.path.join(d, "assets")
+    if os.path.isdir(assets_dir):
+        for entry in sorted(os.listdir(assets_dir)):
+            if entry not in code:
+                sys.stderr.write(f"note: extracted asset never referenced: {entry}\n")
 
 
 if __name__ == "__main__":
