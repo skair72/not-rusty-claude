@@ -22,9 +22,11 @@ def test_payload_round_trips_names_and_contents(extract_bun):
     assert rec[49] == 10
 
 
-def test_base64_loader_content_is_stored_raw_not_encoded(extract_bun, tmp_path):
-    """findings.md 5a: the base64 loader labels how Bun exposes an asset to JS,
-    not how it is stored. Decoding corrupts it (once produced 71-byte modules)."""
+def test_addon_content_is_written_verbatim_not_decoded(extract_bun, tmp_path):
+    """The section stores every module's raw bytes whatever its loader; a loader
+    name says how Bun would expose the module to JS, not how it is stored.
+    Decoding corrupts the addon (an early version produced 71-byte modules).
+    Loader 10 here is napi - what all the shipped .node addons really are."""
     macho_magic = b"\xcf\xfa\xed\xfe" + b"\x00" * 60
     payload = fixtures.build_payload([
         ("/$bunfs/root/cli", b"(function(){})", 1),
@@ -121,3 +123,45 @@ def test_module_name_reducing_to_unsafe_basename_is_rejected_cleanly(
     err = capsys.readouterr().err
     assert "error:" in err
     assert "unsafe basename" in err
+
+
+# --- loader ids must match Bun's own enum ------------------------------------
+#
+# src/bundler/options.zig at tag bun-v1.3.14:
+#   jsx=0 js=1 ts=2 tsx=3 css=4 file=5 json=6 jsonc=7 toml=8 wasm=9 napi=10
+#   base64=11 dataurl=12 text=13 bunsh=14 sqlite=15 sqlite_embedded=16
+#   html=17 yaml=18 json5=19 md=20
+
+def test_loader_ids_match_bun_1_3_14(extract_bun):
+    assert extract_bun.LOADERS[7] == "jsonc"
+    assert extract_bun.LOADERS[9] == "wasm"
+    assert extract_bun.LOADERS[10] == "napi"     # what the real .node addons are
+    assert extract_bun.LOADERS[11] == "base64"
+    assert extract_bun.LOADERS[15] == "sqlite"
+    assert extract_bun.LOADERS[20] == "md"
+
+
+def _extract_one(extract_bun, tmp_path, name, content, loader_id):
+    payload = fixtures.build_payload([
+        ("/$bunfs/root/cli", b"(function(){})", 1),
+        ("/$bunfs/root/" + name, content, loader_id),
+    ])
+    binary = tmp_path / "claude"
+    binary.write_bytes(fixtures.build_elf(payload))
+    out = tmp_path / "out"
+    extract_bun.extract(str(binary), str(out))
+    return out / "assets" / name
+
+
+def test_genuine_base64_module_is_written_to_disk(extract_bun, tmp_path):
+    """The latent bug the off-by-one enum hid: a real base64 module carries
+    byte 11, which the old table labelled "dataurl" - not in the accept-set, so
+    it fell through the else and was SILENTLY DROPPED. Nothing on either shipped
+    binary uses loader 11 today, so no existing test could catch it."""
+    blob = b"\x00\x01\x02payload-bytes\xff"
+
+    dest = _extract_one(extract_bun, tmp_path, "thing.bin", blob, 11)
+
+    assert dest.is_file(), "genuine base64 module was dropped"
+    assert dest.read_bytes() == blob
+

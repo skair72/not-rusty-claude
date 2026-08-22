@@ -17,8 +17,8 @@ Format (see docs/bun-section-format.md): the Bun standalone embeds a serialized
 module graph in a platform section (Mach-O __BUN,__bun; ELF/PE .bun), ending
 with the trailer magic '\\n---- Bun! ----\\n'. This tool implements the Mach-O
 and ELF cases, and refuses PE. Entry module -> cli.original.js; napi/base64/file
-modules -> assets/<name> written as RAW bytes (the 'base64' loader labels how
-Bun exposes the asset to JS, NOT how it is stored — do not decode).
+modules -> assets/<name> written as RAW bytes. Every .node addon on both shipped
+binaries carries loader id 10 = napi. Ids are Bun's, see LOADERS below.
 
 Usage:
   ./extract_bun.py <binary> <out-dir>
@@ -31,9 +31,19 @@ import sys
 TRAILER = b"\n---- Bun! ----\n"
 OFFSET_STRUCT_SIZE = 32
 MODULE_RECORD_SIZE = 52
+# Bun's own loader enum, transcribed from src/bundler/options.zig at tag
+# bun-v1.3.14. Get this wrong and modules are mislabelled: an earlier table
+# here omitted jsonc=7, shifting every id from 7 up by one. That table called
+# the .node addons (real id 10, napi) "base64", which happened to be in the
+# accept-set below so extraction still worked - while a GENUINE base64 module
+# (real id 11) was labelled "dataurl", missed the accept-set, and would have
+# been silently dropped. Re-check this table against Bun's source if the
+# extractor is ever pointed at a binary built by a different Bun version.
 LOADERS = {0: "jsx", 1: "js", 2: "ts", 3: "tsx", 4: "css", 5: "file",
-           6: "json", 7: "toml", 8: "wasm", 9: "napi", 10: "base64",
-           11: "dataurl", 12: "text", 13: "bunsh", 14: "sqlite"}
+           6: "json", 7: "jsonc", 8: "toml", 9: "wasm", 10: "napi",
+           11: "base64", 12: "dataurl", 13: "text", 14: "bunsh", 15: "sqlite",
+           16: "sqlite_embedded", 17: "html", 18: "yaml", 19: "json5",
+           20: "md"}
 
 MH_MAGIC_64 = 0xFEEDFACF
 ELF_MAGIC_LE = 0x464C457F
@@ -181,13 +191,13 @@ def extract(binary, out_dir):
             print(f"  entry   {loader:7} {len(content)/1024/1024:6.2f} MB -> {dest}")
             cli_count += 1
         elif loader in ("napi", "base64", "file"):
-            # Native addons (.node) and runtime assets (mermaid, highlight.js,
-            # the html template) must land on real disk for cli.js to
-            # require/read them once /$bunfs no longer exists. The stored
-            # content is ALWAYS the raw bytes - the 'base64' loader label
-            # describes how Bun later exposes the asset to JS (as a base64
-            # string), NOT how it is stored. Decoding it would corrupt the
-            # Mach-O. Write verbatim.
+            # Native addons (.node, loader napi) and runtime assets (mermaid,
+            # highlight.js, the html template - loader file) must land on real
+            # disk for cli.js to require/read them once /$bunfs no longer
+            # exists. Whatever the loader, the section stores the module's RAW
+            # bytes; a loader name describes how Bun would later expose the
+            # module to JS (base64 = as a base64 string), NOT how it is stored.
+            # Decoding would corrupt the payload. Write verbatim.
             if base in ("", ".", ".."):
                 # base is already reduced to a basename (see above), so this
                 # is never a traversal hole - just a name that would collide
