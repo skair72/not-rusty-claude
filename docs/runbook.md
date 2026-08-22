@@ -134,7 +134,7 @@ Do not rely on it alone.
 ## 4. Run it — by full path
 
 ```bash
-CLAUDE_CONFIG_DIR="$(mktemp -d)" \
+DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \
   "$BUN_BIN" build/extract/cli.original.cjs --version
 ```
 
@@ -142,12 +142,17 @@ Expected: the version string of the binary you extracted from, e.g.
 `2.1.222 (Claude Code)`, exit 0.
 
 The scratch `CLAUDE_CONFIG_DIR` keeps a first run away from your real
-`~/.claude` — worth doing until you trust the build. Deeper smoke tests that
+`~/.claude` — worth doing until you trust the build. `DISABLE_AUTOUPDATER=1`
+keeps the build from trying to update *itself* down a route that would install
+a different, npm-based Claude Code on your machine — see
+[Surviving Claude updates](#surviving-claude-updates) before you drop it. Deeper smoke tests that
 were verified on Linux:
 
 ```bash
-CLAUDE_CONFIG_DIR="$(mktemp -d)" "$BUN_BIN" build/extract/cli.original.cjs --help
-CLAUDE_CONFIG_DIR="$(mktemp -d)" "$BUN_BIN" build/extract/cli.original.cjs mcp list
+DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \
+  "$BUN_BIN" build/extract/cli.original.cjs --help
+DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \
+  "$BUN_BIN" build/extract/cli.original.cjs mcp list
 ```
 
 `--help` renders the full command registry; `mcp list` actually reads and writes
@@ -195,16 +200,65 @@ CLAUDE_CODE_EXECPATH="$NATIVE" \
 
 ## Surviving Claude updates
 
-Anthropic's auto-update installs a new native binary and repoints its own
-launcher. Your extracted artifacts do not follow it — they keep running the
-version you extracted until you rebuild:
+### ⚠️ Run the extracted build with `DISABLE_AUTOUPDATER=1`
+
+Do not let this build update itself, and do not run `claude update` against it.
+
+Claude decides how it was installed with
+`function CE(){return Bun.isStandaloneExecutable===!0}`. Under a stock external
+Bun that property is **undefined**, so `CE()` is false: the detector never
+reaches its `native` case, falls through to npm/global heuristics over
+`process.execPath` (which is now *bun*), shells out to `npm config get prefix`,
+and ends at `unknown`.
+
+Measured here, in a throwaway `HOME`, with `doctor` alone:
+
+```
+Running: unknown (2.1.222)
+Path: /home/claude/.bun-1.3.14/bun
+Invoked: /tmp/w1rep/extract/cli.original.cjs
+Config install method: not set
+```
+
+— and that probe alone left `~/.npm/_logs` (three `npm config get prefix`
+debug logs) and `~/.bun/install/cache` behind in that `HOME`.
+
+`claude update` continues from the same `unknown` verdict: it prints
+`Installation method set to: unknown` and takes the **npm / bun global-install
+route**. With working network that route installs a *different, npm-based*
+Claude Code onto your machine. It can never update these artifacts — nothing in
+it writes to `build/extract/`. (The npm route was exercised by the review fleet
+in a throwaway `HOME`; it is deliberately **not** re-run here, because with
+network it performs the install.)
+
+```bash
+DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \
+  "$BUN_BIN" build/extract/cli.original.cjs --version
+```
+
+`DISABLE_AUTOUPDATER` is read by the bundle (`if(te.DISABLE_AUTOUPDATER)`
+alongside `DISABLE_UPDATES`) and turns off **background** auto-updates. It does
+not stop an explicitly typed `claude update`; only `DISABLE_UPDATES=1` makes
+that command refuse outright ("Updates are disabled by your administrator").
+Set `DISABLE_AUTOUPDATER=1` always, and add `DISABLE_UPDATES=1` if you want the
+manual command fenced off too. `scripts/build.sh` prints the run command with
+`DISABLE_AUTOUPDATER=1` for this reason.
+
+### Moving to a new Claude version
+
+The way forward is always: get the new **native** binary and rebuild. Your
+artifacts keep running the version you extracted until you do.
 
 ```bash
 BUN_BIN="$HOME/.bun-1.3.14/bun" scripts/build.sh "$NATIVE"
 python3 -m pytest tests/ -q        # counts are version-specific; see below
-CLAUDE_CONFIG_DIR="$(mktemp -d)" \
+DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \
   "$BUN_BIN" build/extract/cli.original.cjs --version
 ```
+
+A failed rebuild is safe: `build.sh` extracts into a staging directory and swaps
+it in only after post-processing succeeds, so `build/extract/` still holds the
+previous working build if anything goes wrong.
 
 Two things to expect:
 

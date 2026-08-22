@@ -90,13 +90,23 @@ info "post-processing cli.js for external Bun"
 if [ -e "$WORK" ]; then mv "$WORK" "$PREV"; fi
 mv "$STAGE" "$WORK"
 rm -rf "$PREV"
+info "staged build swapped into place -> $WORK"
 
 # 5. Report - no install
 info "artifacts ready:"
-printf '      %s\n' "$WORK/cli.original.cjs" "$WORK/assets/"
+printf '      %s\n' "$WORK/cli.original.cjs" "$WORK/cli.js" "$WORK/assets/"
 echo
 info "run it with:"
-printf '      %s %s --version\n' "${BUN_BIN:-bun}" "$WORK/cli.original.cjs"
+printf '      DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \\\n'
+printf '        %s %s --version\n' "${BUN_BIN:-bun}" "$WORK/cli.original.cjs"
 echo
+warn "DISABLE_AUTOUPDATER=1 matters: under an external Bun,"
+warn "Bun.isStandaloneExecutable is undefined, so Claude's install-method"
+warn "detection reports 'unknown' and its updater takes the npm/bun"
+warn "global-install route - it would install a DIFFERENT, npm-based Claude"
+warn "Code on your machine instead of updating these artifacts. It also never"
+warn "updates them. Do not run 'claude update' against this build; rebuild"
+warn "from a new native binary instead."
+warn "CLAUDE_CONFIG_DIR keeps a first run away from your real ~/.claude."
 warn "Nothing was installed on PATH. Creating a 'claude' launcher could shadow"
 warn "your real installation - run the command above by full path instead."

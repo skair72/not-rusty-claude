@@ -196,8 +196,14 @@ assumed: with the whole `assets/` directory renamed away, `--version` and
 
 ### 4. Update survival & version pinning
 
-Anthropic's auto-update installs a new native binary; the extracted artifacts do
-not follow it. Re-run `build.sh` to move forward.
+Run the extracted build with `DISABLE_AUTOUPDATER=1`, and never `claude update`
+against it. `Bun.isStandaloneExecutable` is undefined under an external Bun, so
+Claude's install-method detection reports `unknown` and its updater takes the
+npm/bun global-install route — with network that installs a *different,
+npm-based* Claude Code on the machine, and it never updates these artifacts.
+See [runbook.md](./runbook.md) § Surviving Claude updates. Re-run `build.sh`
+against a new native binary to move forward; a failed rebuild now keeps the
+previous `build/extract/` intact.
 
 - **The project's kill switch (findings §10):** if a future Claude build is
   compiled against a canary Bun newer than 1.3.14, its `cli.js` will not run on
