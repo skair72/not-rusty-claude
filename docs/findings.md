@@ -479,7 +479,7 @@ CLAUDE_CONFIG_DIR="$(mktemp -d)" \
   "$HOME/.bun-1.3.14/bun" build/extract/cli.original.cjs --version
 
 # regression
-python3 -m pytest tests/ -q            # 22 passed
+python3 -m pytest tests/ -q            # 31 passed
 ```
 
 `scripts/syntax-check.js` is a **secondary** check only: `new Function(source)`

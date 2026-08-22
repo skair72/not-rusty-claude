@@ -59,7 +59,7 @@ installed on this host, the macOS and Windows binaries were downloaded from npm
 | Output accepted by Bun 1.3.14's parser | 🔎 `bun build --no-bundle`, exit 0 (Step 3) | 🔎 `bun build --no-bundle`, exit 0 (Step 3b) | ⛔ |
 | **Runs under external Bun 1.3.14** | ✅ `--version`, `--help`, `mcp list` all exit 0 (Steps 5, 5b) | 🖥️ not executed here — needs Apple Silicon | ⛔ would also need a Windows Bun |
 | Runtime asset (`assets/*`) resolution | 🔎 **static only** — paths rewritten and files on disk; no executed command loaded one (Step 4) | 🔎 static only | ⛔ |
-| Test suite (22 tests) | ✅ 22 passed, incl. 4 integration tests against the real ELF **and** Mach-O binaries | ✅ same run | — |
+| Test suite (31 tests) | ✅ 31 passed, incl. 4 integration tests against the real ELF **and** Mach-O binaries | ✅ same run | — |
 | Approach B: byte-patch + re-sign (`tools/patch_claude.py`) | n/a (macOS-only concern) | 📓 verified 2026-08-21 on 2.1.238; not re-checked here | n/a |
 
 Step numbers refer to sections of

@@ -92,11 +92,11 @@ not-rusty-claude/
 ├── scripts/
 │   ├── build.sh                    extract → post-process → print the run command
 │   └── syntax-check.js             fast secondary syntax check (JSC, not Bun)
-└── tests/                          22 tests: hermetic fixtures + real-binary integration
+└── tests/                          31 tests: hermetic fixtures + real-binary integration
 ```
 
 Everything runs on stock `python3` (3.9+) with no dependencies. `python3 -m
-pytest tests/ -q` → 22 passed. The integration tests need the real binaries and
+pytest tests/ -q` → 31 passed. The integration tests need the real binaries and
 skip cleanly without them; their hardcoded counts are a deliberate tripwire for
 the next Claude release (see [`docs/status.md`](docs/status.md)).
 
