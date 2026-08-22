@@ -68,12 +68,44 @@ def find_bun_section_macho(buf):
     die("Mach-O has no __BUN,__bun section")
 
 
+def find_bun_section_elf(buf):
+    """Return (raw_offset, raw_size) of the .bun section in an ELF64 image.
+
+    The container differs from Mach-O but the payload it wraps is byte-identical
+    (see docs/bun-section-format.md): a u64 length prefix, the module graph, and
+    the trailer magic.
+    """
+    if buf[4] != 2 or buf[5] != 1:
+        die("only 64-bit little-endian ELF is supported")
+    e_shoff = struct.unpack_from("<Q", buf, 0x28)[0]
+    e_shentsize = struct.unpack_from("<H", buf, 0x3A)[0]
+    e_shnum = struct.unpack_from("<H", buf, 0x3C)[0]
+    e_shstrndx = struct.unpack_from("<H", buf, 0x3E)[0]
+    if e_shoff == 0 or e_shnum == 0:
+        die("ELF has no section headers (stripped?) - cannot locate .bun")
+
+    def shdr(i):
+        off = e_shoff + i * e_shentsize
+        # sh_name u32, sh_type u32, sh_flags u64, sh_addr u64,
+        # sh_offset u64, sh_size u64
+        return struct.unpack_from("<IIQQQQ", buf, off)
+
+    _, _, _, _, str_off, str_size = shdr(e_shstrndx)
+    strtab = buf[str_off:str_off + str_size]
+    for i in range(e_shnum):
+        name_off, _, _, _, off, size = shdr(i)
+        end = strtab.find(b"\0", name_off)
+        if strtab[name_off:end] == b".bun":
+            return off, size
+    die("ELF has no .bun section")
+
+
 def find_bun_section(buf):
     magic = struct.unpack_from("<I", buf, 0)[0]
     if magic == MH_MAGIC_64:
         return find_bun_section_macho(buf)
     if magic == ELF_MAGIC_LE:
-        die("ELF parsing not ported here; use ClawGod's extract-natives.mjs")
+        return find_bun_section_elf(buf)
     die(f"unrecognized magic 0x{magic:08x} (only 64-bit little-endian Mach-O ported)")
 
 
