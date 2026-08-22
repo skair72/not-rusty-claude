@@ -1,4 +1,4 @@
-#!/usr/bin/env /usr/bin/python3
+#!/usr/bin/env python3
 """
 postprocess.py - turn an extracted Bun standalone entry module (cli.original.js)
 into a CommonJS file a stock external Bun can require and run.
@@ -73,8 +73,14 @@ def transform(code):
     return code, counts
 
 
-def check(code, counts):
-    """Return a list of fatal problems; empty means the output should load."""
+def check(code, counts, assets_on_disk=None):
+    """Return a list of fatal problems; empty means the output should load.
+
+    assets_on_disk, when given, is the number of files extract_bun.py wrote to
+    <extract-dir>/assets (None if that directory does not exist / was not
+    checked - e.g. when transform() is exercised in isolation on a text
+    snippet with no accompanying assets/ dir on disk).
+    """
     errors = []
     if not code.startswith("(function"):
         errors.append("output does not start with '(function' - Bun's CJS loader "
@@ -84,6 +90,13 @@ def check(code, counts):
         errors.append("expected exactly 1 trailing IIFE to invoke, found "
                       + str(counts["iife"])
                       + " - the file does not end in '})'")
+    if counts["assets"] == 0 and assets_on_disk:
+        errors.append(
+            "0 /$bunfs/ paths were rewired but assets/ has "
+            f"{assets_on_disk} file(s) on disk - BUNFS_LITERAL matched nothing "
+            "(wrong VFS prefix for this platform? see docs/status.md's "
+            "Windows/PE section) and the output would silently ship without "
+            "its assets rather than fail loudly")
     return errors
 
 
@@ -99,7 +112,12 @@ def main():
     src = os.path.join(d, "cli.original.js")
     if not os.path.isfile(src):
         die(f"{src} not found - run extract_bun.py first")
-    if not os.path.isdir(os.path.join(d, "assets")):
+
+    assets_dir = os.path.join(d, "assets")
+    assets_on_disk = None
+    if os.path.isdir(assets_dir):
+        assets_on_disk = len(os.listdir(assets_dir))
+    else:
         sys.stderr.write("warning: no assets/ dir; native/file modules will be missing\n")
 
     with open(src, "r", encoding="utf-8", errors="replace") as fh:
@@ -107,9 +125,9 @@ def main():
     orig_len = len(code)
 
     code, counts = transform(code)
-    errors = check(code, counts)
+    errors = check(code, counts, assets_on_disk)
 
-    print(f"pragma lines stripped  : {counts['pragma']}")
+    print(f"pragma block stripped  : {counts['pragma']}")
     print(f"/$bunfs/ paths rewired : {counts['assets']}")
     print(f"file:// leaks rewritten: {counts['file_urls']}")
     print(f"IIFE invocations added : {counts['iife']}  (expected 1)")
@@ -130,8 +148,7 @@ def main():
     for path in counts["build_paths"]:
         sys.stderr.write(f"note: build-machine path still present: {path}\n")
 
-    assets_dir = os.path.join(d, "assets")
-    if os.path.isdir(assets_dir):
+    if assets_on_disk is not None:
         for entry in sorted(os.listdir(assets_dir)):
             if entry not in code:
                 sys.stderr.write(f"note: extracted asset never referenced: {entry}\n")

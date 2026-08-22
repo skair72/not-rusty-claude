@@ -1,13 +1,14 @@
-#!/usr/bin/env /usr/bin/python3
+#!/usr/bin/env python3
 """
 extract_bun.py - pull cli.js + native modules and assets out of a Bun standalone
 executable (e.g. the native Claude Code binary), so the JS can be run under a
 stock external Bun instead of the signed binary's embedded runtime.
 
-✅ VERIFIED on ~/.local/share/claude/versions/2.1.238 (arm64, macOS 24.6.0):
-   extracts cli.original.js (26.8 MB) + 9 assets; all 5 .node come out as real
-   Mach-O dylibs. Module names/loaders can change between Claude versions, so
-   re-confirm per docs/status.md work item #1 on a new binary.
+Both the Mach-O and ELF code paths here have been run against real Claude Code
+binaries; see docs/status.md's verification matrix for current per-platform
+counts and status - this comment does not restate them so they cannot drift out
+of sync. Module names/loaders can change between Claude versions, so re-measure
+per docs/status.md's "Remaining work" item 1 on a new binary.
 
 Only reads the binary; never modifies or signs it. Runs on the stock
 /usr/bin/python3 (3.9+) with no node/bun needed.
@@ -76,6 +77,9 @@ def find_bun_section_elf(buf):
     (see docs/bun-section-format.md): a u64 length prefix, the module graph, and
     the trailer magic.
     """
+    if len(buf) < 0x40:
+        die(f"ELF header truncated - file is only {len(buf)} bytes "
+            "(need at least 64 for the fixed header)")
     if buf[4] != 2 or buf[5] != 1:
         die("only 64-bit little-endian ELF is supported")
     e_shoff = struct.unpack_from("<Q", buf, 0x28)[0]
@@ -84,6 +88,9 @@ def find_bun_section_elf(buf):
     e_shstrndx = struct.unpack_from("<H", buf, 0x3E)[0]
     if e_shoff == 0 or e_shnum == 0:
         die("ELF has no section headers (stripped?) - cannot locate .bun")
+    if e_shoff + e_shnum * e_shentsize > len(buf):
+        die("ELF section header table extends past end of file "
+            "(truncated or corrupt binary)")
 
     def shdr(i):
         off = e_shoff + i * e_shentsize
@@ -181,6 +188,13 @@ def extract(binary, out_dir):
             # describes how Bun later exposes the asset to JS (as a base64
             # string), NOT how it is stored. Decoding it would corrupt the
             # Mach-O. Write verbatim.
+            if base in ("", ".", ".."):
+                # base is already reduced to a basename (see above), so this
+                # is never a traversal hole - just a name that would collide
+                # with the assets/ directory itself and raise
+                # IsADirectoryError from open() below. Fail cleanly instead.
+                die(f"module {i} ({name!r}) reduces to an unsafe basename "
+                    f"{base!r} - refusing to write it under assets/")
             os.makedirs(assets_dir, exist_ok=True)
             dest = os.path.join(assets_dir, base)
             with open(dest, "wb") as fh:

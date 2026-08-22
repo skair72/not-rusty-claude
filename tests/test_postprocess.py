@@ -83,3 +83,37 @@ def test_sound_output_reports_no_errors(postprocess):
     out, counts = postprocess.transform(REAL_HEAD + REAL_TAIL)
 
     assert postprocess.check(out, counts) == []
+
+
+def test_zero_rewrites_with_populated_assets_dir_is_fatal(postprocess):
+    """Reproduces the win32 VFS-prefix case: BUNFS_LITERAL matches nothing
+    (Windows uses 'B:/~BUN/root/', not '/$bunfs/root/'), so counts['assets']
+    is 0 while extract_bun.py has already written real files to assets/.
+    That combination must be fatal, not a silent asset-less success - the
+    exact anti-pattern docs/status.md cites as a reason not to ship PE
+    support."""
+    out, counts = postprocess.transform(REAL_HEAD + REAL_TAIL)
+    assert counts["assets"] == 0
+
+    errors = postprocess.check(out, counts, assets_on_disk=3)
+
+    assert errors
+    assert any("assets" in e.lower() for e in errors)
+
+
+def test_zero_rewrites_with_empty_or_absent_assets_dir_is_not_fatal(postprocess):
+    """0 rewrites is fine when there was nothing to rewrite in the first
+    place: no assets/ dir at all (None), or an assets/ dir extract_bun.py
+    made but left empty (0)."""
+    out, counts = postprocess.transform(REAL_HEAD + REAL_TAIL)
+    assert counts["assets"] == 0
+
+    assert postprocess.check(out, counts, assets_on_disk=None) == []
+    assert postprocess.check(out, counts, assets_on_disk=0) == []
+
+
+def test_nonzero_rewrites_with_populated_assets_dir_is_fine(postprocess):
+    out, counts = postprocess.transform(REAL_HEAD + ASSET_CONST + REAL_TAIL)
+    assert counts["assets"] == 1
+
+    assert postprocess.check(out, counts, assets_on_disk=1) == []

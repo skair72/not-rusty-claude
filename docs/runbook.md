@@ -97,7 +97,7 @@ and version — see [findings.md](./findings.md) §4 and §6):
 ```
 Modules: 8 (entry id=0)
 Extracted: 1 cli.js + 5 assets (2 loader shims left inlined in cli.js)
-pragma lines stripped  : 1
+pragma block stripped  : 1
 /$bunfs/ paths rewired : 5
 file:// leaks rewritten: 7
 IIFE invocations added : 1  (expected 1)

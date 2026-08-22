@@ -1,4 +1,4 @@
-#!/usr/bin/env /usr/bin/python3
+#!/usr/bin/env python3
 """
 patch-claude.py - length-preserving byte patcher + ad-hoc re-signer for the
 native (Bun-compiled) Claude Code Mach-O binary, or any signed macOS executable.

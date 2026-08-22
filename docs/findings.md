@@ -238,7 +238,7 @@ that confusing panic, so the failure is made loud and early instead.
 
 | | `linux-x64` 2.1.222 | `darwin-arm64` 2.1.239 |
 |---|---|---|
-| pragma lines stripped | 1 | 1 |
+| pragma block stripped | 1 | 1 |
 | `/$bunfs/` literals rewritten | **5** | **9** |
 | `file://` leaks rewritten | **7** | **8** |
 | IIFE invocations added | 1 | 1 |
