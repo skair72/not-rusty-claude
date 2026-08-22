@@ -22,7 +22,7 @@ a command whose output is pasted in
 | Extract `cli.js` + assets (`extract_bun.py`) | ✅ executed | ✅ executed | ⛔ refused by design |
 | Post-process (`postprocess.py`) | ✅ executed | ✅ executed | ⛔ |
 | `scripts/build.sh` end to end | ✅ executed | ✅ executed | ⛔ |
-| Output accepted by Bun 1.3.14's own parser | ✅ | 🔎 static only | ⛔ |
+| Output accepted by Bun 1.3.14's own parser | 🔎 exit 0 | 🔎 exit 0 | ⛔ |
 | **Runs under external Bun 1.3.14** | ✅ `--version`, `--help`, `mcp list` | 🖥️ needs a Mac | ⛔ would also need a Windows Bun |
 | Runtime asset loading | 🔎 unverified | 🔎 unverified | ⛔ |
 

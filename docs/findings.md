@@ -147,7 +147,9 @@ idx loader     size      name
 
 (`win32-x64` 2.1.239 has **9** modules 🔎 — the linux set plus
 `payload.template.html.asset` — and its names use the `B:/~BUN/root/` prefix
-instead of `/$bunfs/root/`. See [status.md](./status.md) § Windows/PE.)
+instead of `/$bunfs/root/`. Its entry module is `B:/~BUN/root/cli`: it follows
+**darwin's** short name, not linux's `src/entrypoints/cli.js` — a third data
+point for the rule below. See [status.md](./status.md) § Windows/PE.)
 
 **Consequences, all of them practical:**
 
@@ -267,11 +269,29 @@ literal-URL form, and must also consume an optional `ns.` / `(0, ns.fn)` callee
 prefix: replacing only the argument would produce `ns.__filename`, a syntax
 error that the check step is there to catch.
 
-Precision, since the numbers matter: the *substring*
-`fileURLToPath(import.meta.url)` does occur (twice in each binary), just never
-through the indirect-call form the scaffold anchored on. Those sites, plus
-`fileURLToPath(new URL('.', import.meta.url))`-style calls, are genuine runtime
-uses in vendored library code, not build-time leaks, and are **left alone**.
+Precision, since the numbers matter 🔎: the *substring*
+`fileURLToPath(import.meta.url)` does occur (twice in each binary), and a wider
+`fileURLToPath(…import.meta.url)` match finds **5 sites per binary**. **Every
+one of them sits inside a string literal, not in executable code** — confirmed
+by dumping the surrounding bytes at each site:
+
+- **3 sites** are inside an embedded `.mjs` **script source carried as text**
+  (design/build tooling: `scriptsShaFor()`, `package-build.mjs`,
+  `storybook/http-serve.mjs`). The doubled escaping is the tell — `\\u2014` and
+  `\\${…}` inside the block — and the win32 build's copy of the same block
+  preserves Windows line endings as `\r` escape sequences (20,932 occurrences of
+  `\r` before a newline in that entry module, against 143 on linux). Text being
+  carried, not code being run.
+- **2 sites** — exactly the two exact-substring hits — are inside embedded
+  **Markdown documentation about ESM**: one in prose explaining that
+  `__dirname` does not exist in ES modules, one inside a fenced `typescript`
+  example block.
+
+The same holds for all 16 bare `import.meta.url` occurrences: every one is
+inside staged script text or documentation. Rewriting any of them would corrupt
+embedded text rather than fix a path, so they are **left alone** — and that is
+why the real leak count is 7/8 and not higher.
+
 🔎 After post-processing, 16 `import.meta.url` references, 12 `fileURLToPath`
 calls, and 2–3 bare `file:///` literals remain in each output. None of the
 commands executed in the verification run hit a problem from them; no stronger

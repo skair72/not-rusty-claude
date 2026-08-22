@@ -56,8 +56,8 @@ installed on this host, the macOS and Windows binaries were downloaded from npm
 | Extract `cli.js` + assets (raw bytes) | ✅ 1 + 5 assets (Step 2) | ✅ 1 + 9 assets (Step 3b) | ⛔ |
 | `postprocess.py` transforms | ✅ 5 `/$bunfs/` rewrites, 7 `file://`, 1 IIFE, 0 leftovers (Step 2) | ✅ 9 `/$bunfs/` rewrites, 8 `file://`, 1 IIFE, 0 leftovers (Step 3b) | ⛔ (and the regexes would not match — see below) |
 | `scripts/build.sh` end to end | ✅ (Step 2) | ✅ (Step 3b) | ⛔ |
-| Output accepted by Bun 1.3.14's parser | ✅ `bun build --no-bundle`, exit 0 (Step 3) | 🔎 `bun build --no-bundle`, exit 0 (Step 3b) | ⛔ |
-| **Runs under external Bun 1.3.14** | ✅ `--version`, `--help`, `mcp list` all exit 0 (Steps 5, 5b) | 🖥️ not executed here — needs Apple Silicon | 🖥️ ⛔ would also need a Windows Bun |
+| Output accepted by Bun 1.3.14's parser | 🔎 `bun build --no-bundle`, exit 0 (Step 3) | 🔎 `bun build --no-bundle`, exit 0 (Step 3b) | ⛔ |
+| **Runs under external Bun 1.3.14** | ✅ `--version`, `--help`, `mcp list` all exit 0 (Steps 5, 5b) | 🖥️ not executed here — needs Apple Silicon | ⛔ would also need a Windows Bun |
 | Runtime asset (`assets/*`) resolution | 🔎 **static only** — paths rewritten and files on disk; no executed command loaded one (Step 4) | 🔎 static only | ⛔ |
 | Test suite (22 tests) | ✅ 22 passed, incl. 4 integration tests against the real ELF **and** Mach-O binaries | ✅ same run | — |
 | Approach B: byte-patch + re-sign (`tools/patch_claude.py`) | n/a (macOS-only concern) | 📓 verified 2026-08-21 on 2.1.238; not re-checked here | n/a |
@@ -75,7 +75,7 @@ JavaScript does.
 
 ## macOS execution: the one real gap
 
-The darwin artifact (`cli.original.cjs`, 28.2 MB) was built and checked here,
+The darwin artifact (`cli.original.cjs`, 28,244,063 bytes) was built and checked here,
 and Bun 1.3.14's own parser accepts it (`bun build --no-bundle --target=bun`,
 exit 0). **It has never been executed.** Nothing below the parser is known: not
 that it boots, not that it loads its `.node` addons, not that it resolves a
