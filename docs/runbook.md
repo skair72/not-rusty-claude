@@ -306,7 +306,7 @@ artifacts keep running the version you extracted until you do.
 
 ```bash
 BUN_BIN="$HOME/.bun-1.3.14/bun" scripts/build.sh "$NATIVE"
-# 82 passed on a host with both real binaries; 73 passed / 9 skipped with
+# 86 passed on a host with both real binaries; 77 passed / 9 skipped with
 # neither binary nor Bun. NRC_TEST_ELF / NRC_TEST_MACHO / BUN_BIN choose them
 # (README has the full table). The measured counts are version-specific:
 python3 -m pytest tests/ -q

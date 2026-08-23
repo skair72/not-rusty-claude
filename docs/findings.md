@@ -849,8 +849,10 @@ const addon = require(process.argv[2]);
     "magic:", [...out.slice(0, 4)].map(x => x.toString(16).padStart(2, "0")).join(" "));
 })();
 EOF
+# absolute path: the probe require()s this argument, and a bare specifier is
+# resolved relative to the SCRIPT, not the shell's cwd - "./" does not help
 "$HOME/.bun-1.3.14/bun" /tmp/imgprobe.cjs \
-  build/extract/assets/image-processor.node /tmp/gradient-3000.png
+  "$PWD/build/extract/assets/image-processor.node" /tmp/gradient-3000.png
 ```
 
 Measured 2026-08-23 on **both** Bun 1.3.14 and 1.4.0, identical output:
@@ -947,11 +949,11 @@ OUT_DIR=/tmp/macbuild scripts/build.sh /tmp/ccmac/package/claude-darwin-arm64.bi
 DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \
   "$HOME/.bun-1.3.14/bun" build/extract/cli.original.cjs mcp list
 
-# regression. The count depends on what this host has: 82 passed with both real
-# binaries and a Bun; 79/3 skipped without the Mach-O one; 76/6 with neither;
-# 73/9 with no Bun either. NRC_TEST_ELF / NRC_TEST_MACHO / BUN_BIN override the
+# regression. The count depends on what this host has: 86 passed with both real
+# binaries and a Bun; 83/3 skipped without the Mach-O one; 80/6 with neither;
+# 77/9 with no Bun either. NRC_TEST_ELF / NRC_TEST_MACHO / BUN_BIN override the
 # paths (see README's table).
-python3 -m pytest tests/ -q            # 82 passed, on a host with both binaries
+python3 -m pytest tests/ -q            # 86 passed, on a host with both binaries
 ```
 
 `scripts/syntax-check.js` is a **secondary** check only: `new Function(source)`

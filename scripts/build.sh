@@ -106,7 +106,7 @@ info "run it with ('mcp list' is the smoke test, not '--version'):"
 printf '      DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \\\n'
 printf '        %s %s mcp list\n' "${BUN_BIN:-bun}" "$WORK/cli.original.cjs"
 echo
-# Three lines, not the seventeen this used to print. A wall of warnings after
+# Five lines, not the seventeen this used to print. A wall of warnings after
 # every successful build is a wall nobody reads, and the two that can cost the
 # user something - the updater and the behaviour gap - were buried in it.
 warn "keep DISABLE_AUTOUPDATER=1: without it, 'claude update' would install a"

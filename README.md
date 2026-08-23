@@ -127,7 +127,7 @@ not-rusty-claude/
 ├── scripts/
 │   ├── build.sh                    extract → post-process → print the run command
 │   └── syntax-check.js             fast secondary syntax check (JSC, not Bun)
-└── tests/                          82 tests: hermetic fixtures + real-binary integration
+└── tests/                          86 tests: hermetic fixtures + real-binary integration
 ```
 
 The tools themselves need no third-party packages — stock `python3` (3.9+) is
@@ -137,13 +137,16 @@ integration tests need a real 300 MB binary and skip cleanly without one:
 
 | host has | result |
 | --- | --- |
-| both binaries + Bun | **82 passed** |
-| ELF binary + Bun, no Mach-O | 79 passed, 3 skipped |
-| Bun only | 76 passed, 6 skipped |
-| none of them | 73 passed, 9 skipped |
+| both binaries + Bun | **86 passed** |
+| ELF binary + Bun, no Mach-O | 83 passed, 3 skipped |
+| Bun only | 80 passed, 6 skipped |
+| none of them | 77 passed, 9 skipped |
 
-Point them at binaries with `NRC_TEST_ELF` / `NRC_TEST_MACHO` (defaults:
-`/usr/bin/claude`, `/tmp/ccmac/package/claude`) and at a Bun with `BUN_BIN`
+Point them at binaries with `NRC_TEST_ELF` (default `/usr/bin/claude`) and
+`NRC_TEST_MACHO` (default `/tmp/ccmac/package/claude-darwin-arm64.bin`, the
+name [`docs/findings.md`](docs/findings.md)'s appendix unpacks the darwin
+tarball under; the older `/tmp/ccmac/package/claude` is still accepted), and at
+a Bun with `BUN_BIN`
 (default: `~/.bun-1.3.14/bun`, then whatever `bun` is on `PATH`). The
 integration tests' hardcoded counts are a deliberate tripwire for the next
 Claude release (see [`docs/status.md`](docs/status.md)).

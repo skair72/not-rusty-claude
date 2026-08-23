@@ -1221,7 +1221,16 @@ as shipped:
 
 with Object.defineProperty(Bun,'isStandaloneExecutable',{value:true}):
   TOOL_RESULT IMAGE  media=image/jpeg  decoded_bytes=469774  magic=ff d8 ff e0
+                                       ^^^^^^^^^^^^^^^^^^^^
 ```
+
+**`decoded_bytes` does not reproduce** (noted 2026-08-23). The flip does — an
+error message becomes a real JPEG, every time — but the size depends on a
+source PNG that is not in this repository, and an independent A/B of the same
+thing measured a different number. Treat the two `TOOL_RESULT` lines as the
+evidence and the byte count as an artefact of one input. README and
+`status.md` quote the flip without a size for this reason; findings §11 carries
+a generator and a probe whose numbers *do* reproduce.
 
 The addon is not the problem — it works when called directly. The command
 originally pasted here was an elided `bun -e '…'` one-liner, i.e. not runnable
@@ -1232,7 +1241,7 @@ now carries a script-file version, a `python3` generator for a deterministic
 
 ```
 $ ~/.bun-1.3.14/bun /tmp/imgprobe.cjs \
-    build/extract/assets/image-processor.node /tmp/gradient-3000.png
+    "$PWD/build/extract/assets/image-processor.node" /tmp/gradient-3000.png
 exports: processImage, hasClipboardImage, readClipboardImage, ImageProcessor
 metadata: {"width":3000,"height":3000,"format":"png"}
 jpeg bytes: 919331 magic: ff d8 ff e0
@@ -1315,16 +1324,16 @@ of the host as much as of the suite. At this wave's HEAD, measured:
 
 ```
 $ python3 -m pytest -q                                     # both binaries + bun
-82 passed in 16.4s
+86 passed in 17.7s
 
 $ NRC_TEST_MACHO=/nonexistent python3 -m pytest -q         # ELF + bun only
-79 passed, 3 skipped
+83 passed, 3 skipped
 
 $ NRC_TEST_ELF=/nonexistent NRC_TEST_MACHO=/nonexistent python3 -m pytest -q
-76 passed, 6 skipped
+80 passed, 6 skipped
 
 $ … and with no bun reachable either (HOME without ~/.bun-1.3.14, bun off PATH)
-73 passed, 9 skipped
+77 passed, 9 skipped
 ```
 
 `NRC_TEST_ELF`, `NRC_TEST_MACHO` and `BUN_BIN` were documented nowhere before

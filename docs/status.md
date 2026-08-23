@@ -74,7 +74,7 @@ installed on this host, the macOS and Windows binaries were downloaded from npm
 | **Runs under external Bun** | ✅ `doctor`, `mcp list`, `--help`, `--version` all exit 0 on **1.3.14 and 1.4.0** (Steps 5, 5b + addendum) | ✅ the darwin JS boots under **Linux** Bun → `2.1.239 (Claude Code)`; macOS-*specific* behaviour still needs a Mac | ⛔ would also need a Windows Bun |
 | Runtime asset (`assets/*`) resolution | ✅ `image-processor.node` loads and works through the rewritten path; but the CLI never asks for it — [findings.md](./findings.md) §11 | 🔎 static only (Mach-O addons cannot dlopen on Linux) | ⛔ |
 | **Behaves the same as the native binary** | ⚠️ **No.** Native image processing unreachable, seccomp sandbox off, embedded ripgrep → system `rg`, install identity `unknown` — all measured, all §11 | ⚠️ same by construction (same `CE()` branches) | ⛔ |
-| Test suite | ✅ **82 passed** with both real binaries present (73 passed / 9 skipped on a host with neither binary nor Bun — see README's table) | ✅ same run | — |
+| Test suite | ✅ **86 passed** with both real binaries present (77 passed / 9 skipped on a host with neither binary nor Bun — see README's table) | ✅ same run | — |
 | Approach B: byte-patch + re-sign (`tools/patch_claude.py`) | n/a (macOS-only concern) | 📓 verified 2026-08-21 on 2.1.238; not re-checked here | n/a |
 
 Step numbers refer to sections of
@@ -86,7 +86,7 @@ the real binaries are present: `NRC_TEST_ELF` (default `/usr/bin/claude`) and
 the older `/tmp/ccmac/package/claude` still accepted), plus `BUN_BIN` (default
 `~/.bun-1.3.14/bun`, then `bun` on `PATH`) for the tests that actually boot the
 artifact. Without them the suite skips those tests and still passes, which is
-why a bare "82 passed" needs the host stated alongside it.
+why a bare "86 passed" needs the host stated alongside it.
 
 The macOS column is worth reading twice: **extraction, post-processing *and*
 execution of the real Mach-O binary's JavaScript are not a projection — they

@@ -125,18 +125,103 @@ def test_macho_zero_cmdsize_cannot_stall_the_load_command_walk(extract_bun, caps
     assert time.monotonic() - started < 2.0
 
 
-def test_macho_absurd_ncmds_is_refused_immediately(extract_bun, capsys):
-    """ncmds is a u32. Walking 2**32-1 commands took ~10 minutes measured;
-    it must now cost nothing."""
+def test_macho_absurd_ncmds_is_refused_before_the_walk_begins(extract_bun, capsys):
+    """The sanity cap, on its own.
+
+    This test used to build its fixture with cmdsize=0 as well, so the
+    cmdsize guard fired first and the cap was never reached - and it asserted
+    only "load command", a substring BOTH messages contain, so deleting
+    MAX_LOAD_COMMANDS entirely left it green. Every load command here is
+    well-formed; the only thing wrong with the file is a header claiming more
+    commands than any Mach-O has, and the message asserted below is produced by
+    nothing else.
+
+    The cap is load-bearing, not belt-and-braces: with well-formed 8-byte
+    commands the walk is bounded by file size, so a crafted ~126 MB file costs
+    ~4 s without the cap and 0 s with it, scaling linearly with size. A fixture
+    large enough to show that would be a slow test; asserting the guard that
+    prevents it is the same property, cheaply.
+    """
     payload = fixtures.build_payload([("/$bunfs/root/cli", b"x", 1)])
-    blob = _macho_with(payload, ncmds=2**32 - 1, cmdsize=0)
+    blob = _macho_with(payload, ncmds=2**32 - 1, rename_bun=True)
 
     started = time.monotonic()
     with pytest.raises(SystemExit):
         extract_bun.find_bun_section(bytes(blob))
 
-    assert "load command" in capsys.readouterr().err
+    assert "load commands (max" in capsys.readouterr().err
     assert time.monotonic() - started < 2.0
+
+
+def test_macho_load_command_table_ending_mid_command_is_rejected_cleanly(
+        extract_bun, capsys):
+    """ncmds promises a command the file does not contain even the header of.
+
+    Not the same as the cmdsize/EOF checks below: this one fires before the
+    8-byte cmd/cmdsize pair is read at all. Without it, struct.unpack_from
+    raises a raw struct.error - the exact class of failure this tool's contract
+    says it does not have.
+    """
+    blob = bytearray(32 + 4)
+    struct.pack_into("<I", blob, 0, 0xFEEDFACF)   # MH_MAGIC_64
+    struct.pack_into("<I", blob, 16, 1)           # ncmds: one command...
+    # ...of which only 4 bytes exist.
+
+    with pytest.raises(SystemExit):
+        extract_bun.find_bun_section(bytes(blob))
+
+    err = capsys.readouterr().err
+    assert "past end of file" in err
+    assert "error:" in err
+
+
+def test_macho_segment_command_too_short_to_hold_a_section_table_is_skipped(
+        extract_bun, capsys):
+    """An LC_SEGMENT_64 whose cmdsize is smaller than segment_command_64 itself.
+
+    nsects lives at +0x40 and the section records at +0x48, so reading them out
+    of a 24-byte command means reading whatever follows it - or past EOF, which
+    is what happens here: without the `cmdsize >= SEGMENT_64_HEADER` guard this
+    input raises struct.error at offset 96 on a 56-byte buffer. With it, the
+    malformed command is skipped and the file is refused for what it actually
+    is: a Mach-O with no usable __BUN section.
+    """
+    blob = bytearray(32 + 24)
+    struct.pack_into("<I", blob, 0, 0xFEEDFACF)
+    struct.pack_into("<I", blob, 16, 1)                  # ncmds
+    struct.pack_into("<II", blob, 32, 0x19, 24)          # LC_SEGMENT_64, cmdsize=24
+    blob[32 + 8:32 + 13] = b"__BUN"                      # segname says __BUN
+
+    with pytest.raises(SystemExit):
+        extract_bun.find_bun_section(bytes(blob))
+
+    assert "no __BUN,__bun section" in capsys.readouterr().err
+
+
+def test_macho_section_walk_stays_inside_its_own_load_command(extract_bun, capsys):
+    """The section bound must be the COMMAND's end, not the file's.
+
+    Both bounds refuse the same malformed inputs with the same message, so no
+    assertion on an error can tell them apart. This input distinguishes them by
+    what a too-loose bound would *accept*: a section_64 record planted in the
+    bytes after the load command, which a file-bounded walk reads and believes
+    - returning an attacker-chosen offset and size - and a command-bounded walk
+    never reaches.
+    """
+    payload = fixtures.build_payload([("/$bunfs/root/cli", b"x", 1)])
+    blob = bytearray(_macho_with(payload, nsects=2, rename_bun=True))
+    cmd_end = 32 + 0x48 + 80          # the one section_64 record the command holds
+    planted = bytearray(80)
+    planted[0:5] = b"__bun"                                   # sectname
+    planted[16:21] = b"__BUN"                                 # segname
+    struct.pack_into("<Q", planted, 0x28, 0xDEAD)             # size
+    struct.pack_into("<I", planted, 0x30, 0xBEEF)             # offset
+    blob[cmd_end:cmd_end] = planted
+
+    with pytest.raises(SystemExit):
+        extract_bun.find_bun_section(bytes(blob))
+
+    assert "past the end" in capsys.readouterr().err
 
 
 def test_macho_absurd_nsects_is_refused_immediately(extract_bun, capsys):
@@ -222,6 +307,28 @@ def test_payload_shorter_than_its_own_footer_is_rejected_cleanly(extract_bun, ca
         extract_bun.parse_payload(section)
 
     assert "too short" in capsys.readouterr().err
+
+
+def test_elf_section_header_entry_too_small_is_rejected_cleanly(extract_bun, capsys):
+    """e_shentsize below the 40 bytes shdr() unpacks.
+
+    The table-extends-past-EOF check multiplies e_shnum by e_shentsize, so a
+    small enough entry size satisfies it while each individual read still runs
+    off the end: here the table is declared to end exactly at EOF, and reading
+    one 40-byte header at its start already goes past. Raw struct.error without
+    this guard.
+    """
+    payload = fixtures.build_payload([("/$bunfs/root/cli", b"x", 1)])
+    blob = bytearray(fixtures.build_elf(payload))
+    struct.pack_into("<Q", blob, 0x28, len(blob) - 8)   # e_shoff: 8 bytes from EOF
+    struct.pack_into("<H", blob, 0x3A, 8)               # e_shentsize
+    struct.pack_into("<H", blob, 0x3C, 1)               # e_shnum
+    struct.pack_into("<H", blob, 0x3E, 0)               # e_shstrndx
+
+    with pytest.raises(SystemExit):
+        extract_bun.find_bun_section_elf(bytes(blob))
+
+    assert "too small" in capsys.readouterr().err
 
 
 def test_elf_string_table_index_out_of_range_is_rejected_cleanly(extract_bun, capsys):
