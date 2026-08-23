@@ -12,11 +12,13 @@ deliberately kept in separate tests rather than interleaved:
                 check() is clean. A failure means this repo is broken.
   MEASUREMENTS- facts about a PARTICULAR Claude build: how many /$bunfs/
                 literals and build-time file:// URLs its entry module happens
-                to contain. A failure means Claude changed. That is the early
-                warning this file exists to give, and the numbers are meant to
-                be updated when it fires.
+                to contain, and how many `Bun.isStandaloneExecutable` gate call
+                sites the scoped image shim finds and moves. A failure means
+                Claude changed. That is the early warning this file exists to
+                give, and the numbers are meant to be updated when it fires.
 
-Measured on 2026-08-22 against the binaries named below.
+Measured on 2026-08-22 against the binaries named below; the gate counts on
+2026-08-23, when they were added.
 """
 
 import struct
@@ -26,9 +28,20 @@ import pytest
 pytestmark = pytest.mark.integration
 
 # Counts that are properties of the Claude release, not of the tools.
+#
+# gate_calls_before/after and image_shim track the scoped image shim against
+# the real thing. They are here and not in tests/test_image_shim.py because
+# they are release facts, not tool contracts: the shim's own tests assert
+# `after == before - 1` and `image_shim == 1` without naming a number. What
+# this adds is the tripwire - a Claude build that grows, loses or renames gate
+# call sites shows up as drift here instead of passing silently, and
+# image_shim dropping to 0 is how a renamed anchor announces itself (that
+# refusal is deliberately NOT fatal in postprocess.py, so nothing else fails).
 MEASURED = {
-    "elf": {"version": "linux-x64 2.1.222", "assets": 5, "file_urls": 7},
-    "macho": {"version": "darwin-arm64 2.1.239", "assets": 9, "file_urls": 8},
+    "elf": {"version": "linux-x64 2.1.222", "assets": 5, "file_urls": 7,
+            "gate_calls_before": 21, "gate_calls_after": 20, "image_shim": 1},
+    "macho": {"version": "darwin-arm64 2.1.239", "assets": 9, "file_urls": 8,
+              "gate_calls_before": 23, "gate_calls_after": 22, "image_shim": 1},
 }
 
 

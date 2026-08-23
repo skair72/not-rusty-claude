@@ -65,6 +65,26 @@ def find_all(haystack, needle):
     return hits
 
 
+def splice(blob, hits, old_len, padded):
+    """Return a copy of blob with `padded` written over old_len bytes at each hit.
+
+    Raises instead of returning a resized buffer. That is the whole invariant:
+    Mach-O offsets are absolute, so a result even one byte longer or shorter
+    than the input has relocated every load command, __LINKEDIT entry and
+    embedded-bundle offset past the first hit. Callers must run this BEFORE
+    opening the destination - under --in-place the write destroys the original
+    and only the .bak is left.
+    """
+    out = bytearray(blob)
+    for off in hits:
+        out[off:off + old_len] = padded
+    if len(out) != len(blob):
+        raise ValueError(
+            f"patch would resize the file ({len(blob):,} -> {len(out):,} bytes): "
+            f"{len(padded)} bytes of replacement for a {old_len}-byte span")
+    return out
+
+
 def preview(blob, off, length, width=48):
     lo = max(0, off - width)
     hi = min(len(blob), off + length + width)
@@ -133,7 +153,9 @@ def main():
     ap.add_argument("--no-sign", action="store_true", help="patch but skip re-signing (will not launch)")
     ap.add_argument("--identifier", help="signing identifier; defaults to the original binary's")
     ap.add_argument("--verify", metavar="ARG", action="append",
-                    help="run the patched binary with this arg to confirm it launches (repeatable)")
+                    help="run the patched binary with this arg to confirm it launches "
+                         "(repeatable; attach dashed args with =, as --verify=--version, "
+                         "or argparse reads them as options)")
     args = ap.parse_args()
 
     src = os.path.abspath(args.bin)
@@ -148,9 +170,12 @@ def main():
     new = args.new.encode("utf-8")
     if not old:
         # b"".find() succeeds at every offset, so an empty --old "matches" the
-        # whole file: measured on a 1 MiB fixture, 1,048,577 reported
-        # occurrences, each one previewed, 41s and 56 MB of RSS, then exit 0
-        # claiming success. On the binary this tool is for, that is a hang.
+        # whole file. Measured here on a 1 MiB fixture with this guard removed:
+        # 1,048,577 reported occurrences, 3,145,742 lines of preview, 55.8 MB
+        # peak RSS, then exit 0 claiming a successful patch. Wall clock was 41 s
+        # in two runs on this (shared, loaded) host - load-dependent, so read it
+        # as "tens of seconds per MiB", not as a fixed cost. On the ~300 MB
+        # binary this tool is aimed at, that is a hang.
         die("--old is empty; that matches at every offset in the file")
     if len(new) > len(old):
         die(f"replacement is longer than the original ({len(new)} > {len(old)} bytes). "
@@ -177,7 +202,8 @@ def main():
     # time, so --old aaa matches twice in "aaaa" and the second write lands on
     # top of the first replacement's padding: measured, "PREFIX aaaa SUFFIX"
     # with --new z came out as "PREFIX zz   SUFFIX", a doubled z nobody asked
-    # for. The length is still right, so the size check below cannot see it.
+    # for. The length is still right, so neither splice() nor the on-disk
+    # size check can see it.
     # Refuse instead; --occurrence selects a single hit and stays usable.
     touching = [n for n in range(1, len(hits)) if hits[n] - hits[n - 1] < len(old)]
     if touching:
@@ -186,6 +212,14 @@ def main():
             "would write over each other's padding. Use --occurrence.")
 
     padded = new + pad * (len(old) - len(new))
+    try:
+        patched = splice(blob, hits, len(old), padded)
+    except ValueError as exc:
+        # Deliberately before --dry-run returns and before the destination is
+        # created: a rehearsal should report this, and a real run should not
+        # have overwritten anything by the time it is noticed.
+        die(str(exc))
+
     say(f"{BOLD}Found{RESET} {len(hits)} occurrence(s); patching {len(hits)}")
     say(f"  old: {len(old):>5} bytes  {CYN}{args.old[:70]}{RESET}")
     say(f"  new: {len(new):>5} bytes  {CYN}{args.new[:70]}{RESET}")
@@ -212,11 +246,15 @@ def main():
     else:
         die("choose --out <path> or --in-place (or --dry-run)")
 
-    # Ask codesign about the original BEFORE the patch lands. Under --in-place
-    # src is dest, so afterwards the only thing on disk is a file whose
-    # Developer ID signature no longer describes its own bytes - and these two
-    # answers are what the replacement signature gets built from. Under --out
-    # src survives and the order would not matter; do it once, for both.
+    # Ask codesign about the original BEFORE the patch lands. Defensive
+    # ordering, and the premise is UNVERIFIED: this was written on a host with
+    # no codesign, and `codesign -d` reads the embedded signature superblob
+    # rather than validating page hashes, so the reads would very likely return
+    # the same identifier and entitlements after the write as before it. What
+    # is certain is only that under --in-place src IS dest, so afterwards the
+    # single copy on disk carries a signature that no longer covers its own
+    # bytes - and these two answers are what the new signature is built from.
+    # Reading them first costs nothing and removes the question.
     tmp = None if args.no_sign else tempfile.TemporaryDirectory()
     try:
         ent = ident = None
@@ -224,18 +262,19 @@ def main():
             ent = dump_entitlements(src, os.path.join(tmp.name, "ent.plist"))
             ident = args.identifier or original_identifier(src)
 
-        for off in hits:
-            blob[off:off + len(old)] = padded
-
-        size_before = os.path.getsize(dest)
         with open(dest, "wb") as fh:
-            fh.write(blob)
+            fh.write(patched)
         os.chmod(dest, 0o755)
-        size_after = os.path.getsize(dest)
 
-        if size_before != size_after:
-            die(f"size changed ({size_before:,} -> {size_after:,}) - this must never happen")
-        say(f"{GRN}Patched{RESET} - size unchanged at {size_after:,} bytes\n")
+        # splice() already guaranteed the buffer's length, so what is left for
+        # this to catch is the write itself landing short - a quota or ENOSPC
+        # that the buffered write did not surface. Saying "Patched" over a
+        # truncated 300 MB binary is the failure mode; recovery is the .bak.
+        written = os.path.getsize(dest)
+        if written != len(patched):
+            die(f"wrote {len(patched):,} bytes but {dest} holds {written:,} - "
+                "truncated write, recover from the .bak")
+        say(f"{GRN}Patched{RESET} - size unchanged at {written:,} bytes\n")
 
         if args.no_sign:
             say("--no-sign given; the binary is now unsigned-invalid and will be killed on launch.", YEL)

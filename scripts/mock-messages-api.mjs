@@ -85,6 +85,9 @@ const PRESETS = {
     // -n so the hit carries a line number, which is what makes a real match
     // distinguishable from the empty "No matches found" that the globally
     // flipped isStandaloneExecutable produces (findings.md section 11).
+    // `scripts/ab-equivalence.sh --case grep` drives both answers out of the
+    // same binary: hay/a.txt:1:NEEDLE-12345 on the shipped and scoped-shim
+    // sides, "No matches found" on the globally flipped one.
     input: { pattern: "NEEDLE-12345", path: ".", output_mode: "content", "-n": true },
   },
   read: {
@@ -113,9 +116,16 @@ function log(line) {
   if (LOG) fs.appendFileSync(LOG, line + "\n");
 }
 
-// Full bodies, opt-in: they are ~100 KB each (the system prompt and 27 tool
-// schemas dominate), so this is for "what is it actually asking for" debugging,
-// not for routine runs.
+// Full bodies, opt-in: the system prompt and the tool schemas dominate them, so
+// they run to tens of KB each and this is for "what is it actually asking for"
+// debugging, not for routine runs. There is no single size, because the size is
+// a function of how the CLI was invoked. Measured on 2.1.222, the two turn
+// POSTs of one `-p` run under the environment scripts/ab-equivalence.sh uses:
+// 82,302 and 82,588 bytes carrying 24 tool schemas (Bash case), 86,289 and
+// 86,550 bytes carrying 26 (Grep case, which opts in to Grep and Glob). The
+// same Grep run WITHOUT CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1: 105,017 and
+// 105,278 bytes carrying 29 - three more tools the CLI only offers once it is
+// allowed to evaluate its feature gates.
 function logBody(method, url, bodyText) {
   if (!LOG_BODIES) return;
   fs.appendFileSync(LOG_BODIES, JSON.stringify({ method, url, body: bodyText }) + "\n");
@@ -207,10 +217,15 @@ function messageEnd(res, stopReason, outputTokens) {
 
 // True once the transcript carries a tool_result, i.e. the CLI has run the tool
 // we asked for and is coming back for the next assistant turn. Driving off the
-// transcript rather than off "this is request number 2" is deliberate: a single
-// `-p` run was measured issuing three POSTs (a session-title request, then the
-// turn, then the follow-up), and a failing request is re-sent, so a counter
-// desynchronises and the loop never reaches its final text.
+// transcript rather than off "this is request number N" is deliberate, because
+// N is not a property of the turn. Measured on 2.1.222, one `-p` run: a
+// HEAD /api/hello, then THREE POSTs by default (a session-title request, the
+// turn, the follow-up) but only TWO under
+// CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1, which suppresses the title
+// request - and that variable is exactly what scripts/ab-equivalence.sh sets to
+// keep the run off the network. A failing request is re-sent on top of that. A
+// counter would answer the wrong request in one configuration or the other and
+// the loop would never reach its final text.
 function transcriptHasToolResult(body) {
   const messages = Array.isArray(body?.messages) ? body.messages : [];
   for (const m of messages) {
@@ -232,11 +247,14 @@ function handleMessages(req, res, bodyText) {
        rather than a hang, because a hang here costs the caller a full timeout */
   }
   const model = body.model || "claude-mock";
-  // A turn is not the only thing the CLI asks for. Measured on 2.1.222: the
-  // first POST of a `-p` run is a session-title request carrying zero tools and
-  // a "Write the title" prompt; answering *that* with a tool_use hands the
-  // title generator a tool call it never offered. Tools present is the signal
-  // that this request is the agentic loop.
+  // A turn is not the only thing the CLI asks for. Measured on 2.1.222 with
+  // --log-bodies: with nonessential traffic left enabled, the first POST of a
+  // `-p` run is a 2,248-byte session-title request carrying zero tools, a
+  // "Write the title in the predominant language" instruction and the prompt
+  // wrapped in <session>; answering *that* with a tool_use hands the title
+  // generator a tool call it never offered. Tools present is the signal that
+  // this request is the agentic loop, and it holds whether or not the title
+  // request was suppressed.
   const offersTools = Array.isArray(body.tools) && body.tools.length > 0;
   const wantToolCall = toolCall !== null && offersTools && !transcriptHasToolResult(body);
 
@@ -248,10 +266,11 @@ function handleMessages(req, res, bodyText) {
 
   // Diagnostic only - we still send the tool_use. Measured on 2.1.222: the CLI
   // hides Grep and Glob from `tools` unless the invocation opts in (an
-  // --allowedTools naming Grep or Glob sets its searchToolsOptIn flag), and a
-  // tool_use for a tool it did not offer comes back as the tool_result
-  // "No such tool available: Grep", i.e. a turn that completes with the wrong
-  // answer. This line is what tells you that is what happened.
+  // --allowedTools naming Grep or Glob sets its searchToolsOptIn flag) - 24
+  // schemas offered without the opt-in, 26 with it - and a tool_use for a tool
+  // it did not offer comes back as the tool_result "No such tool available:
+  // Grep", i.e. a turn that completes with the wrong answer. This line is what
+  // tells you that is what happened.
   if (wantToolCall) {
     const offered = body.tools.map((t) => t && t.name);
     if (!offered.includes(toolCall.name)) {

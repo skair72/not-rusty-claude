@@ -12,11 +12,16 @@
 # Env:
 #   BUN_BIN   bun to check against (default: `command -v bun`)
 #   OUT_DIR   where artifacts land (default: ./build)
-#   NRC_NO_IMAGE_SHIM=1
-#             build WITHOUT the scoped isStandaloneExecutable image shim, i.e.
-#             exactly what this repo shipped before it existed. It is the "as
-#             shipped" half of the A/B in docs/findings.md 11; passed straight
-#             through to postprocess.py.
+#   NRC_NO_IMAGE_SHIM
+#             ANY non-empty value builds WITHOUT the scoped
+#             isStandaloneExecutable image shim, i.e. exactly what this repo
+#             shipped before it existed. It is the "as shipped" half of the A/B
+#             in docs/findings.md 11; passed straight through to
+#             postprocess.py, which applies the SAME any-non-empty rule. The
+#             two must agree: under a "1"-only rule, NRC_NO_IMAGE_SHIM=false
+#             would shim the artifact here and be announced as an opt-out
+#             below, so a shim that genuinely failed would look deliberate and
+#             nobody would look. Pinned by tests/test_build_script.py.
 
 set -euo pipefail
 
@@ -102,15 +107,22 @@ POST_LOG="$STAGE/.postprocess.log"
 [ -f "$STAGE/cli.original.cjs" ] || die "post-process failed: cli.original.cjs missing"
 [ -f "$STAGE/cli.js" ] || die "post-process failed: cli.js sibling missing"
 
-# 4a. Say out loud which of the two artifacts this is. Measured on both real
-# binaries, the shimmed and unshimmed outputs differ in exactly FOUR bytes
-# (`CE()`/`AE()` -> `true`), and that difference only becomes visible when
-# someone Reads an image big enough to need resizing - far too late to start
-# wondering which build this was.
+# 4a. Say out loud which of the two artifacts this is. Measured 2026-08-23 by
+# building each real binary both ways: the shimmed and unshimmed outputs are the
+# same length and `cmp -l` reports exactly FOUR differing bytes (`CE()`/`AE()`
+# -> `true`). That difference only becomes visible when someone Reads an image
+# big enough to need resizing - far too late to start wondering which build this
+# was. `grep -o 'if(true)try' <artifact> | wc -l` answers it after the fact: 1
+# shimmed, 0 as shipped, on both binaries.
 SHIM_N="$(sed -n 's/^image shim applied *: *\([0-9][0-9]*\).*/\1/p' "$POST_LOG")"
 rm -f "$POST_LOG"
 # ...and remember it, because the closing summary's list of gaps is only true
-# for one of the two builds.
+# for one of the two builds. Printing the unshimmed list after a shimmed build
+# is worse than printing nothing: it sends the reader to findings.md 11 looking
+# for the fix to a problem this artifact no longer has. Both strings are now
+# asserted in tests/test_build_script.py: without those assertions, deleting
+# either one left the suite green while every build went on making a false
+# claim about its own artifact.
 GAPS="image processing, sandbox, ripgrep"
 if [ "${SHIM_N:-}" = "1" ]; then
   GAPS="sandbox, ripgrep, install identity"
@@ -145,9 +157,11 @@ printf '        %s %s mcp list\n' "${BUN_BIN:-bun}" "$WORK/cli.original.cjs"
 echo
 # Five lines, not the seventeen this used to print. A wall of warnings after
 # every successful build is a wall nobody reads, and the two that can cost the
-# user something - the updater and the behaviour gap - were buried in it.
+# user something - the updater and the behaviour gap - were buried in it. The
+# gap list is $GAPS, computed above, precisely so this block cannot go stale
+# against the artifact it is describing.
 warn "keep DISABLE_AUTOUPDATER=1: without it, 'claude update' would install a"
 warn "  DIFFERENT, npm-based Claude Code on your machine. Rebuild instead."
 warn "not identical to the native binary ($GAPS):"
-warn "  read docs/findings.md section 11 before real use."
+warn "  those gaps are THIS build's; docs/findings.md section 11 explains them."
 warn "nothing was installed on PATH - run the command above by full path."
