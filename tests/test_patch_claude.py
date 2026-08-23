@@ -250,11 +250,15 @@ def test_an_absent_old_is_refused(tmp_path):
 def test_an_empty_old_is_refused(tmp_path):
     """b"".find() succeeds at every offset, so an empty --old "matches" the
     whole file. Measured here on a 1 MiB fixture with the guard removed:
-    1,048,577 reported occurrences, 3,145,742 lines of preview, 55.8 MB peak
-    RSS, then exit 0 claiming a successful patch. Wall clock was 41 s in two
-    runs on this shared, loaded host; it moves with load, so it is the order of
-    magnitude that matters and not the number. The file this tool is aimed at
-    is the ~300 MB native binary, where that is a hang."""
+    1,048,577 reported occurrences, 3,145,742 lines of preview under --no-sign
+    (3,145,739 under --dry-run), 55.9-56.1 MiB peak RSS. Those two exit 0
+    claiming a successful patch; the default signing path on this host, which
+    has no codesign, prints the same flood and then dies exit 1 out of
+    dump_entitlements, so the exit status is platform-dependent and the flood
+    is not. Wall clock was 40-41 s in three runs on this shared, loaded host;
+    it moves with load, so it is the order of magnitude that matters and not
+    the number. The file this tool is aimed at is the ~300 MB native binary,
+    where that is a hang."""
     binary = _binary(tmp_path / "claude.bin", BODY)
     out = tmp_path / "patched.bin"
 
@@ -701,6 +705,45 @@ def test_the_quarantine_xattr_is_dropped_from_the_signed_result(
     assert len(dropped) == 1 and len(signed) == 1, cmds
     assert cmds[dropped[0]] == ["xattr", "-d", "com.apple.quarantine", str(binary)]
     assert dropped[0] > signed[0], cmds
+
+
+def test_the_tail_acts_on_the_destination_not_the_source(
+        patch_claude, tmp_path, monkeypatch):
+    """--out, because under --in-place src IS dest and every argument in the
+    tail is trivially right. Split them apart and the two surviving commands -
+    the quarantine drop and the final `codesign -v` - have to be shown to name
+    the patched copy.
+
+    Both mutations are silent in the direction that matters. Pointed at the
+    source, `codesign -v` verifies the untouched original, which still carries
+    its valid Developer ID signature: green line, exit 0, and the ad-hoc
+    signature on the file the user is about to run was never checked at all.
+    Pointed at the source, `xattr -d` strips quarantine off the input and
+    leaves it on the output - the ad-hoc-signature-plus-quarantine pairing the
+    code comment calls a launch block. Neither is observable on this host
+    (no codesign, no xattr), so what is pinned is the argument, plus the bytes
+    each command was looking at when it ran."""
+    binary = _binary(tmp_path / "claude.bin", b"a OLDSTRING b")
+    dest = tmp_path / "patched.bin"
+    calls = _stub_codesign(patch_claude, monkeypatch)
+    _argv(monkeypatch, binary, "--out", dest)
+
+    patch_claude.main()
+
+    dropped = [c for c in calls if c.cmd[0] == "xattr"]
+    verified = [c for c in calls if c.cmd[:2] == ["codesign", "-v"]]
+    assert len(dropped) == 1 and len(verified) == 1, [c.cmd for c in calls]
+
+    assert dropped[0].cmd == ["xattr", "-d", "com.apple.quarantine", str(dest)]
+    assert verified[0].cmd == ["codesign", "-v", "--verbose=2", str(dest)]
+
+    # The argument alone could still be a path that happens to spell the
+    # destination; these say the file under each command held the patched bytes.
+    for call in dropped + verified:
+        assert b"NEW" in call.seen and b"OLDSTRING" not in call.seen, call.cmd
+
+    # And the source is neither of them: it still has the original string.
+    assert b"OLDSTRING" in binary.read_bytes()
 
 
 def test_a_file_with_no_quarantine_xattr_is_not_an_error(

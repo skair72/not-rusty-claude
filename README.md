@@ -144,7 +144,7 @@ not-rusty-claude/
 │   │                               globally-flipped, through the mock below
 │   ├── mock-messages-api.mjs       loopback-only mock of the Messages API
 │   └── syntax-check.js             fast secondary syntax check (JSC, not Bun)
-└── tests/                          199 tests: hermetic fixtures + real-binary integration
+└── tests/                          200 tests: hermetic fixtures + real-binary integration
 ```
 
 The tools themselves need no third-party packages — stock `python3` (3.9+) is
@@ -153,21 +153,46 @@ tests/ -q`. What that prints depends on what the host has, because the
 integration tests need a real Claude binary — 289,467,400 bytes for the Linux
 one on this host, 324,973,552 for the macOS one — and skip cleanly without it:
 
-Every row below was measured on this host on 2026-08-23, by forcing the row
+Every row below was re-measured on this host on 2026-08-23, by forcing the row
 with the environment variables named underneath; the four rows sum to the same
-199 collected tests.
+200 collected tests (`python3 -m pytest tests/ -q --collect-only` → `200 tests
+collected`).
 
 | host has | result | how the row was forced |
 | --- | --- | --- |
-| both binaries + Bun | **199 passed** | nothing set (this host's defaults) |
-| ELF binary + Bun, no Mach-O | 194 passed, 5 skipped | `NRC_TEST_MACHO=/nonexistent/macho` |
-| Bun only | 189 passed, 10 skipped | …plus `NRC_TEST_ELF=/nonexistent/elf` |
-| none of them | 186 passed, 13 skipped | …plus `BUN_BIN=/nonexistent/bun`, an empty `HOME` and no `bun` on `PATH` |
+| both binaries + Bun | **200 passed** | nothing set (this host's defaults) |
+| ELF binary + Bun, no Mach-O | 195 passed, 5 skipped | `NRC_TEST_MACHO=/nonexistent/macho` |
+| Bun only | 190 passed, 10 skipped | …plus `NRC_TEST_ELF=/nonexistent/elf` |
+| none of them | 187 passed, 13 skipped | …plus `BUN_BIN=/nonexistent/bun` and a `HOME` with no Bun under it — the command below |
 
-That last row needs the extra care: `BUN_BIN` is a *first* choice, not an
-override, so the fixture still falls back to `~/.bun-1.3.14/bun` and then to
-`bun` on `PATH`. Pointing `BUN_BIN` at a nonexistent file on a host that has
-either of those does not produce the no-Bun row.
+That last row needs the extra care, and for two independent reasons.
+
+`BUN_BIN` is a *first* choice, not an override, so the fixture still falls back
+to `~/.bun-1.3.14/bun` and then to `bun` on `PATH`. Measured: `BUN_BIN` pointed
+at a nonexistent file with this host's real `HOME` still in place gives the
+Bun-**only** row, 190 passed / 10 skipped — not the no-Bun one. So `HOME` has to
+move too, and `bun` must not be on `PATH` (it is not on this host: the runbook
+unpacks 1.3.14 without installing it, so nothing extra was needed here; a host
+that does have one has to strip it from `PATH` as well).
+
+And moving `HOME` can take `pytest` with it. Followed literally, "an empty
+`HOME`" printed `/usr/bin/python3: No module named pytest` here and exited 1 —
+pytest on this host is a `--user` install, under `$HOME/.local`. So put it back
+explicitly, derived rather than hardcoded (it resolves to
+`/home/claude/.local/lib/python3.11/site-packages` on this host, which is a
+fact about this host and not about the recipe):
+
+```bash
+# the "none of them" row, as run. $(...) is evaluated before HOME is replaced.
+PYTHONPATH="$(python3 -m site --user-site)" \
+NRC_TEST_ELF=/nonexistent/elf NRC_TEST_MACHO=/nonexistent/macho \
+BUN_BIN=/nonexistent/bun HOME="$(mktemp -d)" \
+  python3 -m pytest tests/ -q
+#   → 187 passed, 13 skipped
+```
+
+Where pytest is installed system-wide instead, `--user-site` names a directory
+that need not exist and the `PYTHONPATH` is a harmless no-op.
 
 Point them at binaries with `NRC_TEST_ELF` (default `/usr/bin/claude`) and
 `NRC_TEST_MACHO` (default `/tmp/ccmac/package/claude-darwin-arm64.bin`, the

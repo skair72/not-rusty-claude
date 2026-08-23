@@ -118,14 +118,40 @@ function log(line) {
 
 // Full bodies, opt-in: the system prompt and the tool schemas dominate them, so
 // they run to tens of KB each and this is for "what is it actually asking for"
-// debugging, not for routine runs. There is no single size, because the size is
-// a function of how the CLI was invoked. Measured on 2.1.222, the two turn
-// POSTs of one `-p` run under the environment scripts/ab-equivalence.sh uses:
-// 82,302 and 82,588 bytes carrying 24 tool schemas (Bash case), 86,289 and
-// 86,550 bytes carrying 26 (Grep case, which opts in to Grep and Glob). The
-// same Grep run WITHOUT CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1: 105,017 and
-// 105,278 bytes carrying 29 - three more tools the CLI only offers once it is
-// allowed to evaluate its feature gates.
+// debugging, not for routine runs.
+//
+// The schema counts below are exact - they are a property of the invocation -
+// but the byte counts are deliberately approximate, because the size is not a
+// constant even for one fixed invocation: the body carries the run's own paths.
+// Measured 2026-08-23 by varying one thing at a time: +10 characters of cwd
+// moved the Bash body 82,319 -> 82,339 (the cwd appears twice, once literally
+// and once slug-encoded inside the memory path), and +1 character of
+// CLAUDE_CONFIG_DIR moved it by exactly 1. That is why the three sides of
+// scripts/ab-equivalence.sh disagree by a byte or two on the SAME case: their
+// scratch homes are named home.<case>.asshipped / .shimmed / .global. At fixed
+// paths a repeat run reproduces to the byte (measured twice).
+//
+// Measured on 2.1.222, the two turn POSTs of one `-p` run under the environment
+// scripts/ab-equivalence.sh uses, from paths ~150 characters long under
+// $TMPDIR: ~82.3 KB then ~82.6 KB carrying 24 tool schemas (Bash case; 82,319
+// and 82,605 here), ~86.3 KB then ~86.6 KB carrying 26 (Grep case, which opts
+// in to Grep and Glob; 86,300 and 86,561). Expect a few hundred bytes either
+// way from shorter or longer paths - an exact-looking pair that used to stand
+// here was ~300 bytes out for exactly that reason. Steadier is the step from
+// the first turn to the second - the tool_result going back up: +286 bytes
+// (Bash) on all three sides, and +261 (Grep) on the as-shipped and shimmed
+// sides but +253 on the globally-flipped one, because that side's Grep is
+// broken and returns the shorter "No matches found" instead of a real hit.
+// Even this step is not a constant: it carries whatever the tool returned.
+//
+// The same Grep run WITHOUT CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1: a
+// 2,248-byte session-title POST first (no tools, and no run-specific paths in
+// it: it came out at exactly the 2,248 bytes handleMessages() documents below,
+// measured from different paths than that figure was), then ~105.0 and ~105.3 KB
+// carrying 29 - three more tools the CLI only offers once it is allowed to
+// evaluate its feature gates. Note what that costs: run under ab-equivalence's
+// egress poller, it opened sockets to 160.79.104.10:443 and 34.149.66.165:443,
+// so it is not a loopback-only measurement and no case here uses it.
 function logBody(method, url, bodyText) {
   if (!LOG_BODIES) return;
   fs.appendFileSync(LOG_BODIES, JSON.stringify({ method, url, body: bodyText }) + "\n");

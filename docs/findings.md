@@ -817,13 +817,21 @@ This document said "21" without that qualification, and everything below is
 measured on the linux build unless it says otherwise.
 
 > **A trap for anyone re-deriving the count — recorded because it caught us.**
-> A `\b`-style word boundary over-counts: a bare `CE\(\)` search finds 25 hits
-> on linux-x64 2.1.222, 4 of them inside `isGCE()` / `_checkIsGCE()`. The
-> obvious fix is a lookbehind, and the obvious lookbehind is wrong. Excluding a
-> preceding `.` as well (`(?<![\w$.])`) drops the count to **18** on linux and
-> **20** on darwin, and a session on this branch reported 18 as the true figure
-> on that basis. It is not: the three excluded sites are real, and they look
-> like this —
+> A `\b`-style word boundary over-counts: a bare `CE\(\)` search finds **26**
+> hits on linux-x64 2.1.222 — 21 real call sites, 4 substrings of `isGCE()` /
+> `_checkIsGCE()` (`get isGCE()`, `async _checkIsGCE()`, and `this._checkIsGCE()`
+> twice), and the declaration `function CE(){`, which contains `CE()` too. This
+> paragraph used to say 25, which is the count **with the declaration
+> excluded** — the convention the table above states and a bare search does not
+> apply for you. An off-by-one in the paragraph warning about naive counting;
+> re-measured 2026-08-23, both figures, on the extracted `cli.original.js`.
+> (`AE\(\)` finds 26 on darwin as well, by a different composition: 23 call
+> sites, the declaration, and the tails of `function IAE()` and `function
+> jAE()`.) The obvious fix is a lookbehind, and the obvious lookbehind is
+> wrong. Excluding a preceding `.` as well (`(?<![\w$.])`) drops the count to
+> **18** on linux and **20** on darwin (declaration excluded, as in the table),
+> and a session on this branch reported 18 as the true figure on that basis.
+> It is not: the three excluded sites are real, and they look like this —
 >
 > ```js
 > let e=process.execPath,r=[...CE()?[e]:[e,process.argv[1]]];

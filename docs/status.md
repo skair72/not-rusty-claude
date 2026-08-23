@@ -82,7 +82,7 @@ installed on this host, the macOS and Windows binaries were downloaded from npm
 | Runtime asset (`assets/*`) resolution | ✅ `image-processor.node` loads and works through the rewritten path — and since the scoped shim (2026-08-23) the CLI does ask for it: a **Read** of a 3000×3000 PNG comes back a JPEG, measured end to end through the committed mock ([findings.md](./findings.md) §11) | 🔎 static only (Mach-O addons cannot dlopen on Linux) | ⛔ |
 | **Behaves the same as the native binary** | ⚠️ **No.** Seccomp sandbox off, embedded ripgrep → system `rg`, install identity `unknown` — all measured, all §11. Native image processing **is** reachable in a default build since 2026-08-23 (scoped shim, §11) | ⚠️ same by construction (same gate branches; the shim applies here too — `AE`, 23 → 22 call sites) | ⛔ |
 | Scoped image shim applied | ✅ `CE`, call sites 21 → 20, artifact 4 bytes from the unshimmed one (2026-08-23) | ✅ `AE`, 23 → 22, likewise 4 bytes — built here, **not** executed on a Mac | ⛔ |
-| Test suite | ✅ **199 passed** with both real binaries and a Bun present (186 passed / 13 skipped on a host with neither binary nor Bun — see README's table) | ✅ same run | — |
+| Test suite | ✅ **200 passed** with both real binaries and a Bun present (187 passed / 13 skipped on a host with neither binary nor Bun — see README's table) | ✅ same run | — |
 | Approach B: byte-patch + re-sign (`tools/patch_claude.py`) | n/a (macOS-only concern) | 📓 verified 2026-08-21 on 2.1.238; not re-checked here | n/a |
 
 Step numbers refer to sections of
@@ -94,9 +94,11 @@ the real binaries are present: `NRC_TEST_ELF` (default `/usr/bin/claude`) and
 the older `/tmp/ccmac/package/claude` still accepted), plus `BUN_BIN` (default
 `~/.bun-1.3.14/bun`, then `bun` on `PATH`) for the tests that actually boot the
 artifact. Without them the suite skips those tests and still passes, which is
-why a bare "199 passed" needs the host stated alongside it. All four counts
-were measured on this host on 2026-08-23; README's table says how each row was
-forced.
+why a bare "200 passed" needs the host stated alongside it. All four counts
+were re-measured on this host on 2026-08-23, after the last test landed, and
+they still sum to the 200 tests `--collect-only` reports; README's table says
+how each row was forced, including the `PYTHONPATH` the no-Bun row needs on a
+host whose pytest is a `--user` install.
 
 The macOS column is worth reading twice: **extraction, post-processing *and*
 execution of the real Mach-O binary's JavaScript are not a projection — they

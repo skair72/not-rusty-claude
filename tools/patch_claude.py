@@ -171,10 +171,17 @@ def main():
     if not old:
         # b"".find() succeeds at every offset, so an empty --old "matches" the
         # whole file. Measured here on a 1 MiB fixture with this guard removed:
-        # 1,048,577 reported occurrences, 3,145,742 lines of preview, 55.8 MB
-        # peak RSS, then exit 0 claiming a successful patch. Wall clock was 41 s
-        # in two runs on this (shared, loaded) host - load-dependent, so read it
-        # as "tens of seconds per MiB", not as a fixed cost. On the ~300 MB
+        # 1,048,577 reported occurrences, 3,145,742 lines of preview under
+        # --no-sign and 3,145,739 under --dry-run, 55.9-56.1 MiB peak RSS.
+        # Where that ends up is platform-dependent, so the exit status is not
+        # one number: --no-sign and --dry-run exit 0 claiming a successful
+        # patch, while the default signing path on this host (Linux, no
+        # codesign) prints the same flood and then dies exit 1 on a
+        # FileNotFoundError out of dump_entitlements. What the signing path
+        # does once codesign exists is UNVERIFIED - but it reaches it only
+        # after paying the whole cost above. Wall clock was 40-41 s in three
+        # runs on this (shared, loaded) host - load-dependent, so read it as
+        # "tens of seconds per MiB", not as a fixed cost. On the ~300 MB
         # binary this tool is aimed at, that is a hang.
         die("--old is empty; that matches at every offset in the file")
     if len(new) > len(old):
