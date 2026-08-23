@@ -102,24 +102,15 @@ info "staged build swapped into place -> $WORK"
 info "artifacts ready:"
 printf '      %s\n' "$WORK/cli.original.cjs" "$WORK/cli.js" "$WORK/assets/"
 echo
-info "run it with:"
+info "run it with ('mcp list' is the smoke test, not '--version'):"
 printf '      DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \\\n'
 printf '        %s %s mcp list\n' "${BUN_BIN:-bun}" "$WORK/cli.original.cjs"
 echo
-warn "DISABLE_AUTOUPDATER=1 matters: under an external Bun,"
-warn "Bun.isStandaloneExecutable is undefined, so Claude's install-method"
-warn "detection reports 'unknown' and its updater takes the npm/bun"
-warn "global-install route - it would install a DIFFERENT, npm-based Claude"
-warn "Code on your machine instead of updating these artifacts. It also never"
-warn "updates them. Do not run 'claude update' against this build; rebuild"
-warn "from a new native binary instead."
-warn "CLAUDE_CONFIG_DIR keeps a first run away from your real ~/.claude."
-warn "Use 'mcp list' or 'doctor' as the smoke test, not '--version': --version"
-warn "initialises 0 of the bundle's 6748 lazy modules (a hardcoded fast path),"
-warn "so it proves the file parses and proves nothing about Bun's API surface."
-warn "It runs, but it does NOT behave identically to the native binary: native"
-warn "image processing is disabled, the seccomp sandbox is off, and embedded"
-warn "ripgrep becomes a system 'rg' (so rg must be on PATH). See docs/findings.md"
-warn "section 11 - the equivalence gap - before real use."
-warn "Nothing was installed on PATH. Creating a 'claude' launcher could shadow"
-warn "your real installation - run the command above by full path instead."
+# Three lines, not the seventeen this used to print. A wall of warnings after
+# every successful build is a wall nobody reads, and the two that can cost the
+# user something - the updater and the behaviour gap - were buried in it.
+warn "keep DISABLE_AUTOUPDATER=1: without it, 'claude update' would install a"
+warn "  DIFFERENT, npm-based Claude Code on your machine. Rebuild instead."
+warn "not identical to the native binary (image processing, sandbox, ripgrep):"
+warn "  read docs/findings.md section 11 before real use."
+warn "nothing was installed on PATH - run the command above by full path."

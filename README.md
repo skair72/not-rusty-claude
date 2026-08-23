@@ -57,8 +57,8 @@ a guarantee.
 **⚠️ The equivalence gap — read this before using it.** `Bun.isStandaloneExecutable`
 is undefined outside a standalone, so the CLI takes its non-standalone branch in
 ~21 places. Measured consequences: **native image processing is silently
-disabled** (a 3000×3000 PNG fails to resize as shipped, and returns a correct
-469,774-byte JPEG when the flag is forced true — the addon itself is fine), the
+disabled** (a large PNG fails to resize as shipped, and comes back a correct
+JPEG when the flag is forced true — the addon itself is fine), the
 **seccomp sandbox is off**, embedded ripgrep becomes a **system `rg`** (so `rg`
 is a de facto prerequisite), and install identity reports `unknown`. Both addon
 loaders swallow failure, so **exit 0 is not evidence that the asset wiring
@@ -127,14 +127,26 @@ not-rusty-claude/
 ├── scripts/
 │   ├── build.sh                    extract → post-process → print the run command
 │   └── syntax-check.js             fast secondary syntax check (JSC, not Bun)
-└── tests/                          43 tests: hermetic fixtures + real-binary integration
+└── tests/                          82 tests: hermetic fixtures + real-binary integration
 ```
 
 The tools themselves need no third-party packages — stock `python3` (3.9+) is
 enough. Running the test suite additionally needs `pytest`: `python3 -m pytest
-tests/ -q` → 43 passed. The integration tests need the real binaries and
-skip cleanly without them; their hardcoded counts are a deliberate tripwire for
-the next Claude release (see [`docs/status.md`](docs/status.md)).
+tests/ -q`. What that prints depends on what the host has, because the
+integration tests need a real 300 MB binary and skip cleanly without one:
+
+| host has | result |
+| --- | --- |
+| both binaries + Bun | **82 passed** |
+| ELF binary + Bun, no Mach-O | 79 passed, 3 skipped |
+| Bun only | 76 passed, 6 skipped |
+| none of them | 73 passed, 9 skipped |
+
+Point them at binaries with `NRC_TEST_ELF` / `NRC_TEST_MACHO` (defaults:
+`/usr/bin/claude`, `/tmp/ccmac/package/claude`) and at a Bun with `BUN_BIN`
+(default: `~/.bun-1.3.14/bun`, then whatever `bun` is on `PATH`). The
+integration tests' hardcoded counts are a deliberate tripwire for the next
+Claude release (see [`docs/status.md`](docs/status.md)).
 
 ## Two approaches
 

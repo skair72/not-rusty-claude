@@ -47,9 +47,13 @@ repeated.
 > Rust crates — `lolhtml`, `cssparser-0.36.0`, `encoding_rs-0.8.35`,
 > `selectors-0.33.0`. What 1.3.14 predates is the **Zig→Rust rewrite of Bun's
 > own core**, verified by property rather than by version number: 1.3.14
-> carries 7 Zig source-path strings (`bundler/LinkerGraph.zig`,
-> `bundler/OutputFile.zig`, `bundler/bundle_v2.zig`, `js_parser/ast/P.zig`, …)
-> and 1.4.0 carries **0**.
+> carries **4** Zig source-path strings — `bundler/LinkerGraph.zig`,
+> `bundler/OutputFile.zig`, `bundler/bundle_v2.zig`, `js_parser/ast/P.zig` —
+> and 1.4.0 carries **0**. (Re-measured 2026-08-23: `strings -n 6 bun | grep
+> '\.zig' | sort -u` returns **7** lines on 1.3.14 and 0 on 1.4.0, but three of
+> the seven are embedded JavaScript using an identifier that happens to be
+> spelled `newResolver.zig`, not source paths. This section previously called
+> all 7 paths.)
 
 **The goal:** run Claude Code's JavaScript on Zig-era Bun (≤ 1.3.14) rather than
 on the Rust rewrite. Because Claude Code ships as a Bun *standalone* executable
@@ -304,8 +308,10 @@ actually produced.
 3. **Rewrite build-time `file://` leaks to `__filename`** (see below).
 4. **Append the CJS IIFE invocation** `(exports, require, module, __filename,
    __dirname)` to the trailing `})`.
-5. **Report** any leftover `/$bunfs/` reference, any surviving `/home/runner/…`
-   build-machine path, and any extracted asset the code never mentions.
+5. **Refuse** the build if any `/$bunfs/` (or `B:/~BUN/`) reference survived, or
+   if the rewritten code references an asset that is not on disk; **report**
+   any surviving `/home/runner/…` build-machine path and any extracted asset
+   the code never mentions. Reports print before the file is written.
 
 ### Why the pragma has to go — the measured 2×2 ✅
 
@@ -333,17 +339,34 @@ invocation. Stripping is necessary only because this project also invokes.
 version headroom — §10.)
 
 `postprocess.py`'s `check()` then refuses to write `cli.original.cjs` at all
-unless **three** conditions hold — the docstring used to say two:
+unless **five** conditions hold (it was two, then three, and grew twice as
+review found silent failure modes):
 
 1. the output starts with `(function`;
-2. exactly one IIFE invocation was appended (`counts["iife"] == 1`);
-3. it is **not** the case that zero `/$bunfs/` literals were rewritten while
+2. an IIFE invocation was appended (`counts["iife"] == 1`; the pattern is
+   `$`-anchored, so more than one is not reachable);
+3. **no `/$bunfs/` — or Windows `B:/~BUN/` — reference survived the rewrite.**
+   The leftover detector used to demand the same `root/<basename>` shape the
+   rewriter handles, which made it blind in precisely the cases the rewriter
+   could not handle, and what it did find was a warning printed *after*
+   `wrote:`. It was demonstrably vacuous: making the pattern unmatchable left
+   the entire test suite green;
+4. **every `assets/<name>` the rewritten code will reach for at runtime is a
+   file the extractor actually wrote.** `postprocess.py` had always warned
+   about the harmless direction (an extracted asset nothing references) and
+   never about the dangerous one. This is the direction that catches a whole
+   loader kind falling out of `extract_bun.py`'s accept-set — a live risk since
+   the enum correction moved byte 9 from written to dropped (it is `wasm`), so
+   a future `.wasm` module would be referenced and never extracted;
+5. it is **not** the case that zero `/$bunfs/` literals were rewritten while
    `assets/` holds files on disk — the "silently asset-less" outcome, which is
    what a wrong VFS prefix (Windows' `B:/~BUN/root/`, [status.md](./status.md)
    § Windows/PE) would produce.
 
 A silently broken output file reaching Bun would surface only as that confusing
-panic, so the failure is made loud and early instead.
+panic — or, for a missing asset, as nothing at all, because both of Claude's
+addon loaders swallow their own failures. So the failure is made loud and
+early instead.
 
 ### The measured counts ✅
 
@@ -493,7 +516,7 @@ extract-and-run approach is the cleaner one.
 
 | Tool | Extracts JS | Native modules | Runs via Bun | Patches | Notes |
 |---|---|---|---|---|---|
-| [0Chencc/clawgod](https://github.com/0Chencc/clawgod) | ✅ parses table | ✅ `napi` — correctly ✅ | ✅ wrapper + stock bun | ✅ 29 patches | Closest to our goal. Drops `file`-loader assets and rewrites only `.node` requires (§5b) |
+| [0Chencc/clawgod](https://github.com/0Chencc/clawgod) | ✅ parses table | ✅ `napi` — correctly ✅ | ✅ wrapper + stock bun | ✅ 40 patches | Closest to our goal. Drops `file`-loader assets and rewrites only `.node` requires (§5b) |
 | [vicnaum/bun-demincer](https://github.com/vicnaum/bun-demincer) | ✅ + split/deobfuscate/**reassemble** | ✅ | — | — | Most comprehensive decompiler |
 | [vibheksoni/unbuned](https://github.com/vibheksoni/unbuned) | ✅ pure-Python, zero-dep | ❌ | — | — | Heuristic; skips native modules **and universal Mach-O** |
 | [lafkpages/bun-decompile](https://github.com/lafkpages/bun-decompile) | ✅ + sourcemaps | — | — | — | Web + CLI |
@@ -524,6 +547,22 @@ pointing into a filesystem that no longer exists. This repo's two scripts cover
 both shapes and write all three loader kinds. That is a real advantage; it is
 not the sweeping one this table used to assert. Prefer whichever tool you can
 re-measure.
+
+**And it is ahead of this project on the equivalence gap (§11).** ✅ Measured at
+the same commit: ClawGod's patch list already contains
+`'Bun.isStandaloneExecutable → true'`, which rewrites
+`function X(){return Bun.isStandaloneExecutable===!0}` (and the
+`typeof Bun<"u"&&…` form newer Claude releases use) to return true globally —
+the exact flip §11 shows restores native image processing. It also contains
+`'Restore Glob/Grep tools (un-inline EMBEDDED_SEARCH_TOOLS)'`, which rewrites
+the embedded-search gate to check that real `bfs` and `ugrep` binaries exist on
+`PATH` before claiming embedded search. That second patch is not incidental: it
+is the mitigation for the trap §11 documents, where flipping the flag alone
+makes "embedded ripgrep" mean re-exec `process.execPath` — which is `bun` — and
+`Grep` starts answering "No matches found" for strings that exist. Prior art
+addressed both halves before this project noticed either. The patch count above
+is `grep -cE '^    name: ' install.sh` at `4401fdb` = **40**; this table said 29
+until 2026-08-23.
 
 ---
 
@@ -759,13 +798,71 @@ end-to-end through the mock loop above, reading a 3000×3000 PNG with the
 | build | tool result |
 |---|---|
 | as shipped | `is_error: true` — *"Unable to resize image — dimensions exceed the 2000x2000px limit and image processing failed."* |
-| same artifact, `Bun.isStandaloneExecutable` forced `true` | a correct **469,774-byte JPEG** (`ff d8 ff e0`), `media_type: image/jpeg` |
+| same artifact, `Bun.isStandaloneExecutable` forced `true` | a correct JPEG (`ff d8 ff e0`), `media_type: image/jpeg` |
 
-The addon itself is fine: `require("assets/image-processor.node")` under Bun
-1.3.14 exports `processImage`, `hasClipboardImage`, `readClipboardImage`,
-`ImageProcessor`; it reads that PNG's metadata as `{width:3000, height:3000,
-format:"png"}` and resizes it to a valid JPEG ✅. Extraction and path rewriting
-are not the problem. **The CLI simply never asks for it.**
+The flip itself is what reproduces; the JPEG's exact size does not, and this
+table used to quote one. It depended on a source PNG that is not in this repo,
+so an independent A/B measured a different number for the same qualitative
+result. Byte counts are only quoted here when the input is reproducible.
+
+The addon itself is fine, and **that** part is reproducible end to end ✅ —
+generate a deterministic 3000×3000 PNG with stock `python3`:
+
+```bash
+python3 - /tmp/gradient-3000.png <<'EOF'
+import sys, zlib, struct
+W = H = 3000
+raw = bytearray()
+for y in range(H):
+    raw.append(0)                                   # PNG filter: None
+    raw += bytes(v for x in range(W)
+                 for v in ((x + y) % 256, (x * 2) % 256, (y * 3) % 256))
+def chunk(tag, data):
+    return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data))
+open(sys.argv[1], "wb").write(
+    b"\x89PNG\r\n\x1a\n"
+    + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
+    + chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+    + chunk(b"IEND", b""))
+EOF
+#   → /tmp/gradient-3000.png, exactly 2,329,429 bytes
+```
+
+then drive the extracted addon directly, the way the CLI's wrapper does
+(`processImage` → `metadata`/`resize`/`jpeg`/`toBuffer`):
+
+```bash
+cat > /tmp/imgprobe.cjs <<'EOF'
+const fs = require("fs");
+const addon = require(process.argv[2]);
+(async () => {
+  console.log("exports:", Object.keys(addon).join(", "));
+  const buf = fs.readFileSync(process.argv[3]);
+  let img = await addon.processImage(buf);
+  console.log("metadata:", JSON.stringify(await img.metadata()));
+  img.dispose?.();
+  img = await addon.processImage(buf);
+  img.resize(2000, 2000, { fit: "inside", withoutEnlargement: true });
+  img.jpeg(80);
+  const out = await img.toBuffer();
+  console.log("jpeg bytes:", out.length,
+    "magic:", [...out.slice(0, 4)].map(x => x.toString(16).padStart(2, "0")).join(" "));
+})();
+EOF
+"$HOME/.bun-1.3.14/bun" /tmp/imgprobe.cjs \
+  build/extract/assets/image-processor.node /tmp/gradient-3000.png
+```
+
+Measured 2026-08-23 on **both** Bun 1.3.14 and 1.4.0, identical output:
+
+```
+exports: processImage, hasClipboardImage, readClipboardImage, ImageProcessor
+metadata: {"width":3000,"height":3000,"format":"png"}
+jpeg bytes: 919331 magic: ff d8 ff e0
+```
+
+Extraction and path rewriting are not the problem. **The CLI simply never asks
+for it.**
 
 **2. `exit 0` is not evidence that the asset wiring works.** Both addon loaders
 swallow failure:
@@ -829,9 +926,16 @@ BUN_BIN="$HOME/.bun-1.3.14/bun" scripts/build.sh /usr/bin/claude
 
 # the same pipeline against the real macOS binary, on Linux
 npm pack @anthropic-ai/claude-code-darwin-arm64                    # → a .tgz
-mkdir -p /tmp/ccmac && tar xf anthropic-ai-claude-code-darwin-arm64-*.tgz -C /tmp/ccmac
-#   → /tmp/ccmac/package/claude, a 325 MB Mach-O arm64 binary
-OUT_DIR=/tmp/macbuild scripts/build.sh /tmp/ccmac/package/claude
+# The tarball's payload is named `claude`. This repo never creates a file by
+# that name - a stray `claude` is exactly what could later be found on a PATH
+# and shadow a real installation - so rename it as it comes out of the archive.
+mkdir -p /tmp/ccmac
+tar xf anthropic-ai-claude-code-darwin-arm64-*.tgz -C /tmp/ccmac \
+    --transform='s|package/claude$|package/claude-darwin-arm64.bin|'
+#   → /tmp/ccmac/package/claude-darwin-arm64.bin, a 325 MB Mach-O arm64 binary
+OUT_DIR=/tmp/macbuild scripts/build.sh /tmp/ccmac/package/claude-darwin-arm64.bin
+#   the test suite looks for it there too; see tests/conftest.py, or set
+#   NRC_TEST_MACHO to wherever you put it
 
 # L3: Bun's own parser (primary), then the faster JSC check (secondary)
 "$HOME/.bun-1.3.14/bun" build --no-bundle --target=bun \
@@ -843,8 +947,11 @@ OUT_DIR=/tmp/macbuild scripts/build.sh /tmp/ccmac/package/claude
 DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \
   "$HOME/.bun-1.3.14/bun" build/extract/cli.original.cjs mcp list
 
-# regression
-python3 -m pytest tests/ -q            # 43 passed
+# regression. The count depends on what this host has: 82 passed with both real
+# binaries and a Bun; 79/3 skipped without the Mach-O one; 76/6 with neither;
+# 73/9 with no Bun either. NRC_TEST_ELF / NRC_TEST_MACHO / BUN_BIN override the
+# paths (see README's table).
+python3 -m pytest tests/ -q            # 82 passed, on a host with both binaries
 ```
 
 `scripts/syntax-check.js` is a **secondary** check only: `new Function(source)`

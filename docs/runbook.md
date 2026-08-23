@@ -130,10 +130,13 @@ sibling is not optional — Claude's own code resolves `join(__filename,'..',
 
 **Read the counts.** `IIFE invocations added` must be exactly 1 — if it is not,
 `postprocess.py` refuses to write the output at all rather than handing Bun a
-file that fails with a confusing panic. `warning: leftover bunfs reference`
-lines mean an asset path was not rewritten. `note: build-machine path still
-present` lines are informational: string literals containing Anthropic's build
-paths that are not `/$bunfs/` references (3 of them on both binaries measured).
+file that fails with a confusing panic. A surviving `/$bunfs/` (or Windows
+`B:/~BUN/`) reference is refused the same way: it used to be a warning printed
+after the file had already been written. `note: build-machine path still
+present` lines *are* informational: string literals containing Anthropic's
+build paths that are not `/$bunfs/` references (3 of them on both binaries
+measured). All notes print before `wrote:`, so anything after that line is the
+artifact, not a complaint about it.
 
 `build.sh` needs Bun only to *report* its version — extraction and
 post-processing are pure Python. Without `BUN_BIN` it warns and continues.
@@ -168,11 +171,13 @@ DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \
 
 `doctor` prints the version, the search backend, install identity and updater
 state; `mcp list` reads config, initialises `.claude.json` and dispatches into
-the MCP subsystem. Both initialise ~2760 of the bundle's 6748 lazy modules.
+the MCP subsystem. Both initialise ~2760 lazy modules; the bundle measured here
+(linux-x64 2.1.222) holds 6748, and that total moves with every Claude release.
 
 `--version` also works and prints e.g. `2.1.222 (Claude Code)` — but treat it as
-a smoke test only. Measured, it initialises **0 of 6748** lazy modules (a
-hardcoded fast path): it proves the file parses and the CJS wrapper is invoked,
+a smoke test only. Measured, it initialises **0** lazy modules (a hardcoded
+fast path — the only one of these numbers that is structural rather than a
+property of one build): it proves the file parses and the CJS wrapper is invoked,
 and nothing whatsoever about Bun's API surface
 ([findings.md](./findings.md) §10). `--help` (2725 modules) renders the full
 command registry.
@@ -301,7 +306,10 @@ artifacts keep running the version you extracted until you do.
 
 ```bash
 BUN_BIN="$HOME/.bun-1.3.14/bun" scripts/build.sh "$NATIVE"
-python3 -m pytest tests/ -q        # counts are version-specific; see below
+# 82 passed on a host with both real binaries; 73 passed / 9 skipped with
+# neither binary nor Bun. NRC_TEST_ELF / NRC_TEST_MACHO / BUN_BIN choose them
+# (README has the full table). The measured counts are version-specific:
+python3 -m pytest tests/ -q
 DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \
   "$BUN_BIN" build/extract/cli.original.cjs mcp list   # not --version: findings §10
 ```
@@ -317,6 +325,13 @@ Two things to expect:
    darwin-arm64 2.1.239). That failure is the **early warning system**, not a
    defect: re-measure, update the numbers and [findings.md](./findings.md) §4/§6,
    and re-run this runbook. Do not relax the assertions.
+
+   The failure tells you which kind it is. `…_measured_counts_have_not_drifted`
+   lists **every** changed count at once and names the file to update — that is
+   Claude changing, and it is expected. `…_transform_invariants_hold` failing is
+   a different thing entirely: the pragma, the IIFE, a surviving `/$bunfs/`
+   reference or `check()` itself. That means these tools are broken on the new
+   binary, and no number should be updated until it is understood.
 2. ⚠️ **This is the moment the project can break for good** —
    [findings.md](./findings.md) §10. If the new build was compiled against a
    canary Bun newer than 1.3.14, its `cli.js` will not run on Zig at all. Keep
@@ -335,8 +350,8 @@ Two things to expect:
 | `TypeError: … is not a function` naming a `Bun.*` property | **This** is the missing-API signal — findings §10's risk | Pin to an older Claude version, or shim the API |
 | Images are refused with *"Unable to resize image…"* | Expected, not a bug in your build: native image processing is unreachable outside a Bun standalone (findings §11) | No supported fix yet; do **not** flip `Bun.isStandaloneExecutable` globally — it silently breaks search |
 | `ripgrep not found on PATH` | Embedded ripgrep needs a standalone; this build uses a system `rg` (findings §11) | Install `ripgrep` |
-| `postprocess.py` exits non-zero and writes nothing | one of `check()`'s **three** fatal conditions: no trailing IIFE, the file does not start with `(function`, or **zero** `/$bunfs/` literals were rewritten while `assets/` has files (the silently-asset-less guard) | Read the last ~200 bytes of `cli.original.js`; the file shape changed — re-measure before editing the regex. Zero rewrites with populated assets means a different VFS prefix ([status.md](./status.md) § Windows/PE) |
-| `Cannot find module '.../assets/X.node'` | asset not extracted, or its path not rewritten | Confirm `assets/X.node` exists; check the `/$bunfs/ paths rewired` count and any leftover-bunfs warning |
+| `postprocess.py` exits non-zero and writes nothing | one of `check()`'s **five** fatal conditions ([findings.md](./findings.md) §6): no trailing IIFE; the file does not start with `(function`; a `/$bunfs/` or `B:/~BUN/` reference survived the rewrite; the rewritten code reaches for an `assets/<name>` that was never extracted; or **zero** `/$bunfs/` literals were rewritten while `assets/` has files | The error names which. Shape problems (IIFE, `(function`) mean the entry module changed — read its last ~200 bytes and re-measure before editing a regex. A surviving reference means a `/$bunfs/` shape the rewriter does not cover. A missing asset means `extract_bun.py` dropped a loader kind — check its `LOADERS`/`WRITTEN_LOADERS` against Bun's `src/bundler/options.zig`. Zero rewrites with populated assets means a different VFS prefix ([status.md](./status.md) § Windows/PE) |
+| `Cannot find module '.../assets/X.node'` | asset not extracted, or its path not rewritten | Should no longer be reachable from a build that succeeded: `check()` fails the build when the rewritten code references an asset that is not on disk. If you see it anyway, the artifact and its `assets/` came from different runs — rebuild |
 | A mermaid/highlight/chart feature breaks | a `file`-loader asset still referenced via `/$bunfs/`, or an unverified runtime path | The rewritten path shape is verified to work (`image-processor.node` loads through it), but no command here has exercised these three features — [status.md](./status.md) remaining work #3 |
 | `error: PE (Windows) executable detected` | you pointed the extractor at `claude.exe` | Not supported by design — [status.md](./status.md) § Windows/PE |
 | `error: ELF has no section headers (stripped?)` | the binary was stripped | Get an unstripped build; the shipped one is not stripped |

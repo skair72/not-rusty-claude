@@ -25,9 +25,18 @@ def postprocess():
     return _load("postprocess")
 
 
-def _real(env_var, default):
-    path = os.environ.get(env_var, default)
-    return path if path and os.path.isfile(path) else None
+def _real(env_var, *defaults):
+    """The binary named by env_var, else the first default that exists.
+
+    Both env vars are documented in README's test-count table and in
+    docs/runbook.md; they are what make the integration tests runnable on a
+    host that keeps its binaries somewhere else.
+    """
+    override = os.environ.get(env_var)
+    for path in ([override] if override else list(defaults)):
+        if path and os.path.isfile(path):
+            return path
+    return None
 
 
 @pytest.fixture(scope="session")
@@ -40,7 +49,12 @@ def real_elf_binary():
 
 @pytest.fixture(scope="session")
 def real_macho_binary():
-    path = _real("NRC_TEST_MACHO", "/tmp/ccmac/package/claude")
+    # findings.md's appendix now unpacks the darwin tarball under a name of its
+    # own, because this repo creates no file called `claude`; the older path is
+    # still accepted so an existing checkout keeps working.
+    path = _real("NRC_TEST_MACHO",
+                 "/tmp/ccmac/package/claude-darwin-arm64.bin",
+                 "/tmp/ccmac/package/claude")
     if not path:
         pytest.skip("no Mach-O Claude binary; set NRC_TEST_MACHO")
     return path

@@ -7,9 +7,11 @@ release before Bun's Zig→Rust rewrite.
 **As of 2026-08-22 the pipeline has been run end to end on this host.** The
 extracted, post-processed `cli.original.cjs` from the real Linux binary
 (Claude Code **2.1.222**) starts under external Bun 1.3.14 and answers `doctor`,
-`mcp list`, `--help` and `--version`. Lead with `doctor` or `mcp list`: they
-initialise ~2760 of the bundle's 6748 lazy modules, whereas `--version`
-initialises **0** and therefore proves nothing about Bun's API surface
+`mcp list`, `--help` and `--version`. Lead with `doctor` or `mcp list`: on this
+build they initialise ~2760 of the bundle's 6748 lazy modules, whereas
+`--version` initialises **0** and therefore proves nothing about Bun's API
+surface. (Both numbers are properties of linux-x64 2.1.222, measured; only the
+**0** is structural — it is a hardcoded fast path)
 ([findings.md](./findings.md) §10). That is the first empirical answer to the
 risk in §10, and it is a *positive* one **for that version, on that platform,
 on those code paths** — nothing wider.
@@ -71,11 +73,20 @@ installed on this host, the macOS and Windows binaries were downloaded from npm
 | Output accepted by Bun 1.3.14's parser | 🔎 `bun build --no-bundle`, exit 0 (Step 3) | 🔎 `bun build --no-bundle`, exit 0 (Step 3b) | ⛔ |
 | **Runs under external Bun** | ✅ `doctor`, `mcp list`, `--help`, `--version` all exit 0 on **1.3.14 and 1.4.0** (Steps 5, 5b + addendum) | ✅ the darwin JS boots under **Linux** Bun → `2.1.239 (Claude Code)`; macOS-*specific* behaviour still needs a Mac | ⛔ would also need a Windows Bun |
 | Runtime asset (`assets/*`) resolution | ✅ `image-processor.node` loads and works through the rewritten path; but the CLI never asks for it — [findings.md](./findings.md) §11 | 🔎 static only (Mach-O addons cannot dlopen on Linux) | ⛔ |
-| Test suite (43 tests) | ✅ 43 passed, incl. 4 integration tests against the real ELF **and** Mach-O binaries (see the verification record's 2026-08-22 addendum) | ✅ same run | — |
+| **Behaves the same as the native binary** | ⚠️ **No.** Native image processing unreachable, seccomp sandbox off, embedded ripgrep → system `rg`, install identity `unknown` — all measured, all §11 | ⚠️ same by construction (same `CE()` branches) | ⛔ |
+| Test suite | ✅ **82 passed** with both real binaries present (73 passed / 9 skipped on a host with neither binary nor Bun — see README's table) | ✅ same run | — |
 | Approach B: byte-patch + re-sign (`tools/patch_claude.py`) | n/a (macOS-only concern) | 📓 verified 2026-08-21 on 2.1.238; not re-checked here | n/a |
 
 Step numbers refer to sections of
 [verification-2026-08-22.md](./verification-2026-08-22.md).
+
+The integration tests behind the ✅ marks in the "Test suite" row only run when
+the real binaries are present: `NRC_TEST_ELF` (default `/usr/bin/claude`) and
+`NRC_TEST_MACHO` (default `/tmp/ccmac/package/claude-darwin-arm64.bin`, with
+the older `/tmp/ccmac/package/claude` still accepted), plus `BUN_BIN` (default
+`~/.bun-1.3.14/bun`, then `bun` on `PATH`) for the tests that actually boot the
+artifact. Without them the suite skips those tests and still passes, which is
+why a bare "82 passed" needs the host stated alongside it.
 
 The macOS column is worth reading twice: **extraction, post-processing *and*
 execution of the real Mach-O binary's JavaScript are not a projection — they
@@ -166,14 +177,15 @@ mysterious.
    (observed directly in `claude.exe` 2.1.239 — 6 such literals in the entry
    module, and **zero** `/$bunfs/` ones). `postprocess.py`'s `BUNFS_LITERAL`
    regex would therefore rewrite **nothing**. That outcome — zero rewrites with
-   a populated `assets/` — is now the third fatal condition in `check()`, so it
-   fails **loudly** rather than shipping silently asset-less output; that guard
-   is what `tools/postprocess.py`'s error message points at this section for.
+   a populated `assets/` — is a fatal condition in `check()`, so it fails
+   **loudly** rather than shipping silently asset-less output; that guard is
+   what `tools/postprocess.py`'s error message points at this section for.
    (This paragraph used to give "silently asset-less rather than loudly broken"
    as a *reason not to ship PE*; that stopped being true when the guard landed
-   in `59d9a98`.) The remaining work is real but bounded: generalise the
-   pattern *and* the leftover check, then find a Windows Bun to run the result
-   on.
+   in `59d9a98`.) The leftover detector now covers the `B:/~BUN/` prefix too,
+   and a surviving reference is fatal in its own right, so a PE attempt fails
+   loudly twice over. The remaining work is real but bounded: generalise
+   `BUNFS_LITERAL` itself, then find a Windows Bun to run the result on.
 
 Everything else about the PE entry module matches the other platforms: it opens
 with the `// @bun @bytecode @bun-cjs` pragma and a CommonJS wrapper, and ends
@@ -247,8 +259,11 @@ worse problem was found underneath it.
   `Bun.isStandaloneExecutable`, which is undefined outside a standalone.
   Measured: as shipped, reading a 3000×3000 PNG fails with *"Unable to resize
   image…"*; with the flag forced true, the same artifact returns a correct
-  469,774-byte JPEG. The seccomp sandbox is off, embedded ripgrep degrades to a
-  system `rg`, and install identity is `unknown`, for the same reason.
+  JPEG. (The flip reproduces; the JPEG's exact size does not, because the
+  source PNG is not in this repo — findings §11 ships a generator and a
+  reproducible direct-addon measurement instead.) The seccomp sandbox is off,
+  embedded ripgrep degrades to a system `rg`, and install identity is
+  `unknown`, for the same reason.
 - **Also settled, and it matters for every "exit 0" claim in this repo:** both
   addon loaders swallow failure (`try{…}catch{ …=null }`), so a missing or
   broken asset degrades silently. **Exit 0 is not evidence that asset wiring
@@ -297,8 +312,10 @@ previous `build/extract/` intact.
   output that changes every release. They are measured against two real
   binaries, not contracts.
 - **The equivalence gap is characterised, not closed.** findings §11 lists what
-  differs and why; only the image path has an A/B measurement behind it. The
-  other 20 `CE()` branches were read, not exercised.
+  differs and why. Three of the branches have an A/B measurement behind them —
+  the image path, `doctor`'s install-identity and search lines, and `Grep`
+  (which is the one that shows why a global flip is *not* the fix). The
+  remaining `CE()` branches were read, not exercised.
 - **`CLAUDE_CODE_EXECPATH`.** Measured: the CLI **never reads** it (0
   occurrences of `process.env.CLAUDE_CODE_EXECPATH`) and unconditionally
   *writes* it as `process.execPath` — now the bun binary — into every spawned
@@ -324,9 +341,9 @@ previous `build/extract/` intact.
 - **Don't transcribe the loader enum from another extractor.** Read it from
   Bun's `src/bundler/options.zig` at the matching tag. Doing otherwise is how
   `jsonc=7` went missing here and every id from 7 up shifted (findings §5a).
-- **Don't lead with `--version`** when checking a build. It initialises 0 of
-  6748 lazy modules — a hardcoded fast path. Use `doctor` or `mcp list`
-  (findings §10).
+- **Don't lead with `--version`** when checking a build. It initialises **0**
+  lazy modules — a hardcoded fast path — out of 6748 on the build measured
+  here. Use `doctor` or `mcp list` (findings §10).
 - **Don't read `exit 0` as "the assets resolve".** Both addon loaders swallow
   failure (findings §11).
 - **Don't match the entry module by name.** It is `/$bunfs/root/cli` on darwin

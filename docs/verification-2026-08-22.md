@@ -879,8 +879,13 @@ pasted in the "Safety checks" section above.
 # Addendum: 2026-08-22 fleet audit, wave-1 fixes, and a re-run at HEAD
 
 *Appended 2026-08-22, after the body above was already written and pinned to
-commit `56e8877`. Nothing above this line was edited except the pin notice at
-the top of the file. Where the two disagree, **this addendum is current**.*
+commit `56e8877`. Where the two disagree, **this addendum is current**.*
+
+*Two things above this line were edited, not one, and the earlier wording here
+("nothing except the pin notice") was wrong: the pin notice at the top, and one
+sentence in the "fix round 1/5" paragraph, which cited a `task-8-report.md`
+that is not in this repository and now says so instead. No pasted command,
+output or number in the body has been altered.*
 
 ## What happened
 
@@ -1173,8 +1178,16 @@ $ DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR=$(mktemp -d) \
     ~/.bun-1.3.14/bun <macout>/extract/cli.original.cjs --version
 2.1.239 (Claude Code)                                                  (exit 0)
 
-$ ~/.bun-1.3.14/bun -e 'require("<macout>/extract/assets/image-processor.node")'
-Error [ERR_DLOPEN_FAILED]: … invalid ELF header
+$ echo 'require("<macout>/extract/assets/image-processor.node");' > /tmp/probe.cjs
+$ ~/.bun-1.3.14/bun /tmp/probe.cjs
+error: <macout>/extract/assets/image-processor.node: invalid ELF header
+ code: "ERR_DLOPEN_FAILED"                                             (exit 1)
+
+  # NOT `bun -e`. Corrected 2026-08-23: this line used to paste the same
+  # require through `bun -e '…'`, which on 1.3.14 prints NOTHING and exits 0 —
+  # the dlopen failure is swallowed. (On 1.4.0 the same `bun -e` does report
+  # it.) The fact was right; the command pasted under it did not produce that
+  # output on the version named. Use a script file.
 
 $ od -N4 -tx1 <macout>/extract/assets/*.node
 audio-capture.node        cf fa ed fe      computer-use-input.node   ca fe ba be
@@ -1210,14 +1223,23 @@ with Object.defineProperty(Bun,'isStandaloneExecutable',{value:true}):
   TOOL_RESULT IMAGE  media=image/jpeg  decoded_bytes=469774  magic=ff d8 ff e0
 ```
 
-The addon is not the problem — it works when called directly:
+The addon is not the problem — it works when called directly. The command
+originally pasted here was an elided `bun -e '…'` one-liner, i.e. not runnable
+as printed and tied to a source PNG that is not in this repository; findings §11
+now carries a script-file version, a `python3` generator for a deterministic
+3000×3000 PNG, and this output, which reproduces byte-for-byte on **both**
+1.3.14 and 1.4.0 (re-measured 2026-08-23):
 
 ```
-$ ~/.bun-1.3.14/bun -e '…require("<out>/extract/assets/image-processor.node")…'
-exports: [ "processImage", "hasClipboardImage", "readClipboardImage", "ImageProcessor" ]
+$ ~/.bun-1.3.14/bun /tmp/imgprobe.cjs \
+    build/extract/assets/image-processor.node /tmp/gradient-3000.png
+exports: processImage, hasClipboardImage, readClipboardImage, ImageProcessor
 metadata: {"width":3000,"height":3000,"format":"png"}
-resized JPEG bytes: 2534466  magic: ff d8 ff e0
+jpeg bytes: 919331 magic: ff d8 ff e0
 ```
+
+(The 2,534,466-byte figure this block used to show came from a different source
+image at different resize settings. Same conclusion, unreproducible number.)
 
 `doctor`, same A/B:
 
@@ -1269,7 +1291,100 @@ $ … <bun-1.4.0>  <out240>/extract/cli.original.cjs mcp list    → No MCP serv
 - **macOS-specific behaviour.** The darwin JS boots here, but its addons are
   Mach-O and `process.platform` is `linux`.
 - **Windows.** Unimplemented by choice (`status.md` § Windows/PE).
-- **20 of the 21 `CE()` branches** were read from source, not exercised. Only
-  the image path has an A/B measurement behind it.
+- **Most of the 21 `CE()` branches** were read from source, not exercised.
+  Three have an A/B measurement behind them, all pasted above: the image path,
+  `doctor` (install identity + search backend), and `Grep`. The earlier
+  wording here — "only the image path has an A/B" — contradicted this
+  document's own tables.
 - **The `find`/`grep` shell-function shadowing** was reconstructed from the
   shipped source, not observed live.
+
+---
+
+# Addendum: 2026-08-23, wave 3 (robustness + evidence hygiene)
+
+*Appended after the two addenda above. Same rule: nothing earlier is rewritten
+except where a pasted command did not reproduce, and every such correction is
+marked inline where it sits.*
+
+## Test counts, with the precondition they need
+
+"43 passed" was quoted in four places with no statement of what the host had.
+The integration tests skip without a real binary, so the number is a property
+of the host as much as of the suite. At this wave's HEAD, measured:
+
+```
+$ python3 -m pytest -q                                     # both binaries + bun
+82 passed in 16.4s
+
+$ NRC_TEST_MACHO=/nonexistent python3 -m pytest -q         # ELF + bun only
+79 passed, 3 skipped
+
+$ NRC_TEST_ELF=/nonexistent NRC_TEST_MACHO=/nonexistent python3 -m pytest -q
+76 passed, 6 skipped
+
+$ … and with no bun reachable either (HOME without ~/.bun-1.3.14, bun off PATH)
+73 passed, 9 skipped
+```
+
+`NRC_TEST_ELF`, `NRC_TEST_MACHO` and `BUN_BIN` were documented nowhere before
+this wave; they are now in README's table, in `docs/status.md` under the
+verification matrix, and in `tests/conftest.py`'s own docstring.
+
+## `bun -e` swallows a failing `require()` on 1.3.14
+
+Found while checking that this record's own pasted commands reproduce. Same
+darwin addon, same host, same file:
+
+```
+$ ~/.bun-1.3.14/bun -e 'require("<macout>/…/image-processor.node")'
+                                                          (no output, exit 0)
+$ ~/.bun-1.3.14/bun /tmp/probe.cjs        # the same line, from a file
+error: …/image-processor.node: invalid ELF header
+ code: "ERR_DLOPEN_FAILED"                                            (exit 1)
+$ ~/.bun-1.4.0/bun  -e 'require("<macout>/…/image-processor.node")'
+error: …/image-processor.node: invalid ELF header                     (exit 1)
+```
+
+So a `bun -e` one-liner is not a safe way to demonstrate that a native module
+loads on 1.3.14: exit 0 there means "the expression was evaluated", not "the
+addon loaded". Use a script file. The affected block above is corrected in
+place.
+
+## Re-measurements
+
+| Claim | Was | Measured 2026-08-23 | Command |
+|---|---|---|---|
+| Zig source paths in bun 1.3.14 | "7 Zig source-path strings" | **4** paths; 7 strings contain `.zig`, three of them being JS with an identifier `newResolver.zig` | `strings -n 6 bun \| grep '\.zig' \| sort -u` |
+| ClawGod patches at `4401fdb` | 29 | **40** | `grep -cE '^    name: ' install.sh` |
+| image-processor addon, direct call | 2,534,466-byte JPEG (unreproducible input) | **919,331** bytes, `ff d8 ff e0`, identical on 1.3.14 and 1.4.0 | findings §11's generator + probe |
+
+## Pipeline, re-run end to end at this wave's HEAD
+
+Both binaries, both Bun versions, `mcp list` (not `--version`):
+
+```
+$ OUT_DIR=<elfout> BUN_BIN=~/.bun-1.3.14/bun scripts/build.sh /usr/bin/claude
+Extracted: 1 cli.js + 5 assets (2 loader shims left inlined in cli.js)
+/$bunfs/ paths rewired : 5    file:// leaks rewritten: 7    IIFE: 1
+note: build-machine path still present: …/@ant/computer-use-swift/js
+note: build-machine path still present: …/@grpc/grpc-js/build/src
+note: build-machine path still present: …/src/frame
+wrote: <elfout>/extract/cli.original.cjs
+```
+
+The three `note:` lines now print **before** `wrote:`, not after it, and the
+successful build ends in 5 warning lines instead of 17.
+
+The 2×2, both artifacts × both Bun versions, `DISABLE_AUTOUPDATER=1` and a
+scratch `CLAUDE_CONFIG_DIR` for each:
+
+```
+linux-x64 2.1.222 artifact,   bun 1.3.14   mcp list → "No MCP servers configured…"  rc=0
+linux-x64 2.1.222 artifact,   bun 1.4.0    mcp list → "No MCP servers configured…"  rc=0
+darwin-arm64 2.1.239 artifact,bun 1.3.14   mcp list → "No MCP servers configured…"  rc=0
+darwin-arm64 2.1.239 artifact,bun 1.4.0    mcp list → "No MCP servers configured…"  rc=0
+```
+
+`/usr/bin/claude` was never executed or written during this wave; its md5 is
+unchanged.

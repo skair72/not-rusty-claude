@@ -743,6 +743,19 @@ git commit -m "fix: rewrite every /\$bunfs/ literal, not just .node requires"
 - Consumes: `postprocess.transform(code) -> (str, dict)` from Task 4.
 - Produces: the same `transform` with `pragma`, `file_urls`, `iife` populated and `build_paths` added, plus `postprocess.check(code, counts) -> list[str]` returning fatal error strings (empty when the output is sound).
 
+> **Amendment 4 (2026-08-22, fix wave `59d9a98`) and Amendment 5 (2026-08-23,
+> wave 3).** This cross-task interface widened twice after the plan was
+> written, and the plan was not updated at the time — recorded here now.
+> The shipped signature is
+> `check(code, counts, assets_on_disk=None, asset_names_on_disk=None)`, and
+> `transform()` additionally returns `counts["asset_names"]` (the asset
+> basenames the rewritten code will reach for) and a `counts["leftovers"]`
+> that covers any `/$bunfs/` or Windows `B:/~BUN/` reference rather than only
+> the `root/<basename>` shape. `check()` grew from two fatal conditions to
+> five; the two additions are the silently-asset-less guard (Amendment 4) and
+> the referenced-but-never-extracted guard plus fatal leftovers (Amendment 5).
+> See `docs/findings.md` §6 for the current list.
+
 - [ ] **Step 1: Write the failing tests**
 
 Append to `tests/test_postprocess.py`:
