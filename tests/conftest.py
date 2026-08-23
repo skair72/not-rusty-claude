@@ -76,3 +76,11 @@ def bun_bin():
         if path and os.path.isfile(path) and os.access(path, os.X_OK):
             return path
     pytest.skip("no bun available; set BUN_BIN")
+
+
+@pytest.fixture
+def patch_claude():
+    """Fresh per test, unlike the tool fixtures above: these tests monkeypatch
+    the module's run() to stand in for codesign, and a session-scoped module
+    would carry a stub from one test into the next."""
+    return _load("patch_claude")

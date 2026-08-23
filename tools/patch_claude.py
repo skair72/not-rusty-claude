@@ -146,6 +146,12 @@ def main():
 
     old = args.old.encode("utf-8")
     new = args.new.encode("utf-8")
+    if not old:
+        # b"".find() succeeds at every offset, so an empty --old "matches" the
+        # whole file: measured on a 1 MiB fixture, 1,048,577 reported
+        # occurrences, each one previewed, 41s and 56 MB of RSS, then exit 0
+        # claiming success. On the binary this tool is for, that is a hang.
+        die("--old is empty; that matches at every offset in the file")
     if len(new) > len(old):
         die(f"replacement is longer than the original ({len(new)} > {len(old)} bytes). "
             "A Mach-O cannot grow mid-file - shorten --new.")
@@ -166,6 +172,18 @@ def main():
         if not 1 <= idx <= len(hits):
             die(f"--occurrence {idx} out of range (found {len(hits)})")
         hits = [hits[idx - 1]]
+
+    # Overlapping hits clobber each other. find_all advances one byte at a
+    # time, so --old aaa matches twice in "aaaa" and the second write lands on
+    # top of the first replacement's padding: measured, "PREFIX aaaa SUFFIX"
+    # with --new z came out as "PREFIX zz   SUFFIX", a doubled z nobody asked
+    # for. The length is still right, so the size check below cannot see it.
+    # Refuse instead; --occurrence selects a single hit and stays usable.
+    touching = [n for n in range(1, len(hits)) if hits[n] - hits[n - 1] < len(old)]
+    if touching:
+        die(f"--old overlaps itself: {len(touching)} of the {len(hits)} hits start "
+            f"within {len(old)} bytes of the previous one, so patching them all "
+            "would write over each other's padding. Use --occurrence.")
 
     padded = new + pad * (len(old) - len(new))
     say(f"{BOLD}Found{RESET} {len(hits)} occurrence(s); patching {len(hits)}")
@@ -194,25 +212,35 @@ def main():
     else:
         die("choose --out <path> or --in-place (or --dry-run)")
 
-    for off in hits:
-        blob[off:off + len(old)] = padded
+    # Ask codesign about the original BEFORE the patch lands. Under --in-place
+    # src is dest, so afterwards the only thing on disk is a file whose
+    # Developer ID signature no longer describes its own bytes - and these two
+    # answers are what the replacement signature gets built from. Under --out
+    # src survives and the order would not matter; do it once, for both.
+    tmp = None if args.no_sign else tempfile.TemporaryDirectory()
+    try:
+        ent = ident = None
+        if tmp:
+            ent = dump_entitlements(src, os.path.join(tmp.name, "ent.plist"))
+            ident = args.identifier or original_identifier(src)
 
-    size_before = os.path.getsize(dest)
-    with open(dest, "wb") as fh:
-        fh.write(blob)
-    os.chmod(dest, 0o755)
-    size_after = os.path.getsize(dest)
+        for off in hits:
+            blob[off:off + len(old)] = padded
 
-    if size_before != size_after:
-        die(f"size changed ({size_before:,} -> {size_after:,}) - this must never happen")
-    say(f"{GRN}Patched{RESET} - size unchanged at {size_after:,} bytes\n")
+        size_before = os.path.getsize(dest)
+        with open(dest, "wb") as fh:
+            fh.write(blob)
+        os.chmod(dest, 0o755)
+        size_after = os.path.getsize(dest)
 
-    if args.no_sign:
-        say("--no-sign given; the binary is now unsigned-invalid and will be killed on launch.", YEL)
-        return
+        if size_before != size_after:
+            die(f"size changed ({size_before:,} -> {size_after:,}) - this must never happen")
+        say(f"{GRN}Patched{RESET} - size unchanged at {size_after:,} bytes\n")
 
-    with tempfile.TemporaryDirectory() as tmp:
-        ent = dump_entitlements(src, os.path.join(tmp, "ent.plist"))
+        if args.no_sign:
+            say("--no-sign given; the binary is now unsigned-invalid and will be killed on launch.", YEL)
+            return
+
         if ent:
             say(f"{BOLD}Entitlements{RESET} carried over from the original:")
             with open(ent) as fh:
@@ -222,7 +250,6 @@ def main():
         else:
             say("no entitlements found on the original", YEL)
 
-        ident = args.identifier or original_identifier(src)
         if ident:
             say(f"\n{BOLD}Identifier{RESET} preserved as {CYN}{ident}{RESET}")
         else:
@@ -231,6 +258,9 @@ def main():
 
         say(f"{BOLD}Re-signing{RESET} ad-hoc, hardened runtime preserved")
         resign(dest, ent, ident)
+    finally:
+        if tmp:
+            tmp.cleanup()
 
     # A quarantine xattr plus an ad-hoc signature is a launch block; drop it.
     run(["xattr", "-d", "com.apple.quarantine", dest])
