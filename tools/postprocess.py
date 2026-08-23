@@ -13,19 +13,26 @@ What it does (see docs/findings.md §6):
      expression pointing at the extracted assets/ directory on real disk.
   3. Rewrite build-time fileURLToPath()/import.meta.url leaks to __filename.
   4. Append the CJS IIFE invocation so require()-ing the file actually runs it.
-  5. Report any leftover /$bunfs/ references (should be none after step 2).
-  6. Write a one-line sibling cli.js next to it, because Claude's own code
+  5. Write a one-line sibling cli.js next to it, because Claude's own code
      resolves join(__filename,'..','cli.js') for two MCP self-spawns.
 
-check() then validates the transformed code is actually sound. It has THREE
-fatal conditions: the output starts with `(function`; exactly one trailing IIFE
-invocation was appended; and it is not the case that zero /$bunfs/ literals were
-rewritten while assets/ holds files on disk (the "silently asset-less" outcome a
-wrong VFS prefix produces — see docs/status.md's Windows/PE section). If any of
-them fails, main() prints the errors to stderr and exits non-zero WITHOUT
-writing cli.original.cjs — a silently-broken output file reaching Bun surfaces
-only as the confusing panic "Expected CommonJS module to have a function
-wrapper".
+check() then validates the transformed code is actually sound. It has FIVE
+fatal conditions:
+  a. the output starts with `(function`;
+  b. a trailing IIFE invocation was appended;
+  c. no /$bunfs/ (or Windows B:/~BUN/) reference survived the rewrite;
+  d. every assets/<name> the rewritten code will reach for at runtime is a
+     file extract_bun.py actually wrote — the referenced-but-never-extracted
+     direction, which is what a whole loader kind dropping out of the
+     extractor's accept-set looks like from here;
+  e. it is not the case that zero /$bunfs/ literals were rewritten while
+     assets/ holds files on disk (the "silently asset-less" outcome a wrong
+     VFS prefix produces — see docs/status.md's Windows/PE section).
+If any of them fails, main() prints the errors to stderr and exits non-zero
+WITHOUT writing cli.original.cjs — a silently-broken output file reaching Bun
+surfaces only as the confusing panic "Expected CommonJS module to have a
+function wrapper", or worse, as a silent degradation, because Claude's addon
+loaders swallow their own failures.
 
 Usage:
   ./postprocess.py <extract-dir>
@@ -46,7 +53,18 @@ import sys
 #                                                     fs/promises.readFile
 # The .node case simply becomes a dynamic require of an absolute path.
 BUNFS_LITERAL = re.compile(r"""(['"])/\$bunfs/root/([\w.\-]+)\1""")
-LEFTOVER_BUNFS = re.compile(r"/\$bunfs/root/[\w.\-]*")
+
+# Deliberately WIDER than BUNFS_LITERAL: this is the net that catches what the
+# rewriter could not. It used to require the same `root/` segment, which made
+# it blind in exactly the cases that matter - a nested path, a different VFS
+# root, or the Windows prefix all rewrote to nothing AND flagged nothing. It
+# was provably vacuous: neutering it so it could never match left the whole
+# suite green. Both real binaries produce zero matches for this wider pattern
+# after transform (measured on linux-x64 2.1.222 and darwin-arm64 2.1.239), so
+# a hit here means something genuinely new, and check() treats it as fatal.
+# `B:/~BUN/` is Bun's Windows VFS prefix - see docs/status.md's Windows/PE
+# section for why PE is not shipped.
+LEFTOVER_BUNFS = re.compile(r"(?:/\$bunfs/|B:/~BUN/)[^\s'\"`]*")
 
 # Bun's bundler resolves import.meta.url at build time into a literal file://
 # URL of the build machine, e.g.
@@ -86,6 +104,9 @@ def transform(code):
     """Pure text transform. Returns (new_code, counts)."""
     counts = {}
     code, counts["pragma"] = re.subn(r"^(?:\/\/[^\n]*\n)+", "", code, count=1)
+    # the distinct asset basenames the rewritten code will reach for at
+    # runtime; check() matches them against what the extractor actually wrote
+    counts["asset_names"] = sorted({m.group(2) for m in BUNFS_LITERAL.finditer(code)})
     code, counts["assets"] = BUNFS_LITERAL.subn(_asset_expr, code)
     code, counts["file_urls"] = FILE_URL_LEAK.subn("__filename", code)
     code, counts["iife"] = re.subn(
@@ -97,23 +118,47 @@ def transform(code):
     return code, counts
 
 
-def check(code, counts, assets_on_disk=None):
+def check(code, counts, assets_on_disk=None, asset_names_on_disk=None):
     """Return a list of fatal problems; empty means the output should load.
 
     assets_on_disk, when given, is the number of files extract_bun.py wrote to
     <extract-dir>/assets (None if that directory does not exist / was not
     checked - e.g. when transform() is exercised in isolation on a text
     snippet with no accompanying assets/ dir on disk).
+
+    asset_names_on_disk, when given, is the set of their names; it lets the
+    referenced-but-never-extracted check run. None skips that check for the
+    same reason.
     """
     errors = []
     if not code.startswith("(function"):
         errors.append("output does not start with '(function' - Bun's CJS loader "
                       "will panic with 'Expected CommonJS module to have a "
                       "function wrapper'")
-    if counts["iife"] != 1:
-        errors.append("expected exactly 1 trailing IIFE to invoke, found "
-                      + str(counts["iife"])
-                      + " - the file does not end in '})'")
+    if counts["iife"] == 0:
+        # `\})\s*$` is $-anchored, so subn() can never make more than one
+        # substitution; 0 is the only failure this can report.
+        errors.append("no trailing IIFE to invoke - the file does not end in "
+                      "'})', so require()-ing it would define the wrapper and "
+                      "never run it")
+    if counts["leftovers"]:
+        errors.append(
+            "%d /$bunfs/ reference(s) survived the rewrite: %s - they point "
+            "into the standalone's virtual filesystem, which does not exist "
+            "outside the native binary, so whatever reads them fails at "
+            "runtime (or degrades silently, since both addon loaders swallow "
+            "their errors). Widen BUNFS_LITERAL to cover the new shape."
+            % (len(counts["leftovers"]), ", ".join(counts["leftovers"])))
+    if asset_names_on_disk is not None:
+        missing = sorted(set(counts["asset_names"]) - set(asset_names_on_disk))
+        if missing:
+            errors.append(
+                "the rewritten code will require()/readFile() %d asset(s) "
+                "that were never extracted: %s. Either extract_bun.py dropped "
+                "a loader kind (check its LOADERS table and WRITTEN_LOADERS "
+                "against Bun's src/bundler/options.zig) or the two tools were "
+                "run against different binaries."
+                % (len(missing), ", ".join("assets/" + m for m in missing)))
     if counts["assets"] == 0 and assets_on_disk:
         errors.append(
             "0 /$bunfs/ paths were rewired but assets/ has "
@@ -138,9 +183,11 @@ def main():
         die(f"{src} not found - run extract_bun.py first")
 
     assets_dir = os.path.join(d, "assets")
+    asset_names = set()
     assets_on_disk = None
     if os.path.isdir(assets_dir):
-        assets_on_disk = len(os.listdir(assets_dir))
+        asset_names = set(os.listdir(assets_dir))
+        assets_on_disk = len(asset_names)
     else:
         sys.stderr.write("warning: no assets/ dir; native/file modules will be missing\n")
 
@@ -149,13 +196,21 @@ def main():
     orig_len = len(code)
 
     code, counts = transform(code)
-    errors = check(code, counts, assets_on_disk)
+    errors = check(code, counts, assets_on_disk, asset_names)
 
     print(f"pragma block stripped  : {counts['pragma']}")
     print(f"/$bunfs/ paths rewired : {counts['assets']}")
     print(f"file:// leaks rewritten: {counts['file_urls']}")
     print(f"IIFE invocations added : {counts['iife']}  (expected 1)")
     print(f"size: {orig_len} -> {len(code)} bytes")
+
+    # Diagnostics belong ABOVE the write: printed after "wrote:" they read as
+    # commentary on a finished artifact rather than as reasons to look at it.
+    for path in counts["build_paths"]:
+        sys.stderr.write(f"note: build-machine path still present: {path}\n")
+    for entry in sorted(asset_names):
+        if entry not in code:
+            sys.stderr.write(f"note: extracted asset never referenced: {entry}\n")
 
     if errors:
         for e in errors:
@@ -171,16 +226,6 @@ def main():
     with open(shim, "w", encoding="utf-8") as fh:
         fh.write(SHIM_SOURCE)
     print(f"wrote: {shim}  (sibling for Claude's MCP self-spawns)")
-
-    for name in counts["leftovers"]:
-        sys.stderr.write(f"warning: leftover bunfs reference: {name}\n")
-    for path in counts["build_paths"]:
-        sys.stderr.write(f"note: build-machine path still present: {path}\n")
-
-    if assets_on_disk is not None:
-        for entry in sorted(os.listdir(assets_dir)):
-            if entry not in code:
-                sys.stderr.write(f"note: extracted asset never referenced: {entry}\n")
 
 
 if __name__ == "__main__":

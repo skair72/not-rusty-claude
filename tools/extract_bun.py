@@ -45,6 +45,26 @@ LOADERS = {0: "jsx", 1: "js", 2: "ts", 3: "tsx", 4: "css", 5: "file",
            16: "sqlite_embedded", 17: "html", 18: "yaml", 19: "json5",
            20: "md"}
 
+# Loaders whose modules must land on real disk under assets/ because the entry
+# module reaches for them at RUNTIME - native addons (napi) and assets read
+# back through fs (file, base64). Everything else is a JS shim the bundler has
+# already inlined into the entry module. Kept as a named constant so the test
+# suite can assert one written kind per entry rather than restating the tuple.
+WRITTEN_LOADERS = ("napi", "base64", "file")
+
+# Loaders that are genuine JavaScript, i.e. the ones legitimately inlined into
+# the entry module and dropped here. Anything else being dropped is a signal,
+# not a routine event - see the warning in extract().
+JS_LOADERS = ("js", "jsx", "ts", "tsx")
+
+# Sanity ceilings for Mach-O header counts. A real Mach-O has tens of load
+# commands and tens of sections; these are ~1000x that, so they reject the
+# u32-scale values a corrupt or hostile header supplies without constraining
+# any plausible real binary. Without them a load command claiming ncmds=2**32-1
+# takes ~10 minutes to walk (measured) instead of dying immediately.
+MAX_LOAD_COMMANDS = 10000
+MAX_SECTIONS = 10000
+
 MH_MAGIC_64 = 0xFEEDFACF
 ELF_MAGIC_LE = 0x464C457F
 PE_MAGIC = b"MZ"
@@ -56,26 +76,61 @@ def die(msg):
 
 
 def find_bun_section_macho(buf):
-    """Return (raw_offset, raw_size) of the __BUN,__bun section."""
+    """Return (raw_offset, raw_size) of the __BUN,__bun section.
+
+    Every count and offset here comes straight out of the file, so all of them
+    are attacker-controlled on an untrusted input. The bounds checks are not
+    decoration: without them a header with cmdsize=0 makes `off` stop advancing
+    and re-reads the same bytes ncmds times, and a huge nsects walks past EOF
+    where slicing quietly yields b"" instead of raising - measured at ~10 and
+    ~17 minutes respectively for u32-scale counts. The ELF path opposite has
+    had these checks since it was written; this one predates them.
+    """
     # mach_header_64: magic(4) cputype(4) cpusubtype(4) filetype(4)
     #                 ncmds(4) sizeofcmds(4) flags(4) reserved(4)
+    HEADER_SIZE = 32
+    SECTION_64_SIZE = 80
+    SEGMENT_64_HEADER = 0x48   # section_64 records start here, inside the command
+    if len(buf) < HEADER_SIZE:
+        die(f"Mach-O header truncated - file is only {len(buf)} bytes "
+            f"(need at least {HEADER_SIZE} for the fixed header)")
     ncmds = struct.unpack_from("<I", buf, 16)[0]
-    off = 32  # load commands begin after the 32-byte header
+    if ncmds > MAX_LOAD_COMMANDS:
+        die(f"Mach-O claims {ncmds} load commands (max {MAX_LOAD_COMMANDS}) "
+            "- corrupt or hostile header")
+    off = HEADER_SIZE  # load commands begin after the 32-byte header
     LC_SEGMENT_64 = 0x19
     for _ in range(ncmds):
+        if off + 8 > len(buf):
+            die("Mach-O load command table extends past end of file "
+                "(truncated or corrupt binary)")
         cmd, cmdsize = struct.unpack_from("<II", buf, off)
-        if cmd == LC_SEGMENT_64:
+        if cmdsize == 0:
+            die("Mach-O load command has cmdsize=0 - the walk cannot advance "
+                "(corrupt or hostile binary)")
+        if off + cmdsize > len(buf):
+            die("Mach-O load command extends past end of file "
+                "(truncated or corrupt binary)")
+        if cmd == LC_SEGMENT_64 and cmdsize >= SEGMENT_64_HEADER:
             segname = buf[off + 8:off + 24].split(b"\0", 1)[0].decode("ascii", "replace")
             if segname == "__BUN":
                 nsects = struct.unpack_from("<I", buf, off + 0x40)[0]
-                s = off + 0x48  # first section_64 record
+                if nsects > MAX_SECTIONS:
+                    die(f"Mach-O __BUN segment claims {nsects} sections "
+                        f"(max {MAX_SECTIONS}) - corrupt or hostile header")
+                s = off + SEGMENT_64_HEADER  # first section_64 record
                 for _ in range(nsects):
+                    # section_64 records live inside the load command; a
+                    # well-formed one never runs past its own cmdsize.
+                    if s + SECTION_64_SIZE > min(off + cmdsize, len(buf)):
+                        die("Mach-O __BUN section table extends past the end "
+                            "of its load command (truncated or corrupt binary)")
                     sectname = buf[s:s + 16].split(b"\0", 1)[0].decode("ascii", "replace")
                     if sectname == "__bun":
                         size = struct.unpack_from("<Q", buf, s + 0x28)[0]
                         offset = struct.unpack_from("<I", buf, s + 0x30)[0]
                         return offset, size
-                    s += 80  # sizeof(section_64)
+                    s += SECTION_64_SIZE
         off += cmdsize
     die("Mach-O has no __BUN,__bun section")
 
@@ -101,6 +156,16 @@ def find_bun_section_elf(buf):
     if e_shoff + e_shnum * e_shentsize > len(buf):
         die("ELF section header table extends past end of file "
             "(truncated or corrupt binary)")
+    if e_shentsize < 40:
+        die(f"ELF section header entry size {e_shentsize} is too small "
+            "(need at least 40 bytes to hold sh_offset/sh_size)")
+    if e_shstrndx >= e_shnum:
+        # shdr() below indexes the table with e_shstrndx before any loop
+        # bound applies to it, so an out-of-range value reaches
+        # struct.unpack_from as a raw offset. Same class the check above
+        # closes, one field further on.
+        die(f"ELF section name string table index {e_shstrndx} is out of "
+            f"range (only {e_shnum} sections)")
 
     def shdr(i):
         off = e_shoff + i * e_shentsize
@@ -119,6 +184,9 @@ def find_bun_section_elf(buf):
 
 
 def find_bun_section(buf):
+    if len(buf) < 4:
+        die(f"input is only {len(buf)} bytes - too short to hold a container "
+            "magic, let alone a Bun standalone")
     if buf[:2] == PE_MAGIC:
         die("PE (Windows) executable detected - extraction is not supported.\n"
             "       The .bun payload format is identical, but running the extracted\n"
@@ -136,8 +204,18 @@ def find_bun_section(buf):
 def parse_payload(section):
     """Validate a raw __bun/.bun section and return
     (payload, modules_offset, modules_size, entry_point_id)."""
+    # The smallest conceivable well-formed section: u64 length prefix, the
+    # 32-byte offset struct and the trailer. Anything shorter cannot be
+    # unpacked at all, and reached struct.error rather than die() before.
+    minimum = 8 + OFFSET_STRUCT_SIZE + len(TRAILER)
+    if len(section) < minimum:
+        die(f"section is only {len(section)} bytes - too short to hold a Bun "
+            f"module graph (need at least {minimum})")
     payload_size = struct.unpack_from("<Q", section, 0)[0]
     payload = section[8:8 + payload_size]
+    if len(payload) < OFFSET_STRUCT_SIZE + len(TRAILER):
+        die(f"payload is only {len(payload)} bytes - too short to hold the "
+            "offset struct and trailer (truncated section?)")
     if payload[-len(TRAILER):] != TRAILER:
         die("trailer mismatch - not a Bun standalone graph, or wrong offsets")
 
@@ -174,7 +252,8 @@ def extract(binary, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     table = payload[modules_offset:modules_offset + modules_size]
 
-    cli_count = asset_count = shim_count = 0
+    asset_count = shim_count = 0
+    written = {}    # basename -> content already written under assets/
     for i in range(count):
         rec = table[i * MODULE_RECORD_SIZE:(i + 1) * MODULE_RECORD_SIZE]
         name_off, name_size, content_off, content_size = struct.unpack_from("<IIII", rec, 0)
@@ -189,8 +268,7 @@ def extract(binary, out_dir):
             with open(dest, "wb") as fh:
                 fh.write(content)
             print(f"  entry   {loader:7} {len(content)/1024/1024:6.2f} MB -> {dest}")
-            cli_count += 1
-        elif loader in ("napi", "base64", "file"):
+        elif loader in WRITTEN_LOADERS:
             # Native addons (.node, loader napi) and runtime assets (mermaid,
             # highlight.js, the html template - loader file) must land on real
             # disk for cli.js to require/read them once /$bunfs no longer
@@ -205,21 +283,51 @@ def extract(binary, out_dir):
                 # IsADirectoryError from open() below. Fail cleanly instead.
                 die(f"module {i} ({name!r}) reduces to an unsafe basename "
                     f"{base!r} - refusing to write it under assets/")
+            if base in written:
+                # Two modules in different directories share a basename, so
+                # both want the same assets/<base>. The second used to
+                # overwrite the first in silence, exit 0, and ship an artifact
+                # missing an asset. postprocess.py could not disambiguate them
+                # either: BUNFS_LITERAL only matches basenames directly under
+                # /$bunfs/root/, so both references rewrite to the same path.
+                if written[base] == content:
+                    print(f"  note: module {i} ({name!r}) duplicates "
+                          f"assets/{base} byte-for-byte; keeping one copy")
+                    continue
+                die(f"module {i} ({name!r}) collides with an already-written "
+                    f"assets/{base} whose contents differ - one of the two "
+                    "would be silently lost")
             os.makedirs(assets_dir, exist_ok=True)
             dest = os.path.join(assets_dir, base)
+            written[base] = content
             with open(dest, "wb") as fh:
                 fh.write(content)
             kind = "native " if base.endswith(".node") else "asset  "
             print(f"  {kind} {loader:7} {len(content)/1024:7.0f} KB -> {dest}")
             asset_count += 1
         else:
-            # tiny js shims (image-processor.js etc.) that load the addons
+            # tiny js shims (image-processor.js etc.) that load the addons.
+            # Anything that is NOT JavaScript is being dropped on the floor:
+            # either Bun's loader enum has drifted (a new id we do not know)
+            # or this binary carries a kind we have never seen embedded, e.g.
+            # wasm(9) or sqlite(15). Neither is fatal here - if the entry
+            # module actually references it, postprocess.py's
+            # referenced-but-never-extracted check stops the build - but it
+            # must not pass in silence, because a silent drop is precisely how
+            # the old off-by-one enum hid a mislabelled kind.
+            if loader not in JS_LOADERS:
+                sys.stderr.write(
+                    f"warning: module {i} ({name!r}) has loader "
+                    f"{loader} (id {loader_id}), which is neither JavaScript "
+                    "to inline nor a kind we extract - it was DROPPED. Check "
+                    "LOADERS against Bun's src/bundler/options.zig.\n")
             shim_count += 1
 
-    print(f"Extracted: {cli_count} cli.js + {asset_count} assets "
+    # No cli_count guard: exactly one module has i == entry_point_id, and
+    # parse_payload() has already rejected entry_point_id >= count, so the
+    # entry branch fires exactly once by construction.
+    print(f"Extracted: 1 cli.js + {asset_count} assets "
           f"({shim_count} loader shims left inlined in cli.js)")
-    if cli_count != 1:
-        die(f"expected exactly 1 entry-point, got {cli_count}")
 
 
 def main():

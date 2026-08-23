@@ -165,3 +165,96 @@ def test_genuine_base64_module_is_written_to_disk(extract_bun, tmp_path):
     assert dest.is_file(), "genuine base64 module was dropped"
     assert dest.read_bytes() == blob
 
+
+
+# --- basename collisions and unknown loaders ---------------------------------
+#
+# Both are version-drift blind spots: they cost nothing today (no shipped
+# binary has either) and they cost an asset, silently, the day a Claude release
+# introduces one.
+
+def _elf_with(tmp_path, modules):
+    payload = fixtures.build_payload(
+        [("/$bunfs/root/cli", b"(function(){})", 1)] + modules)
+    binary = tmp_path / "claude"
+    binary.write_bytes(fixtures.build_elf(payload))
+    return binary
+
+
+def test_colliding_basenames_with_different_content_are_fatal(
+        extract_bun, tmp_path, capsys):
+    """Two modules in different directories share a basename, so both want the
+    same assets/<base>. The second used to overwrite the first in silence and
+    exit 0. postprocess.py cannot disambiguate them either - BUNFS_LITERAL only
+    matches basenames directly under /$bunfs/root/ - so one asset is simply
+    lost."""
+    binary = _elf_with(tmp_path, [
+        ("/$bunfs/root/a/thing.node", b"first-copy", 10),
+        ("/$bunfs/root/b/thing.node", b"second-copy", 10),
+    ])
+
+    with pytest.raises(SystemExit):
+        extract_bun.extract(str(binary), str(tmp_path / "out"))
+
+    err = capsys.readouterr().err
+    assert "collides" in err
+    assert "thing.node" in err
+
+
+def test_colliding_basenames_with_identical_content_are_kept(
+        extract_bun, tmp_path, capsys):
+    """The benign half of the same case: the same bytes embedded twice. There
+    is nothing to lose, so keep one copy and say so rather than failing a
+    build over it."""
+    binary = _elf_with(tmp_path, [
+        ("/$bunfs/root/a/thing.node", b"same-bytes", 10),
+        ("/$bunfs/root/b/thing.node", b"same-bytes", 10),
+    ])
+    out = tmp_path / "out"
+
+    extract_bun.extract(str(binary), str(out))
+
+    assert (out / "assets" / "thing.node").read_bytes() == b"same-bytes"
+    assert "duplicates" in capsys.readouterr().out
+
+
+def test_an_unknown_loader_id_is_reported_not_silently_dropped(
+        extract_bun, tmp_path, capsys):
+    """An id past the end of Bun's enum means the enum has drifted. The module
+    is dropped either way, but a drop nobody is told about is how the previous
+    off-by-one enum hid for as long as it did."""
+    binary = _elf_with(tmp_path, [("/$bunfs/root/mystery.dat", b"bytes", 200)])
+
+    extract_bun.extract(str(binary), str(tmp_path / "out"))
+
+    err = capsys.readouterr().err
+    assert "unknown(200)" in err
+    assert "DROPPED" in err
+
+
+def test_a_known_but_unextracted_binary_loader_is_reported(
+        extract_bun, tmp_path, capsys):
+    """wasm(9) is the live example: the corrected enum moved byte 9 from the
+    accept-set to the drop path (it was mislabelled `napi` before). Neither
+    shipped binary carries one, so if a future release does, this warning plus
+    postprocess.py's referenced-but-never-extracted check are what stand
+    between it and a silently asset-less build."""
+    binary = _elf_with(tmp_path, [("/$bunfs/root/mod.wasm", b"\x00asm", 9)])
+
+    extract_bun.extract(str(binary), str(tmp_path / "out"))
+
+    err = capsys.readouterr().err
+    assert "wasm" in err
+    assert "DROPPED" in err
+
+
+def test_javascript_shims_are_dropped_without_any_warning(
+        extract_bun, tmp_path, capsys):
+    """The routine case must stay silent, or the warning above is noise: the
+    real binaries drop 2 js-loader shims whose contents the bundler has already
+    inlined into the entry module."""
+    binary = _elf_with(tmp_path, [("/$bunfs/root/image-processor.js", b"//x", 1)])
+
+    extract_bun.extract(str(binary), str(tmp_path / "out"))
+
+    assert capsys.readouterr().err == ""

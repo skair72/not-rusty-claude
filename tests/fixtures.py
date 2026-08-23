@@ -48,31 +48,79 @@ def _section_bytes(payload):
     return struct.pack("<Q", len(payload)) + payload
 
 
-def build_macho(payload):
-    """Minimal 64-bit little-endian Mach-O with one LC_SEGMENT_64 __BUN/__bun."""
+SEGMENT_COMMAND_64_SIZE = 0x48
+SECTION_64_SIZE = 80
+
+# What the real darwin-arm64 Claude binary looks like: 21 load commands, with
+# __BUN at #5 behind four of DIFFERENT sizes, and __TEXT carrying 11 sections.
+# Those four cmdsizes are each exactly a segment_command_64 plus a whole number
+# of section_64 records (72 = 0 sections, 952 = 11, 232 = 2, 712 = 8), which is
+# what makes them usable as decoys here.
+REAL_MACHO_DECOY_CMDSIZES = (72, 952, 232, 712)
+
+
+def _segment_command(segname, cmdsize, sectname_prefix=b"__dec"):
+    """One LC_SEGMENT_64 of exactly cmdsize bytes, with as many empty
+    section_64 records as fit. Used as filler the parser must walk past."""
+    assert cmdsize >= SEGMENT_COMMAND_64_SIZE
+    nsects = (cmdsize - SEGMENT_COMMAND_64_SIZE) // SECTION_64_SIZE
+    cmd = bytearray(cmdsize)
+    struct.pack_into("<II", cmd, 0, 0x19, cmdsize)      # LC_SEGMENT_64
+    cmd[8:8 + len(segname)] = segname
+    struct.pack_into("<I", cmd, 0x40, nsects)
+    for i in range(nsects):
+        s = SEGMENT_COMMAND_64_SIZE + i * SECTION_64_SIZE
+        name = sectname_prefix + str(i).encode()
+        cmd[s:s + len(name)] = name
+        cmd[s + 16:s + 16 + len(segname)] = segname
+    return bytes(cmd)
+
+
+def build_macho(payload, decoy_commands=(), decoy_sections=0):
+    """A 64-bit little-endian Mach-O with an LC_SEGMENT_64 __BUN/__bun.
+
+    decoy_commands: cmdsizes of filler load commands emitted BEFORE the __BUN
+    segment. With the default () the walk has nothing to walk, so a parser
+    that ignored cmdsize entirely would still pass; pass
+    REAL_MACHO_DECOY_CMDSIZES to reproduce the real binary's variable-size
+    command chain.
+
+    decoy_sections: filler section_64 records inside the __BUN segment ahead of
+    __bun. With the default 0 the 80-byte stride is never exercised, because
+    the very first record is the one being looked for.
+    """
     section = _section_bytes(payload)
     header_size = 32
-    cmdsize = 0x48 + 80          # segment_command_64 + one section_64
-    sect_offset = header_size + cmdsize
+    decoys = b"".join(
+        _segment_command(b"__DECOY", size, sectname_prefix=b"__d%d_" % i)
+        for i, size in enumerate(decoy_commands))
+    cmdsize = SEGMENT_COMMAND_64_SIZE + SECTION_64_SIZE * (decoy_sections + 1)
+    sect_offset = header_size + len(decoys) + cmdsize
 
     hdr = bytearray(header_size)
     struct.pack_into("<I", hdr, 0, 0xFEEDFACF)   # MH_MAGIC_64
     struct.pack_into("<I", hdr, 4, 0x0100000C)   # CPU_TYPE_ARM64
     struct.pack_into("<I", hdr, 12, 2)           # MH_EXECUTE
-    struct.pack_into("<I", hdr, 16, 1)           # ncmds
-    struct.pack_into("<I", hdr, 20, cmdsize)     # sizeofcmds
+    struct.pack_into("<I", hdr, 16, 1 + len(decoy_commands))    # ncmds
+    struct.pack_into("<I", hdr, 20, len(decoys) + cmdsize)      # sizeofcmds
 
     cmd = bytearray(cmdsize)
     struct.pack_into("<II", cmd, 0, 0x19, cmdsize)      # LC_SEGMENT_64
     cmd[8:8 + len(b"__BUN")] = b"__BUN"
-    struct.pack_into("<I", cmd, 0x40, 1)                # nsects
-    # the single section_64 record lives inside this same command, at +0x48
-    cmd[0x48:0x48 + len(b"__bun")] = b"__bun"           # sectname
-    cmd[0x58:0x58 + len(b"__BUN")] = b"__BUN"           # section's segname
-    struct.pack_into("<Q", cmd, 0x48 + 0x28, len(section))    # size
-    struct.pack_into("<I", cmd, 0x48 + 0x30, sect_offset)     # offset
+    struct.pack_into("<I", cmd, 0x40, decoy_sections + 1)       # nsects
+    # the section_64 records live inside this same command, from +0x48 on
+    for i in range(decoy_sections):
+        s = SEGMENT_COMMAND_64_SIZE + i * SECTION_64_SIZE
+        name = b"__pad%d" % i
+        cmd[s:s + len(name)] = name
+        cmd[s + 16:s + 16 + len(b"__BUN")] = b"__BUN"
+    bun = SEGMENT_COMMAND_64_SIZE + decoy_sections * SECTION_64_SIZE
+    cmd[bun:bun + len(b"__bun")] = b"__bun"                     # sectname
+    cmd[bun + 16:bun + 16 + len(b"__BUN")] = b"__BUN"           # segname
+    struct.pack_into("<Q", cmd, bun + 0x28, len(section))       # size
+    struct.pack_into("<I", cmd, bun + 0x30, sect_offset)        # offset
 
-    return bytes(hdr) + bytes(cmd) + section
+    return bytes(hdr) + decoys + bytes(cmd) + section
 
 
 def build_elf(payload):

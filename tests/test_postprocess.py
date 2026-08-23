@@ -192,3 +192,89 @@ def test_cli_js_shim_boots_the_entry_under_bun(tmp_path, bun_bin, pkg):
     # resolve join(__filename,"..","cli.js") - both must land on the shim's dir
     assert f"argv1={tmp_path / 'cli.js'}" in result.stdout
     assert f"filename={tmp_path / 'cli.original.cjs'}" in result.stdout
+
+
+# --- check()'s remaining fatal conditions ------------------------------------
+
+def test_output_not_starting_with_the_wrapper_is_reported_as_fatal(postprocess):
+    """The guard whose message names the exact Bun panic. Every other test's
+    input happens to satisfy it, so deleting the guard changed nothing: this
+    input trips it and only it."""
+    out, counts = postprocess.transform("var x=1;\n(function(){})")
+    assert counts["iife"] == 1, "this input must fail the (function check alone"
+
+    errors = postprocess.check(out, counts)
+
+    assert errors
+    assert any("(function" in e for e in errors)
+    assert not any("IIFE" in e for e in errors)
+
+
+# --- leftover /$bunfs/ references --------------------------------------------
+#
+# LEFTOVER_BUNFS used to require the same `root/<basename>` shape BUNFS_LITERAL
+# rewrites, which made it blind in exactly the cases that matter: anything the
+# rewriter cannot handle also failed to be reported. It was vacuous - neutering
+# it so it could never match left the whole suite green - and what it did find
+# was a warning printed after "wrote:", not a reason to stop.
+
+@pytest.mark.parametrize("reference", [
+    'require("/$bunfs/root/vendor/nested.node")',   # nested path
+    'require("/$bunfs/dist/thing.node")',           # different VFS root
+    'require("B:/~BUN/root/thing.node")',           # Bun's Windows prefix
+])
+def test_a_reference_the_rewriter_cannot_handle_is_flagged_and_fatal(
+        postprocess, reference):
+    out, counts = postprocess.transform(
+        REAL_HEAD + "var x=" + reference + ";" + REAL_TAIL)
+
+    assert counts["assets"] == 0, "this shape must be one BUNFS_LITERAL misses"
+    assert counts["leftovers"], "an unrewritable VFS reference was not reported"
+
+    errors = postprocess.check(out, counts)
+
+    assert any("bunfs" in e.lower() for e in errors), errors
+
+
+def test_a_normally_rewritten_reference_leaves_no_leftovers(postprocess):
+    """The widened pattern must not fire on its own replacement text."""
+    out, counts = postprocess.transform(REAL_HEAD + NODE_REQUIRE + REAL_TAIL)
+
+    assert counts["assets"] == 1
+    assert counts["leftovers"] == []
+    assert postprocess.check(out, counts) == []
+
+
+def test_referenced_assets_are_matched_against_what_was_extracted(postprocess):
+    """The dangerous direction: the rewritten code reaches for an asset that
+    is not on disk. postprocess.py only ever warned about the harmless
+    inverse ("extracted asset never referenced")."""
+    out, counts = postprocess.transform(REAL_HEAD + NODE_REQUIRE + REAL_TAIL)
+    assert counts["asset_names"] == ["image-processor.node"]
+
+    assert postprocess.check(out, counts,
+                             asset_names_on_disk={"image-processor.node"}) == []
+
+    errors = postprocess.check(out, counts, asset_names_on_disk={"something-else"})
+    assert any("image-processor.node" in e for e in errors), errors
+
+
+def test_diagnostics_are_printed_before_the_artifact_is_written(tmp_path):
+    """Order matters for whether anyone acts on them. Printed after "wrote:"
+    these notes read as commentary on a finished artifact; printed before, they
+    read as reasons to look at it.
+
+    PYTHONUNBUFFERED makes the interleaving of the two streams reflect the
+    order of the writes rather than Python's buffering.
+    """
+    (tmp_path / "cli.original.js").write_text(
+        TINY_ENTRY.replace("})\n", 'var p="/home/runner/work/leaked/path";\n})\n'))
+
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "tools" / "postprocess.py"), str(tmp_path)],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        env={"PATH": "/usr/bin:/bin", "PYTHONUNBUFFERED": "1"})
+
+    assert result.returncode == 0, result.stdout
+    note = result.stdout.index("note: build-machine path still present")
+    assert note < result.stdout.index("wrote:"), result.stdout
