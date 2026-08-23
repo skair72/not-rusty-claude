@@ -12,6 +12,11 @@
 # Env:
 #   BUN_BIN   bun to check against (default: `command -v bun`)
 #   OUT_DIR   where artifacts land (default: ./build)
+#   NRC_NO_IMAGE_SHIM=1
+#             build WITHOUT the scoped isStandaloneExecutable image shim, i.e.
+#             exactly what this repo shipped before it existed. It is the "as
+#             shipped" half of the A/B in docs/findings.md 11; passed straight
+#             through to postprocess.py.
 
 set -euo pipefail
 
@@ -86,10 +91,42 @@ info "extracting cli.js + assets -> $WORK"
 [ -f "$STAGE/cli.original.js" ] || die "extraction failed: cli.original.js missing"
 
 # 4. Post-process
+#
+# stdout is teed so the shim status can be reported here as well. The log lives
+# INSIDE $STAGE so it is disposed of by whichever path runs next: the EXIT trap
+# rm -rf's $STAGE on failure, and the success path deletes it before the swap -
+# nothing of ours is ever left in $OUT_DIR.
 info "post-processing cli.js for external Bun"
-"$HERE/tools/postprocess.py" "$STAGE"
+POST_LOG="$STAGE/.postprocess.log"
+"$HERE/tools/postprocess.py" "$STAGE" | tee "$POST_LOG"
 [ -f "$STAGE/cli.original.cjs" ] || die "post-process failed: cli.original.cjs missing"
 [ -f "$STAGE/cli.js" ] || die "post-process failed: cli.js sibling missing"
+
+# 4a. Say out loud which of the two artifacts this is. Measured on both real
+# binaries, the shimmed and unshimmed outputs differ in exactly FOUR bytes
+# (`CE()`/`AE()` -> `true`), and that difference only becomes visible when
+# someone Reads an image big enough to need resizing - far too late to start
+# wondering which build this was.
+SHIM_N="$(sed -n 's/^image shim applied *: *\([0-9][0-9]*\).*/\1/p' "$POST_LOG")"
+rm -f "$POST_LOG"
+# ...and remember it, because the closing summary's list of gaps is only true
+# for one of the two builds.
+GAPS="image processing, sandbox, ripgrep"
+if [ "${SHIM_N:-}" = "1" ]; then
+  GAPS="sandbox, ripgrep, install identity"
+  info "image shim APPLIED: the native image-processor branch is reachable,"
+  info "  which is what the Read tool needs to resize a large image. Every other"
+  info "  isStandaloneExecutable gate (ripgrep, sandbox, updater) stays false."
+elif [ -n "${NRC_NO_IMAGE_SHIM:-}" ]; then
+  warn "image shim NOT APPLIED (NRC_NO_IMAGE_SHIM is set): this is the"
+  warn "  'as shipped' build, with the native image-processor branch"
+  warn "  unreachable exactly as in every build before the shim existed."
+else
+  warn "image shim NOT APPLIED: postprocess.py could not find the gate or its"
+  warn "  anchor - see its warning above for which. The artifact is otherwise"
+  warn "  fine, just with image processing degraded as it was before the shim."
+  warn "  Most likely a new Claude release renamed the anchor string."
+fi
 
 # 4b. Swap the staged build in. Everything above this line is reversible; if any
 # of it failed, the previous $WORK is still untouched on disk.
@@ -111,6 +148,6 @@ echo
 # user something - the updater and the behaviour gap - were buried in it.
 warn "keep DISABLE_AUTOUPDATER=1: without it, 'claude update' would install a"
 warn "  DIFFERENT, npm-based Claude Code on your machine. Rebuild instead."
-warn "not identical to the native binary (image processing, sandbox, ripgrep):"
+warn "not identical to the native binary ($GAPS):"
 warn "  read docs/findings.md section 11 before real use."
 warn "nothing was installed on PATH - run the command above by full path."
