@@ -115,6 +115,16 @@ POST_LOG="$STAGE/.postprocess.log"
 # was. `grep -o 'if(true)try' <artifact> | wc -l` answers it after the fact: 1
 # shimmed, 0 as shipped, on both binaries.
 SHIM_N="$(sed -n 's/^image shim applied *: *\([0-9][0-9]*\).*/\1/p' "$POST_LOG")"
+# ...and WHY, when it did not apply. postprocess.py prints this line only in
+# that case and it is the only statement of the cause that reaches stdout; the
+# headline below quotes it instead of naming a cause of its own. It used to
+# name one - "a new Claude release renamed the anchor string" - for every
+# refusal alike, and that is wrong for the refusal that does not involve the
+# anchor at all: rebuilding a linux-x64 2.1.222 binary whose gate DECLARATION
+# had been replaced in place with an equal-length arrow form printed exactly
+# that line for an artifact whose anchor was still present exactly once
+# (reproduced on this host 2026-08-24).
+SHIM_WHY="$(sed -n 's/^image shim not applied *: *//p' "$POST_LOG")"
 rm -f "$POST_LOG"
 # ...and remember it, because the closing summary's list of gaps is only true
 # for one of the two builds. Printing the unshimmed list after a shimmed build
@@ -134,10 +144,13 @@ elif [ -n "${NRC_NO_IMAGE_SHIM:-}" ]; then
   warn "  'as shipped' build, with the native image-processor branch"
   warn "  unreachable exactly as in every build before the shim existed."
 else
-  warn "image shim NOT APPLIED: postprocess.py could not find the gate or its"
-  warn "  anchor - see its warning above for which. The artifact is otherwise"
-  warn "  fine, just with image processing degraded as it was before the shim."
-  warn "  Most likely a new Claude release renamed the anchor string."
+  warn "image shim NOT APPLIED: ${SHIM_WHY:-postprocess.py refused; see its warning above}"
+  warn "  The artifact is otherwise fine, just with image processing degraded"
+  warn "  as it was before the shim existed. Drift can be in the gate"
+  warn "  DECLARATION's minified shape, in the anchor string, or in the"
+  warn "  if(<gate>())try{ branch shape, and they are re-measured differently -"
+  warn "  the line above says which one this build hit. See docs/runbook.md's"
+  warn "  troubleshooting table."
 fi
 
 # 4b. Swap the staged build in. Everything above this line is reversible; if any

@@ -10,12 +10,15 @@ Two platforms, and they are at different levels of confidence:
 - **Linux x64** — the whole path below was executed on 2026-08-22 against Claude
   Code 2.1.222, output pasted in
   [verification-2026-08-22.md](./verification-2026-08-22.md).
-- **macOS (Apple Silicon)** — steps 0–4 were executed here against the real
-  2.1.239 Mach-O binary; the extracted darwin JavaScript boots under **Linux**
-  Bun and prints `2.1.239 (Claude Code)`. What has **never** been exercised is
-  macOS-*specific* behaviour: the Mach-O `.node` addons cannot load on Linux,
-  and `process.platform` is `linux`. That is what you would be contributing.
-  See [status.md](./status.md) § macOS execution.
+- **macOS (Apple Silicon)** — steps 0–3 were executed here against the real
+  2.1.239 Mach-O binary, and step 4 was executed here *under Linux Bun*: the
+  extracted darwin JavaScript boots and prints `2.1.239 (Claude Code)`. No step
+  in this runbook has ever been run **on** macOS. The `.node` addons are Mach-O
+  and cannot load on Linux, and `process.platform` is `linux` here, so nothing
+  macOS-*specific* is exercised — that is what you would be contributing.
+  [README's macOS section](../README.md#macos) is the version of this with the
+  measured and unverified steps separated command by command; see also
+  [status.md](./status.md) § macOS execution.
 - **Windows** — not supported; extraction refuses PE input by design
   ([status.md](./status.md) § Windows/PE).
 
@@ -36,6 +39,20 @@ Two platforms, and they are at different levels of confidence:
   a Bun standalone, which this build is not, so it looks for `rg` on `PATH`
   ([findings.md](./findings.md) §11).
 - This repo checked out. Nothing needs installing from it.
+
+Every step in this runbook should work on Linux **and** macOS — with the
+standing caveat that none of them has ever been run on macOS
+([README](../README.md#macos)) — except one, which is Linux-only by decision:
+`scripts/ab-equivalence.sh`, the §11 A/B. Its egress guard reads
+`/proc/<pid>/fd` against `/proc/net/tcp`, and the script refuses to start where
+those are unreadable rather than run the comparison with its safety net
+silently missing. It also requires `timeout(1)` (or `gtimeout`) — a hard
+requirement, not a best effort, since a hung case has to be bounded by
+something — plus `node` for the loopback mock and `rg` on `PATH`. A preflight
+names everything missing in one message rather than dying at whichever line
+comes first (checked here on 2026-08-24 by hiding `bun` and `node`: both were
+reported together, exit 1; the `/proc` branch — the one a Mac would take —
+could not be exercised on this host, which refuses `unshare`).
 
 Locate the binary and confirm it is a Bun standalone:
 
@@ -132,9 +149,12 @@ wrote: .../.extract.stage.NNNN/cli.js  (sibling for Claude's MCP self-spawns)
 ==> staged build swapped into place -> .../build/extract
 ```
 
-(Copied from a build run on this host on 2026-08-23. The gate's minified name
-and the call-site count belong to `linux-x64` 2.1.222: the darwin-arm64 2.1.239
-build prints `AE` and `23 -> 22`.)
+(Quoted from a build run on this host against `/usr/bin/claude`, re-run and
+re-checked 2026-08-24. Every number in it belongs to `linux-x64` 2.1.222 — the
+gate's minified name included. The darwin-arm64 2.1.239 build prints a
+different name and different counts; that transcript is in
+[README's macOS section](../README.md#macos), and the two are tabulated side by
+side in [findings.md](./findings.md) §6.)
 
 (The `wrote:` lines name the **staging** directory; `build.sh` prints the final
 paths in its "artifacts ready" block immediately afterwards. The `cli.js`
@@ -152,9 +172,9 @@ file that fails with a confusing panic. A surviving `/$bunfs/` (or Windows
 `B:/~BUN/`) reference is refused the same way: it used to be a warning printed
 after the file had already been written. `note: build-machine path still
 present` lines *are* informational: string literals containing Anthropic's
-build paths that are not `/$bunfs/` references (3 of them on both binaries
-measured). All notes print before `wrote:`, so anything after that line is the
-artifact, not a complaint about it.
+build paths that are not `/$bunfs/` references (how many, per binary, is a row
+of [findings.md](./findings.md) §6's table). All notes print before `wrote:`, so
+anything after that line is the artifact, not a complaint about it.
 
 `build.sh` needs Bun only to *report* its version — extraction and
 post-processing are pure Python. Without `BUN_BIN` it warns and continues.
@@ -189,16 +209,17 @@ DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \
 
 `doctor` prints the version, the search backend, install identity and updater
 state; `mcp list` reads config, initialises `.claude.json` and dispatches into
-the MCP subsystem. Both initialise ~2760 lazy modules; the bundle measured here
-(linux-x64 2.1.222) holds 6748, and that total moves with every Claude release.
+the MCP subsystem. Both initialise thousands of the bundle's lazy modules, and
+that total moves with every Claude release; the per-command counts are
+[findings.md](./findings.md) §10's table and live there only.
 
 `--version` also works and prints e.g. `2.1.222 (Claude Code)` — but treat it as
 a smoke test only. Measured, it initialises **0** lazy modules (a hardcoded
 fast path — the only one of these numbers that is structural rather than a
 property of one build): it proves the file parses and the CJS wrapper is invoked,
 and nothing whatsoever about Bun's API surface
-([findings.md](./findings.md) §10). `--help` (2725 modules) renders the full
-command registry.
+([findings.md](./findings.md) §10). `--help` renders the full command registry
+and initialises about as many modules as the other two.
 
 The scratch `CLAUDE_CONFIG_DIR` keeps a first run away from your real
 `~/.claude` — worth doing until you trust the build. `DISABLE_AUTOUPDATER=1`
@@ -331,10 +352,12 @@ artifacts keep running the version you extracted until you do.
 
 ```bash
 BUN_BIN="$HOME/.bun-1.3.14/bun" scripts/build.sh "$NATIVE"
-# Measured 2026-08-23: 200 passed on a host with both real binaries and a Bun;
-# 187 passed / 13 skipped with neither binary nor Bun. NRC_TEST_ELF /
-# NRC_TEST_MACHO / BUN_BIN choose them (README has the full table). The
-# measured counts inside the tests are version-specific:
+# What this prints depends on what the host has: NRC_TEST_ELF / NRC_TEST_MACHO
+# / BUN_BIN choose the real binaries the integration tests need, and the tests
+# skip cleanly without them. The four per-host counts are stated in exactly one
+# place - README's table - so that they cannot drift apart between files, which
+# is how four of them ended up ten too low here. The measured counts INSIDE the
+# tests are version-specific and are the release tripwire:
 python3 -m pytest tests/ -q
 DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \
   "$BUN_BIN" build/extract/cli.original.cjs mcp list   # not --version: findings §10
@@ -347,9 +370,10 @@ previous working build if anything goes wrong.
 Two things to expect:
 
 1. **The integration tests will fail on a new version.** They assert the
-   measured module and transform counts (8/5/7 for linux-x64 2.1.222, 15/9/8 for
-   darwin-arm64 2.1.239). That failure is the **early warning system**, not a
-   defect: re-measure, update the numbers and [findings.md](./findings.md) §4/§6,
+   measured module, asset and transform counts — findings §4 and §6 are where
+   those figures are written down. That failure is the **early warning system**,
+   not a defect: re-measure, update the numbers and
+   [findings.md](./findings.md) §4/§6,
    and re-run this runbook. Do not relax the assertions.
 
    The failure tells you which kind it is. `…_measured_counts_have_not_drifted`
@@ -374,9 +398,9 @@ Two things to expect:
 |---|---|---|
 | `Expected CommonJS module to have a function wrapper` | **Ambiguous** — Bun older than 1.3.14, *or* the pragma/IIFE transform did not apply, *or* the pragma was kept **and** the IIFE appended (findings §6's 2×2). Not a reliable "Claude needs a newer Bun" canary | Confirm `bun --version` is ≥ 1.3.14; confirm `cli.original.cjs` starts with `(function` and ends with the `(exports, require, module, …)` call |
 | `TypeError: … is not a function` naming a `Bun.*` property | **This** is the missing-API signal — findings §10's risk | Pin to an older Claude version, or shim the API |
-| Images are refused with *"Unable to resize image…"* | **Not expected in a default build any more.** Since 2026-08-23 `postprocess.py` rewrites the image-processor gate so the native path is reachable (findings §11, *What shipped*). Seeing this means one of three things: the artifact predates the shim; it was built with `NRC_NO_IMAGE_SHIM` set to a non-empty value; or the shim could not find its anchor in this Claude release, in which case the build printed `image shim NOT APPLIED` | Check the artifact itself: `grep -o 'if(true)try' build/extract/cli.original.cjs \| wc -l` prints **1** for a shimmed build and **0** for an as-shipped one (measured on linux-x64 2.1.222 and darwin-arm64 2.1.239). If it prints 0, rebuild without `NRC_NO_IMAGE_SHIM` and read the `image shim` lines in the build output. If the build says NOT APPLIED with the env var unset, a new Claude release moved the anchor — re-measure, see findings §11. Never "fix" it by flipping `Bun.isStandaloneExecutable` globally: measured, that silently breaks `Grep` |
+| Images are refused with *"Unable to resize image…"* | **Not expected in a default build any more.** Since 2026-08-23 `postprocess.py` rewrites the image-processor gate so the native path is reachable (findings §11, *What shipped*). Seeing this means one of three things: the artifact predates the shim; it was built with `NRC_NO_IMAGE_SHIM` set to a non-empty value; or the shim refused in this Claude release, in which case the build printed `image shim NOT APPLIED:` followed by the cause. Three different things drift and they are **not** interchangeable: the gate **declaration**'s minified shape, the anchor string, or the `if(<gate>())try{` branch shape | Check the artifact itself: `grep -o 'if(true)try' build/extract/cli.original.cjs \| wc -l` prints **1** for a shimmed build and **0** for an as-shipped one (measured on linux-x64 2.1.222 and darwin-arm64 2.1.239). If it prints 0, rebuild without `NRC_NO_IMAGE_SHIM` and read the `image shim` lines in the build output. If the build says NOT APPLIED with the env var unset, read the rest of that same line — it names which of the three drifted, and each is re-measured somewhere else (`STANDALONE_DEF`, `IMAGE_ANCHOR`, `_image_site_re` in `tools/postprocess.py`); see findings §11. Checked here on 2026-08-24 by rebuilding a copy of the Linux binary whose 53-byte gate declaration had been replaced in place with an equal-length arrow form: the build named the **declaration** and said the anchor was not implicated, for an artifact whose anchor was still present exactly once. Never "fix" it by flipping `Bun.isStandaloneExecutable` globally: measured, that silently breaks `Grep` |
 | `ripgrep not found on PATH` | Embedded ripgrep needs a standalone; this build uses a system `rg` (findings §11) | Install `ripgrep` |
-| `postprocess.py` exits non-zero and writes nothing | one of `check()`'s **six** fatal conditions ([findings.md](./findings.md) §6; counted in `tools/postprocess.py` on 2026-08-23): no trailing IIFE; the file does not start with `(function`; a `/$bunfs/` or `B:/~BUN/` reference survived the rewrite; the rewritten code reaches for an `assets/<name>` that was never extracted; **zero** `/$bunfs/` literals were rewritten while `assets/` has files; or the image shim's before/after gate-call arithmetic does not add up | The error names which. Shape problems (IIFE, `(function`) mean the entry module changed — read its last ~200 bytes and re-measure before editing a regex. A surviving reference means a `/$bunfs/` shape the rewriter does not cover. A missing asset means `extract_bun.py` dropped a loader kind — check its `LOADERS`/`WRITTEN_LOADERS` against Bun's `src/bundler/options.zig`. Zero rewrites with populated assets means a different VFS prefix ([status.md](./status.md) § Windows/PE). Failed shim arithmetic means the one-site rewrite spread — nothing is written, deliberately, because the site it would reach next is embedded ripgrep and that failure is a wrong answer, not an error |
+| `postprocess.py` exits non-zero and writes nothing | one of `check()`'s **six** fatal conditions ([findings.md](./findings.md) §6; counted in `tools/postprocess.py` on 2026-08-24): no trailing IIFE; the file does not start with `(function`; a `/$bunfs/` or `B:/~BUN/` reference survived the rewrite; the rewritten code reaches for an `assets/<name>` that was never extracted; **zero** `/$bunfs/` literals were rewritten while `assets/` has files; or the image shim's bookkeeping does not describe the artifact — the before/after gate-call arithmetic does not add up, **or** a rewrite is claimed against a gate that was never identified, in which case nothing counted what the rewrite did and the counts are reported as *unknown* rather than as `0` | The error names which. Shape problems (IIFE, `(function`) mean the entry module changed — read its last ~200 bytes and re-measure before editing a regex. A surviving reference means a `/$bunfs/` shape the rewriter does not cover. A missing asset means `extract_bun.py` dropped a loader kind — check its `LOADERS`/`WRITTEN_LOADERS` against Bun's `src/bundler/options.zig`. Zero rewrites with populated assets means a different VFS prefix ([status.md](./status.md) § Windows/PE). Failed shim arithmetic means the one-site rewrite spread — nothing is written, deliberately, because the site it would reach next is embedded ripgrep and that failure is a wrong answer, not an error. `not counted (no gate identified)` on the `image shim call sites` line is not an error on its own: it is the honest reading when no gate declaration matched, and it is there because `0 -> 0` in its place was a claim about the artifact that measured false |
 | `Cannot find module '.../assets/X.node'` | asset not extracted, or its path not rewritten | Should no longer be reachable from a build that succeeded: `check()` fails the build when the rewritten code references an asset that is not on disk. If you see it anyway, the artifact and its `assets/` came from different runs — rebuild |
 | A mermaid/highlight/chart feature breaks | a `file`-loader asset still referenced via `/$bunfs/`, or an unverified runtime path | The rewritten path shape is verified to work (`image-processor.node` loads through it), but no command here has exercised these three features — [status.md](./status.md) remaining work #3 |
 | `error: PE (Windows) executable detected` | you pointed the extractor at `claude.exe` | Not supported by design — [status.md](./status.md) § Windows/PE |

@@ -19,7 +19,10 @@ closed PR #1:
 2. Give `tools/patch_claude.py` — the one tool in this repo that writes to a
    signed binary — a real test suite. Checked out and counted 2026-08-23: at
    `7ea5562~1` the tool was **261** lines with **no** `tests/test_patch_claude.py`
-   at all; as shipped it is **330** lines with **58** tests.
+   at all; as shipped it is **507** lines with **94** tests (re-counted
+   2026-08-24, after the review fleet's fixes landed; the figures this
+   paragraph carried before — 330 lines, 58 tests — were correct at `9c98027`
+   and went stale in the very next commit).
 
 ---
 
@@ -222,6 +225,24 @@ upstream change into an outage. But it must not be *silent*: `postprocess.py`
 prints the gate name and the shim count on stdout, and `build.sh` prints an
 explicit line either way.
 
+**Changed during re-review — the refusal has to name which thing drifted, and
+must not invent counts.** Three separate things can drift and they are
+re-measured in different places: the gate **declaration**'s minified shape
+(`STANDALONE_DEF`), the **anchor** string (`IMAGE_ANCHOR`), and the
+`if(<gate>())try{` branch shape (`_image_site_re`). `build.sh` used to close
+every refusal alike with *"Most likely a new Claude release renamed the anchor
+string."* Reproduced on this host on 2026-08-24, both revisions against the
+same input — a copy of `/usr/bin/claude` whose one 53-byte gate declaration at
+offset 260,565,233 was replaced in place with an equal-length arrow form,
+anchor untouched — the old build exits 0 and prints exactly that line for an
+artifact that still holds `Native image processor not available` **once**, and
+prints `image shim call sites  : 0 -> 0` for an entry module with **21** live
+`CE()` call sites. `postprocess.py` now emits the cause on stdout as
+`image shim not applied : …`, `build.sh` quotes it rather than guessing, and
+where no gate could be named the counts print as
+`not counted (no gate identified)`: `0` there is not "unknown", it is a claim
+about the artifact, and it measured false.
+
 ### Opt-out
 
 `NRC_NO_IMAGE_SHIM` set to **any non-empty value** skips the rewrite. This
@@ -256,7 +277,7 @@ oversight:
 
 ### Verification
 
-**Static**, in `tests/test_image_shim.py` (52 tests, collected 2026-08-23): the
+**Static**, in `tests/test_image_shim.py` (**59** tests, collected 2026-08-24): the
 gate name is captured from both real declaration shapes; exactly one site is
 rewritten and it is the one before the anchor; every *other* gate call site is
 byte-identical, asserted by reconstruction rather than by spot check; the
@@ -277,13 +298,30 @@ not-exactly-once refusal and silently stop shimming every build.
 
 Held to a **mutation test**: 37 mutations of the shim, its `check()` condition
 and its env handling, run against the hermetic suite (and, for the two that
-only the 300 MB binaries catch, against those). 34 die. The 3 survivors are
-equivalent mutants and are listed here so nobody re-derives them: `sites[0]` →
-`sites[-1]` (the uniqueness refusal above guarantees exactly one candidate),
-`reason` → `None or reason` (the same expression), and `after` recounted →
-`before - 1` (a single-slice rewrite removes exactly one call, so the two
-agree by construction — the recount only starts to matter if the rewrite ever
-becomes more than one slice).
+only the 300 MB binaries catch, against those). 34 died. Two of the three
+survivors are equivalent mutants and are listed here so nobody re-derives
+them: `sites[0]` → `sites[-1]` (the uniqueness refusal above guarantees
+exactly one candidate) and `reason` → `None or reason` (the same expression).
+
+**Changed during re-review — the third survivor was not equivalent.** It was
+recorded as one: `after` recounted → `before - 1`, on the reasoning that a
+single-slice rewrite removes exactly one call so the two agree by
+construction. The reasoning is true of *today's* rewrite and says nothing
+about the guard, which is the point of condition (f): every other test of
+`check()` hands it its counts, so the validator was thoroughly covered and the
+thing that *produces* the numbers was not covered at all. Reproduced on a
+private copy on 2026-08-24: with `before - 1` in place of the recount, a
+rewrite that spreads into every gate call in the real 22,960,130-byte
+`linux-x64` 2.1.222 entry module reports
+`gate=CE before=21 after=20 image_shim=1` and `check() errors: []` over an
+output with **0** `CE()` call sites left — the global flip that breaks `Grep`,
+shipped as one tidy scoped rewrite. Control, same spreading rewrite with the
+real recount: `before=21 after=0`, and `check()` fires with the accounting
+error. `test_the_after_count_is_measured_on_the_rewritten_code` (in
+`tests/test_image_shim.py`) now recounts the output independently and kills
+the mutant: with `before - 1` applied to a private copy, that file goes from
+`59 passed` to `2 failed, 57 passed`. So the tally above should be read as of
+its own date — that mutation is no longer a survivor.
 
 **Dynamic**, on the real artifact: an A/B driven through a **loopback-only mock
 of the Messages API**, committed to this repo as
@@ -318,9 +356,60 @@ Every expectation is explicit per side, so the script fails rather than merely
 printing. It also polls `/proc/<pid>/fd` against `/proc/net/tcp` for the whole
 process tree and fails on any non-loopback socket — which is how it was found
 that the as-shipped Read case had been quietly fetching sharp's libvips
-packages from npm mid-run. All four cases × three sides were run on 2026-08-23
-against `linux-x64` 2.1.222 under Bun 1.3.14: every expectation reproduced and
-every `egress=` line came back empty. The result table is in findings §11.
+packages from npm mid-run. Re-run in full on 2026-08-24 against `linux-x64`
+2.1.222 under Bun 1.3.14: four cases × three sides, `all expected results
+reproduced`, exit 0, every `egress=` line empty. The result table is in
+findings §11.
+
+**Changed during re-review — what "the whole process tree" and "empty" now
+mean.** Both were claims before they were mechanisms:
+
+- The poller filtered on a cmdline containing the artifact path, which sees
+  only the bun process. The Bash tool, `rg` and any tool-driven network access
+  run in *children*, and a child opening a socket to a non-loopback address
+  was reported as nothing at all. It now walks `/proc/<pid>/stat` parent
+  chains, so a child or grandchild of a marked process is attributed to the
+  run — and an unrelated process is still not.
+- It failed **open**. Being SIGTERMed is the normal end of a case, so "the
+  poller is gone" could not be told from "the run was clean"; a poller that
+  died on its first iteration left an empty egress file that read as a pass.
+  It now writes a status file, and a case whose guard did not report `OK` is
+  failed. So is a turn-driving case whose guard attributed **zero** sockets,
+  which is what a guard watching the wrong processes looks like.
+- Any IPv6 socket with no peer was reported as egress, because the all-zero v6
+  remote was compared as a raw hex string that matched none of the loopback
+  exemptions — so the guard could invent traffic, contradicting its own claim
+  that a finding there is always real. Peers are now decoded with
+  `inet_ntop`.
+
+**Changed during re-review — the harness is Linux-only, and now says so.** The
+egress guard has no portable substitute, so a preflight refuses to start where
+`/proc/net/tcp` and `/proc/<pid>/fd` are unreadable, rather than run the
+comparison with its safety net silently missing; the same preflight names
+every other missing prerequisite in one message. Everything else in the script
+was made portable on the way (`python3` for sizes and md5s instead of
+`stat -c` / `md5sum`), because
+the previous failure on a macOS-like `PATH` was BSD `stat`'s
+`illegal option -- c` from inside fixture setup, before any of the script's
+own checks could speak.
+
+**Changed during re-review — the fixture is checked on its decoded content.**
+The 3000×3000 PNG's file size was asserted exactly, which pinned the harness
+to this host's deflate rather than to the image: measured 2026-08-24, the same
+27,003,000 scanline bytes at level 6 give a 2,329,372-byte IDAT through this
+`python3`'s zlib 1.2.13 and a 2,329,196-byte one through node v22's zlib
+1.3.1-e00f703. Dimensions, colour type, chunk CRCs and the md5 of the decoded
+scanlines are asserted instead; the on-disk size is printed as informational.
+
+**Changed during re-review — a pass off the mock's non-streaming fallback is
+not a pass.** The mock's `sse()` carried a *measured* claim that the SSE
+`event:` line is not what the client dispatches on. It is; the four runs that
+establish that, and the fallback that confounded the original measurement, are
+recorded in `scripts/mock-messages-api.mjs`'s `sse()` comment. The mechanism
+that matters here is the check, not the retraction: a mock defect can move
+every turn onto a code path a real API run never takes while the A/B still
+prints the expected string, so the harness now greps each case's mock log for
+`stream=false` and fails the case.
 
 ---
 
@@ -364,7 +453,8 @@ turned something up: overlapping `--old` matches that would write over each
 other's padding, back-to-back hits that only *look* overlapping, `--out`
 pointing at the input, the quarantine xattr having to be dropped *after* the
 signature lands, a failed `codesign --verify` being fatal, and `--verify`
-actually launching the patched binary. 58 tests in total.
+actually launching the patched binary. **94** tests in total, collected on
+this host on 2026-08-24.
 
 ### What the tests changed
 
@@ -386,6 +476,46 @@ tests did prove something wrong, so this is what moved:
 - The measured cost of an empty `--old` was re-stated as load-dependent
   ("tens of seconds per MiB") rather than as a single wall-clock figure, since
   this host is shared between agents.
+
+**Changed during re-review.** The review fleet found four more. Three of them
+are behaviour a user of this tool has to know about, and each was reproduced
+on this Linux host on 2026-08-24:
+
+- **A signing run on a host with no `codesign` used to leave an unpatched copy
+  of the input at `--out`.** This was a regression introduced by the same
+  reordering that made `splice()` raise: `shutil.copy2(src, dest)` ran before
+  the `codesign` reads, and those raise `FileNotFoundError` rather than
+  returning non-zero, so the destination was created and then never written.
+  `printf 'HEAD NEEDLE TAIL' > fixture.bin` with
+  `--old NEEDLE --new N --out out.bin` left `out.bin` holding
+  `HEAD NEEDLE TAIL` — verbatim, unpatched, under the name the user asked for,
+  behind an unhandled traceback that said nothing about it. There is now a
+  pre-flight refusal before anything is created, and `main()` reads the
+  signing metadata before it creates the destination so that a failure in
+  `codesign` itself cannot leave a file behind either. The same fixture now
+  prints one sentence and leaves no `out.bin` at all.
+- **Hits inside `LC_CODE_SIGNATURE` are dropped, reported, and excluded from
+  the patched count.** On the shipped 324,973,552-byte `darwin-arm64` Mach-O,
+  `--old com.anthropic --dry-run` finds **137** hits and **2** of them
+  (`0x1354BE54`, `0x135E69E5`) are inside the signature blob
+  (324,320,704..324,973,552) — the signing Identifier
+  `com.anthropic.claude-code`, stored as a literal C string in the
+  CodeDirectory. It now prints `Found 137 occurrence(s); patching 135` and
+  names the two it skipped; `--patch-signature` overrides.
+  `code_signature_range()` reads the Mach-O header and load-command table only,
+  so the check costs the same on a 325 MB binary as on a 3 KB one, and returns
+  `None` — "I cannot tell", not a refusal — for anything that is not a thin
+  Mach-O it recognises, which is what keeps the test suite's Mach-O-shaped
+  fixtures patchable.
+- **`--out <the input>` is refused**, by `os.path.samefile` rather than a
+  string compare, so a symlink or hard link to the input is caught too.
+  Answering it as written was an in-place patch with no `.bak`; it now dies
+  with `--out names the input; use --in-place, which keeps a .bak`.
+- The fourth, not user-visible: the third full in-RAM copy of the binary that
+  this work had added was removed —
+  `blob` is read as `bytes` and no longer re-copied at the find and at every
+  preview line. `splice()` takes its own `bytearray()` and `preview()` only
+  slices, so the change is behaviour-preserving.
 
 Still out of scope: this tool is not part of the extract → postprocess → run
 pipeline; it is a macOS utility that happens to live here.

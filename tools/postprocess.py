@@ -51,7 +51,10 @@ fatal conditions:
   f. the image-shim bookkeeping adds up: rewriting one gate call site leaves
      exactly one fewer `<gate>()` call in the file, and rewriting none leaves
      the count untouched. It catches a rewrite that SPREAD - two sites moved,
-     or none while one was claimed - so it is fatal, not a note. What it
+     or none while one was claimed - so it is fatal, not a note. When no gate
+     could be NAMED there is nothing to count: the counts are then reported as
+     unknown rather than as zero, and a rewrite claimed against a gate nobody
+     named is the same bookkeeping failure and is fatal here too. What it
      cannot catch is a rewrite aimed at the WRONG site: it counts how many
      moved, never which, and one wrong site scores exactly like the right one.
      That is why the site is picked by shape (step 6) and not by distance.
@@ -144,6 +147,16 @@ STANDALONE_DEF = re.compile(
     r"function\s+([\w$]+)\s*\(\s*\)\s*\{\s*return\s+[^{}]*?"
     r"Bun\.isStandaloneExecutable\s*===\s*!0\s*\}")
 
+# The property that declaration tests, as plain text. Used for one thing only:
+# telling the two "no declaration matched" drifts apart in the refusal message,
+# so the build stops naming a single cause for every refusal. Measured on this
+# host 2026-08-24: it occurs exactly ONCE in the 22,960,130-byte linux-x64
+# 2.1.222 entry module - inside the gate declaration itself - so "still
+# mentioned, no declaration matched" means STANDALONE_DEF's shape drifted (an
+# arrow form, or the gate inlined into its callers), while "not mentioned at
+# all" means the flag is gone from the build.
+STANDALONE_PROPERTY = "Bun.isStandaloneExecutable"
+
 # The image branch has no name of its own (`if(CE())`), but it ends in a
 # distinctive literal. Measured: exactly ONE occurrence in each of the two
 # entry modules, and in BOTH the branch's own guard `if(<gate>())try{` starts
@@ -234,7 +247,28 @@ def _gate_name(code):
     """
     names = sorted({m.group(1) for m in STANDALONE_DEF.finditer(code)})
     if not names:
-        return None, "no Bun.isStandaloneExecutable gate declaration found"
+        # Say WHICH drift this is. The gate is resolved before the anchor is
+        # ever looked for, so an unmatched declaration cannot be an anchor
+        # problem - and blaming the anchor here is not hypothetical: a build of
+        # a linux-x64 2.1.222 binary whose declaration was replaced in place
+        # with an equal-length arrow form (`var CE=()=>Bun.isStandalone...`)
+        # closed with "Most likely a new Claude release renamed the anchor
+        # string" while that same artifact still held the anchor exactly once
+        # and 21 live CE() calls (measured here 2026-08-24).
+        mentions = code.count(STANDALONE_PROPERTY)
+        if mentions:
+            return None, (
+                "no Bun.isStandaloneExecutable gate DECLARATION matched, but "
+                "the property itself is still mentioned %d time(s) - so the "
+                "declaration's minified SHAPE drifted (emitted as an arrow, or "
+                "inlined into its callers?), and the anchor string is not "
+                "implicated. Re-measure STANDALONE_DEF against the new shape"
+                % mentions)
+        return None, (
+            "no Bun.isStandaloneExecutable gate declaration found, and the "
+            "property is not mentioned anywhere in this entry module - the "
+            "flag is gone from this Claude build, so there is no gate to scope "
+            "a rewrite to")
     if len(names) > 1:
         return None, (
             "%d differently-named Bun.isStandaloneExecutable gate declarations "
@@ -265,14 +299,32 @@ def _apply_image_shim(code):
     otherwise. Every refusal path returns the code UNCHANGED: a Claude release
     that renames the anchor should degrade to today's artifact, not fail the
     build - see the design doc's "When the anchor is not found".
+
+    With no gate named, `before` and `after` are None and not 0. Nothing was
+    counted in that case, and 0 is not the same statement: it says this entry
+    module holds no gate calls at all. Measured false on the drift that
+    produces it - the arrow-declaration build described in _gate_name left 21
+    live CE() calls in the artifact while the build log said `0 -> 0`.
     """
     name, why = _gate_name(code)
     if name is None:
-        return code, None, 0, 0, 0, why
+        return code, None, None, None, 0, why
     before = _count_gate_calls(code, name)
 
     hits = code.count(IMAGE_ANCHOR)
-    if hits != 1:
+    # Absent and duplicated are different drifts and get different sentences:
+    # build.sh now quotes this reason as its closing headline, and "occurs 0
+    # times, not once - refusing to guess which one" told a reader whose anchor
+    # had simply been renamed that the tool was declining to choose between
+    # occurrences it never found.
+    if hits == 0:
+        return code, name, before, before, 0, (
+            "the anchor %r is not in this entry module at all - it was renamed "
+            "or dropped in this Claude release, so there is nothing left to "
+            "locate the image branch by. The gate itself is fine: %s() is "
+            "declared and has %d call site(s), so this is not declaration "
+            "drift" % (IMAGE_ANCHOR, name, before))
+    if hits > 1:
         return code, name, before, before, 0, (
             "the anchor %r occurs %d times, not once - refusing to guess which "
             "one guards image processing" % (IMAGE_ANCHOR, hits))
@@ -324,7 +376,7 @@ def transform(code, image_shim=True):
         # an A/B whose two halves disagree about WHICH gate they counted is
         # comparing two different numbers and calling the difference evidence.
         name, _ = _gate_name(code)
-        before = after = _count_gate_calls(code, name) if name else 0
+        before = after = _count_gate_calls(code, name) if name else None
         applied, reason = 0, "disabled by caller (NRC_NO_IMAGE_SHIM)"
     counts.update(gate_name=name, gate_calls_before=before,
                   gate_calls_after=after, image_shim=applied,
@@ -401,7 +453,21 @@ def check(code, counts, assets_on_disk=None, asset_names_on_disk=None):
     applied = counts["image_shim"]
     before = counts["gate_calls_before"]
     after = counts["gate_calls_after"]
-    if applied not in (0, 1):
+    if before is None or after is None:
+        # No gate was named, so nothing was counted and there is no arithmetic
+        # to check - the counts are unknown, deliberately, rather than the 0
+        # they used to be (see _apply_image_shim). A claimed rewrite here is
+        # not a miscount but a fabrication: every path that fails to name a
+        # gate returns the code untouched, so `applied` must be 0. Still part
+        # of condition (f) - the bookkeeping has to describe the artifact.
+        if applied:
+            errors.append(
+                "image shim accounting is wrong: it reports %d site(s) "
+                "rewritten against a gate that was never identified, so "
+                "nothing counted what the rewrite did to the file and nobody "
+                "can say which gates this build leaves false - embedded "
+                "ripgrep above all. Nothing was written." % applied)
+    elif applied not in (0, 1):
         # Reported separately from the arithmetic below because the arithmetic
         # does not catch it: (before, after, applied) = (21, 19, 2) balances
         # perfectly and is still two rewrites in a shim licensed to make one.
@@ -472,12 +538,29 @@ def main():
     # "the shim worked" produce artifacts that differ only when you happen to
     # Read a large image. build.sh greps the third line.
     print(f"image shim gate        : {counts['gate_name']}")
-    print(f"image shim call sites  : {counts['gate_calls_before']} -> "
-          f"{counts['gate_calls_after']}")
+    if counts["gate_calls_before"] is None:
+        # Not "0 -> 0". No gate was named, so no call site was ever counted,
+        # and zeros here are a claim about this artifact that is measured
+        # false: building a linux-x64 2.1.222 binary whose gate declaration had
+        # been replaced in place by an equal-length arrow form printed
+        # `0 -> 0` for an entry module that still held 21 live CE() calls
+        # (measured on this host 2026-08-24).
+        print("image shim call sites  : not counted (no gate identified)")
+    else:
+        print(f"image shim call sites  : {counts['gate_calls_before']} -> "
+              f"{counts['gate_calls_after']}")
     # "(expected 1)" would be a lie in the opt-out build, where 0 is the whole
     # point; build.sh's sed only reads the number, so the tail is free text.
     print(f"image shim applied     : {counts['image_shim']}  "
           + ("(expected 1)" if image_shim else "(opt-out: NRC_NO_IMAGE_SHIM set)"))
+    if counts["image_shim_reason"] is not None:
+        # The CAUSE, on stdout, only when there is one - build.sh tees stdout
+        # and reads this line for its closing headline. Before it existed that
+        # headline named one cause ("a new Claude release renamed the anchor
+        # string") for every refusal, including the drifted-declaration one
+        # where the anchor was measured present exactly once. Omitted entirely
+        # in a shimmed build so the log of the default build is unchanged.
+        print(f"image shim not applied : {counts['image_shim_reason']}")
     print(f"size: {orig_len} -> {len(code)} bytes")
 
     # Diagnostics belong ABOVE the write: printed after "wrote:" they read as

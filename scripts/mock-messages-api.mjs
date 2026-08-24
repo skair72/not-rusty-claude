@@ -160,11 +160,35 @@ function logBody(method, url, bodyText) {
 // ------------------------------------------------------------ SSE plumbing
 
 function sse(res, type, data) {
-  // The `event:` line is what the real API sends, so it is sent here too - but
-  // it is not what the client dispatches on. Measured by dropping it: a
-  // data-only stream still drove the Bash turn to the same tool_result, i.e.
-  // 2.1.222 reads data.type. Do not "simplify" this to data-only anyway; the
-  // point of a mock is to look like the thing it stands in for.
+  // The `event:` line is what the real API sends, and it is LOAD-BEARING: drop
+  // it and 2.1.222 does not parse the stream at all. Four runs on this host,
+  // Bash case, `build/extract/cli.original.cjs` under Bun 1.3.14 with
+  // `-p 'run the probe' --output-format stream-json --verbose
+  // --dangerously-skip-permissions`, reading the mock's own --log:
+  //
+  //   control, this code               2 requests, both stream=true;
+  //                                    tool_result HELLO-FROM-SUBPROCESS\nLinux
+  //   `event:` dropped                 4 requests - each stream=true is
+  //                                    abandoned and re-sent as stream=false.
+  //                                    Same tool_result, but produced entirely
+  //                                    by the non-streaming branch below; no
+  //                                    SSE was parsed.
+  //   `event:` dropped AND that        cli_rc=1, no tool_result at all: one
+  //   non-streaming branch 503         stream=true then three stream=false
+  //                                    retries, then "API Error: Repeated 529
+  //                                    Overloaded errors".
+  //   `event:` kept, same 503          2 requests, both stream=true, correct
+  //                                    tool_result - the stream alone carries
+  //                                    the turn.
+  //
+  // An earlier version of this comment read run 2 as "a data-only stream still
+  // drove the turn, so the client dispatches on data.type". It does not: that
+  // turn came from the fallback. The observation was real, the conclusion was
+  // not, and the failure mode it hid is the one that matters here - a mock
+  // defect can silently move every turn onto a code path a real API run never
+  // takes while the A/B still prints the expected string. scripts/
+  // ab-equivalence.sh now fails any case whose mock log shows stream=false,
+  // which is the check that would have caught it.
   res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 

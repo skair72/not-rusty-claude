@@ -34,16 +34,19 @@
 # is never executed - the artifact runs under Bun.
 #
 # THREE things keep it that way, and each of them was measured by polling
-# /proc/<pid>/fd (over the whole process tree) against /proc/net/tcp while a
-# case ran. Each was found by that poll, not predicted:
+# /proc/<pid>/fd against /proc/net/tcp while a case ran - over every process
+# whose ppid chain reaches the artifact, which is not quite the same thing as
+# "the whole process tree" (EGRESS below says exactly what escapes it). Each
+# was found by that poll, not predicted:
 #
 #   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 #     WITHOUT it the Bash case opened 6 non-loopback sockets - 5 to
 #     160.79.104.10:443 (api.anthropic.com resolves there) and 1 to
 #     34.149.66.165:443 (a Google-hosted address, not identified further) -
-#     alongside the one loopback socket to the mock. WITH it: 1 socket total, 0
-#     non-loopback. Control: bun alone spinning a 4 s busy loop opened 0
-#     sockets, so it is the CLI's traffic, not bun's.
+#     alongside the loopback socket to the mock. WITH it: 0 non-loopback, and
+#     nothing left but the loopback connection(s) to the mock. Control: bun
+#     alone spinning a 4 s busy loop opened 0 sockets, so it is the CLI's
+#     traffic, not bun's.
 #   ANTHROPIC_BASE_URL, set for EVERY case including doctor
 #     The disable flag is not sufficient on its own. Measured on the doctor case
 #     with the flag set but no base URL: 3 non-loopback sockets to
@@ -66,11 +69,34 @@
 # The header of this file used to claim "no traffic leaves the host" while that
 # was false, for two independent reasons at once. So the claim is no longer a
 # claim: every case now runs under the same poll that found them (see EGRESS
-# below), prints its own `egress=` line, and a non-empty one FAILS the script.
-# Measured across a full run - four cases, three sides, twelve runs - all twelve
-# egress lines are empty, and a manual poll over the same run saw 17 sockets,
-# all of them loopback to the mock. The loopback count wanders between runs (16
-# in the run before it); the zero is the invariant.
+# below), prints its own `egress=` and `egress_guard=` lines, and a non-empty
+# egress, a guard that did not finish, or a guard that attributed NO socket at
+# all fails the script. That last one is the positive control: an empty egress
+# line from a poller that was watching the wrong process is indistinguishable
+# from a clean run, so the socket count is reported and checked too.
+#
+# The INVARIANT is: zero non-loopback sockets on every run, and at least one
+# socket attributed to every run that drives a turn. The TOTAL is not an
+# invariant and is not quoted here or anywhere else - it moves run to run (the
+# CLI opens one or two connections to the mock depending on how it splits the
+# turn, and doctor drives no turn at all, so doctor may legitimately open
+# none). Each run prints its own count in its `egress_guard=` line; read it
+# there rather than comparing against a number in a comment.
+#
+# PLATFORM: Linux-only, and it refuses to start anywhere else rather than run
+# without its own safety net. The egress guard reads /proc/net/tcp and
+# /proc/<pid>/fd and there is no portable substitute here, so every dependency
+# it needs - bun, node, python3, /proc, timeout(1) - is named by one preflight
+# below instead of failing at whichever line comes first. timeout(1) is in that
+# list because the shell-watchdog fallback that used to stand in for it is
+# gone: the fallback ran only when neither timeout nor gtimeout was on PATH,
+# and the host that describes - macOS - is refused two checks earlier for
+# having no /proc. It was unreachable code advertised as a portability
+# guarantee. A Linux host that somehow lacks timeout(1) is now told so up
+# front instead. macOS likewise reaches the preflight and gets one sentence
+# about what is missing, instead of dying inside fixture setup on BSD stat's
+# `illegal option -- c` (file sizes and md5s go through python3 for the same
+# reason).
 #
 # Usage:
 #   scripts/ab-equivalence.sh                       # build all sides, run all cases
@@ -140,8 +166,59 @@ case "$CASE" in
   *) die "unknown --case '$CASE' (want: bash, grep, read, doctor, all)" ;;
 esac
 
-[ -x "$BUN_BIN" ] || die "bun not found at $BUN_BIN (set BUN_BIN)"
-command -v node >/dev/null 2>&1 || die "node not found; the mock needs it"
+# stat(1) and md5sum(1) are not portable - GNU wants `stat -c %s`, BSD/macOS
+# `stat -f %z`, and macOS ships `md5`, not `md5sum`. This script already
+# requires python3 (the fixture, the summary and the egress guard are all
+# python), so one implementation covers both platforms and there is no probe
+# left to guess wrong. Measured before this existed, on a macOS-like PATH (a
+# BSD `stat` that rejects -c, no md5sum, no timeout): the COMPLETE output of
+# `--case bash` was `stat: illegal option -- c` plus a usage line and exit 1,
+# from a bare assignment in fixture setup under `set -e` - the script died
+# before any of its own dependency checks could say a word.
+file_size() { python3 -c 'import os,sys; print(os.path.getsize(sys.argv[1]))' "$1"; }
+file_md5()  { python3 -c 'import hashlib,sys
+print(hashlib.md5(open(sys.argv[1],"rb").read()).hexdigest())' "$1"; }
+
+# A hanging case must still be bounded, and that bound is timeout(1) - a hard
+# requirement checked by the preflight below, not a best effort. gtimeout is
+# accepted because coreutils installs it under that name on some hosts; there
+# is deliberately no shell-watchdog fallback behind it. The fallback that used
+# to be here could only run on a host with neither binary, i.e. a stock macOS,
+# and the /proc check below refuses that host before this function is ever
+# called - so it was unreachable code that the header and docs/runbook.md were
+# both describing as a portability guarantee.
+TIMEOUT_BIN=""
+if command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN="gtimeout"; fi
+
+run_timeout() {  # run_timeout <seconds> <cmd...>
+  local secs="$1"; shift
+  "$TIMEOUT_BIN" "$secs" "$@"
+}
+
+# One preflight that names EVERYTHING missing, instead of failing at whichever
+# line happens to come first. /proc is in here because the egress guard is the
+# mechanism that replaced this file's retracted "no traffic leaves the host"
+# claim: running the comparison without it would produce output that looks
+# exactly like a clean run.
+MISSING=""
+if [ ! -x "$BUN_BIN" ]; then MISSING="$MISSING\n  - bun at $BUN_BIN (set BUN_BIN)"; fi
+if ! command -v node >/dev/null 2>&1; then MISSING="$MISSING\n  - node (the mock is a node script)"; fi
+if ! command -v python3 >/dev/null 2>&1; then MISSING="$MISSING\n  - python3 (fixture, transcript summary, egress guard)"; fi
+if [ -z "$TIMEOUT_BIN" ]; then
+  MISSING="$MISSING\n  - timeout(1) or gtimeout (the per-case bound; a hung case must not"
+  MISSING="$MISSING\n    run until something else on this host kills it)"
+fi
+if [ ! -r /proc/net/tcp ] || [ ! -d /proc/self/fd ]; then
+  MISSING="$MISSING\n  - Linux /proc (/proc/net/tcp and /proc/<pid>/fd): the egress guard reads"
+  MISSING="$MISSING\n    them to prove every socket this run opens is loopback. There is no"
+  MISSING="$MISSING\n    portable substitute here yet, so this harness is Linux-only."
+fi
+if [ -n "$MISSING" ]; then
+  # shellcheck disable=SC2059
+  printf "\033[31merror:\033[0m scripts/ab-equivalence.sh cannot run here. Missing:$MISSING\n" >&2
+  exit 1
+fi
 
 # if-blocks, not `[ ... ] && x`: under `set -e` a false test at the top level is
 # a failing command and would exit the script with status 1 and no message.
@@ -170,30 +247,66 @@ mkdir -p "$WORK/hay"
 printf 'NEEDLE-12345\n' > "$WORK/hay/a.txt"
 
 PNG="$SCRATCH/gradient-3000.png"
-# Verbatim from docs/findings.md section 11. Deterministic on stock python3:
-# measured 2,329,429 bytes, md5 78f7dbdc56b15d269b02a6439d3c5d36. The size is
-# asserted below because the whole point of the Read case is that the *input*
-# reproduces - the retracted number in that section was retracted precisely
-# because its source image did not.
-python3 - "$PNG" <<'EOF'
-import sys, zlib, struct
+# Verbatim from docs/findings.md section 11. The whole point of the Read case
+# is that the *input* reproduces, so the fixture is checked - but on its
+# DECODED content, not on its file size. The size is a property of the local
+# deflate, not of the image: measured on this host, byte-identical scanlines
+# (27,003,000 bytes, md5 95adc51dc27c1ad40b52df01793235e2) at level 6 give
+# 2,329,429 bytes through python3's zlib 1.2.13 and 2,329,253 through node
+# v22's zlib 1.3.1-e00f703. The hard `= 2329429` that used to stand here was
+# therefore a `die` in fixture setup - before any case ran - for anyone whose
+# python3 links a different-but-correct zlib (zlib-ng-compat, a chromium fork).
+PNG_CHECK="$(python3 - "$PNG" <<'EOF'
+import hashlib, sys, zlib, struct
 W = H = 3000
 raw = bytearray()
 for y in range(H):
     raw.append(0)                                   # PNG filter: None
     raw += bytes(v for x in range(W)
                  for v in ((x + y) % 256, (x * 2) % 256, (y * 3) % 256))
+raw = bytes(raw)
 def chunk(tag, data):
     return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data))
 open(sys.argv[1], "wb").write(
     b"\x89PNG\r\n\x1a\n"
     + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
-    + chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+    + chunk(b"IDAT", zlib.compress(raw, 6))
     + chunk(b"IEND", b""))
+
+# Read it back and check what a decoder would see. This is the assertion the
+# Read case actually depends on - 3000x3000 is what makes the image oversized,
+# and the pixels are what "the same input" means.
+blob = open(sys.argv[1], "rb").read()
+if blob[:8] != b"\x89PNG\r\n\x1a\n":
+    sys.exit("fixture PNG: not a PNG")
+pos, idat, ihdr = 8, b"", None
+while pos < len(blob):
+    ln = struct.unpack(">I", blob[pos:pos + 4])[0]
+    tag = blob[pos + 4:pos + 8]
+    body = blob[pos + 8:pos + 8 + ln]
+    if struct.unpack(">I", blob[pos + 8 + ln:pos + 12 + ln])[0] != zlib.crc32(tag + body):
+        sys.exit(f"fixture PNG: CRC mismatch in chunk {tag!r}")
+    if tag == b"IHDR":
+        ihdr = struct.unpack(">IIBBBBB", body)
+    elif tag == b"IDAT":
+        idat += body
+    pos += 12 + ln
+if ihdr[:4] != (W, H, 8, 2):
+    sys.exit(f"fixture PNG: header is {ihdr[:4]}, expected {(W, H, 8, 2)}")
+back = zlib.decompress(idat)
+if back != raw:
+    sys.exit(f"fixture PNG: decoded {len(back)} bytes, md5 "
+             f"{hashlib.md5(back).hexdigest()}, expected {len(raw)} / "
+             f"{hashlib.md5(raw).hexdigest()}")
+print(f"PNG_OK {W}x{H} rgb8 raw_bytes={len(raw)} "
+      f"raw_md5={hashlib.md5(raw).hexdigest()} file_bytes={len(blob)}")
 EOF
-PNG_BYTES="$(stat -c %s "$PNG")"
-[ "$PNG_BYTES" = "2329429" ] || die "generated PNG is $PNG_BYTES bytes, expected 2329429 (findings.md 11)"
-info "fixture PNG: $PNG_BYTES bytes (3000x3000, deterministic)"
+)" || die "fixture PNG did not verify (message above); without it the Read case compares nothing"
+PNG_BYTES="$(file_size "$PNG")"
+# Informational: it moves with the local zlib (see above), so nothing branches
+# on it. What was asserted is the decoded image, by the block that just ran.
+info "fixture PNG: $PNG_CHECK"
+info "  decoded scanlines verified above; the $PNG_BYTES bytes on disk are informational (zlib-dependent)"
 
 # ------------------------------------------------------------------ builds
 
@@ -294,9 +407,9 @@ G_ART="$SCRATCH/global/extract/cli.original.cjs"
 # sides that turn out to be the same bytes would otherwise "agree" for a reason
 # that has nothing to do with the shim.
 info "bun: $("$BUN_BIN" --version)  node: $(node --version)"
-info "as shipped : $A_ART ($(stat -c %s "$A_ART") B, md5 $(md5sum "$A_ART" | cut -d' ' -f1))"
+info "as shipped : $A_ART ($(file_size "$A_ART") B, md5 $(file_md5 "$A_ART"))"
 if [ -n "$B_ART" ]; then
-  info "shimmed    : $B_ART ($(stat -c %s "$B_ART") B, md5 $(md5sum "$B_ART" | cut -d' ' -f1))"
+  info "shimmed    : $B_ART ($(file_size "$B_ART") B, md5 $(file_md5 "$B_ART"))"
   if cmp -s "$A_ART" "$B_ART"; then
     warn "the two artifacts are byte-identical: NRC_NO_IMAGE_SHIM changed nothing."
   fi
@@ -304,7 +417,7 @@ else
   warn "no shimmed side: tools/postprocess.py has no NRC_NO_IMAGE_SHIM support yet."
   warn "  running the as-shipped and globally-flipped sides only."
 fi
-info "global     : $G_ART ($(stat -c %s "$G_ART") B, md5 $(md5sum "$G_ART" | cut -d' ' -f1))"
+info "global     : $G_ART ($(file_size "$G_ART") B, md5 $(file_md5 "$G_ART"))"
 
 # ------------------------------------------------------------------ runner
 
@@ -314,6 +427,21 @@ SUMMARIZE="$SCRATCH/summarize.py"
 cat > "$SUMMARIZE" <<'EOF'
 import base64
 import json, sys
+
+
+def oneline(text):
+    """Escape so each field below occupies exactly ONE line.
+
+    Its callers pull these fields back out with `sed -n 's/^tool_result=//p'`,
+    which matches only the line that literally begins `tool_result=`. A raw
+    newline in a tool_result therefore truncated the value at its first line in
+    BOTH the expect/reject check and the SAME/DIFFERS verdict - and this is not
+    hypothetical: the Bash case's tool_result is "HELLO-FROM-SUBPROCESS\nLinux"
+    (measured), so the "Linux" half was being discarded, and two sides that
+    differed only after line 1 would have been reported SAME.
+    """
+    return (text.replace("\\", "\\\\").replace("\n", "\\n")
+                .replace("\r", "\\r").replace("\t", "\\t"))
 
 tool_name = None
 summary = "(no tool_result)"
@@ -365,28 +493,103 @@ for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
         final = (f"is_error={j.get('is_error')} num_turns={j.get('num_turns')} "
                  f"result={str(j.get('result'))[:60]!r}")
 
-print(f"tool={tool_name}")
-print(f"tool_result={summary}")
-print(f"result={final}")
+print(f"tool={oneline(str(tool_name))}")
+print(f"tool_result={oneline(summary)}")
+print(f"result={oneline(final)}")
 EOF
 
 # The loopback-only property, enforced per run instead of asserted in a comment.
 # This is how the npm reach-out documented in the header was found, and a header
 # is not a mechanism: the previous version of this script claimed "no traffic
 # leaves the host" and was wrong about it for two different reasons at once.
-# Poll-based, so it can only ever MISS a socket, never invent one - a finding
-# here is real.
+#
+# Two properties this has to have, and only got in the review that followed:
+#
+#   It follows the PPID CHAIN, not just the process whose cmdline names the
+#   artifact. The Bash tool, `rg`, and any tool-driven network access run in
+#   CHILDREN. Measured with the previous version extracted verbatim: a marked
+#   process opening a socket to this host's 172.18.0.5:19999 was caught
+#   (egress=[172.18.0.5:19999]); the SAME process spawning a child that opened
+#   the identical connection reported nothing (egress=[]) while the listener
+#   logged the connection both times. With the parent-chain walk below, both
+#   are caught, and so is a grandchild - and an unrelated process opening the
+#   same socket is still not attributed to this run.
+#
+#   What a ppid chain cannot follow is a descendant that has been REPARENTED
+#   AWAY, and that is a real hole, not a theoretical one. Re-measured on this
+#   host with the poller below extracted verbatim and a listener on
+#   172.18.0.5:19999, five shapes, one connection each: the marked process
+#   itself, a child of it, and a grandchild all came back
+#   egress=[172.18.0.5:19999] with sockets=1; a double-forked grandchild whose
+#   middle process exits, and the same thing again with setsid(), both came
+#   back egress=[] with sockets=0 - while the listener logged the connection in
+#   all five. Once the middle process is gone the orphan's ppid is 1 and no
+#   chain from it reaches the artifact.
+#
+#   That is accepted rather than fixed, because the fixes are worse here. The
+#   alternatives - attributing by session id or by process group - would take
+#   in the harness's OWN session: this script, the node mock, and anything else
+#   sharing the shell that started it, which turns the "at least one socket"
+#   positive control into noise and the egress line into other people's
+#   traffic. What is under test is a CLI driving its own tool subprocesses, and
+#   those are ordinary children. A CLI that daemonized itself to phone home
+#   would evade this poller; so would a socket opened and closed inside one
+#   30 ms gap between polls. Both are MISSES. A hit is still real.
+#
+#   It fails CLOSED. Being SIGTERMed is the normal end of a case, so "the
+#   poller is gone" cannot mean "clean"; it writes a status file and run_case
+#   fails any case whose status is not OK. Measured on the previous version:
+#   with /proc unreadable it died in 30 ms with an unhandled FileNotFoundError,
+#   run_case discarded that exit, and the empty egress file read as a pass.
+#
+# What it still cannot do is see a socket that opens and closes entirely
+# between two 30 ms polls, so a MISS is possible and a hit is real - as long as
+# the hit is a real destination, which is why the v6 decoding below matters.
 EGRESS="$SCRATCH/egress.py"
 cat > "$EGRESS" <<'EOF'
-import os, re, sys, time
+import os, re, signal, socket, sys, time
 
-artifact, outpath = sys.argv[1], sys.argv[2]
+artifact, outpath, statuspath = sys.argv[1], sys.argv[2], sys.argv[3]
 out = open(outpath, "a", buffering=1)
+status = open(statuspath, "w", buffering=1)
 seen = set()
+# Counted, not just filtered: an empty egress file is only evidence if this
+# poller was watching the right processes at all. A run that attributes ZERO
+# sockets to the artifact's process tree looks exactly like a clean run, and
+# every case here opens at least one (the loopback connection to the mock), so
+# the caller fails a non-doctor case whose socket count is 0.
+egress_count = 0
 # backstop: the caller kills this, but if the caller is itself killed, an
 # endless /proc scan on a shared box is a bad thing to leave behind. Longer
 # than the longest case timeout above (180 s).
 deadline = time.time() + 600
+
+# The caller SIGTERMs this poller when the case ends, so "was killed" is the
+# NORMAL exit and cannot be used to tell a clean run from a crash. Hence the
+# status file: it says OK only on the path that ran the loop to the end. An
+# empty or ERROR status makes run_case fail the case. Before this, the poller
+# dying on its first iteration (measured: /proc missing -> FileNotFoundError in
+# 30 ms) left an empty egress file, which check_side read as "clean" - the
+# guard failed OPEN, which is the one way a guard must never fail.
+stop = False
+
+
+def on_signal(signum, frame):
+    global stop
+    stop = True
+
+
+for sig in (signal.SIGTERM, signal.SIGINT):
+    signal.signal(sig, on_signal)
+
+
+def read_text(path):
+    try:
+        with open(path, "rb") as fh:
+            return fh.read().decode("utf8", "replace")
+    except OSError:
+        # a pid that exited between listdir() and here; not an error
+        return None
 
 
 def inode_table():
@@ -402,6 +605,87 @@ def inode_table():
     return tbl
 
 
+def ppid_of(pid):
+    # Field 4 of /proc/<pid>/stat, parsed from after the LAST ')': field 2 is
+    # the comm in parentheses and may itself contain spaces and ')', so a plain
+    # split() gets the wrong column for a process whose name is hostile.
+    st = read_text(f"/proc/{pid}/stat")
+    if st is None:
+        return None
+    cut = st.rfind(")")
+    if cut == -1:
+        return None
+    rest = st[cut + 1:].split()
+    if len(rest) < 2:
+        return None
+    return rest[1]
+
+
+def monitored_pids():
+    """Every pid whose parent chain reaches a process running the artifact.
+
+    The cmdline filter alone (what this used to do) sees only the bun process
+    itself, and the Bash tool, `rg`, and any tool-driven network access run in
+    CHILDREN. Measured with the poller extracted verbatim: a marked process
+    that opens a socket to this host's 172.18.0.5:19999 is caught, and the same
+    process spawning a CHILD that opens the identical connection reports
+    nothing while the listener logs the connection either way.
+
+    "Parent chain", and not "process tree": a descendant that has been
+    reparented away - a double fork, or setsid with the middle process exiting
+    - has ppid 1 and is NOT found. Measured, five shapes, one connection each:
+    self, child and grandchild all reported sockets=1 and the connection; the
+    double-fork and setsid orphans reported sockets=0 while the listener logged
+    their connection anyway. See the block above this heredoc for why that is
+    accepted here rather than papered over with a session-id match.
+
+    The root test is "the artifact path appears in this cmdline", so a root is
+    any process launched with that path on its command line: the bun process,
+    the timeout(1) wrapper in front of it (checked on this host - `timeout 5
+    env -i /bin/sleep 3` shows that whole line as its cmdline, and env execs
+    into the target rather than staying as a process of its own), and this
+    poller, which the caller passes the same path as argv[1]. Everything under
+    any of them is watched. Verified by dumping the monitored set mid-run on
+    this host with one marked process: exactly two pids, the marked process and
+    the poller.
+    """
+    entries = os.listdir("/proc")     # deliberately NOT guarded: no /proc means
+                                      # this guard cannot work at all, and the
+                                      # caller must hear about that, not get an
+                                      # empty (= clean-looking) result
+    pids = [e for e in entries if e.isdigit()]
+    parent = {}
+    roots = set()
+    for pid in pids:
+        cmd = read_text(f"/proc/{pid}/cmdline")
+        if cmd is None:
+            continue
+        # the artifact path, so a sibling agent's Claude on the same host is not
+        # attributed to this run
+        if artifact in cmd:
+            roots.add(pid)
+        p = ppid_of(pid)
+        if p is not None:
+            parent[pid] = p
+    keep = set(roots)
+    for pid in pids:
+        chain = []
+        cur = pid
+        # bounded walk: /proc is read without a lock, so a racing reparent can
+        # in principle hand back a cycle, and an unbounded loop here would spin
+        # forever holding the CPU on a shared box
+        for _ in range(64):
+            if cur in keep:
+                keep.update(chain)
+                break
+            chain.append(cur)
+            nxt = parent.get(cur)
+            if nxt is None or nxt == cur or nxt == "0":
+                break
+            cur = nxt
+    return keep
+
+
 def addr(fam, hexaddr):
     h, port = hexaddr.split(":")
     port = int(port, 16)
@@ -410,40 +694,53 @@ def addr(fam, hexaddr):
     raw = b"".join(bytes.fromhex(h[i:i + 8])[::-1] for i in range(0, 32, 8))
     if raw[:12] == b"\0" * 10 + b"\xff\xff":       # v4-mapped
         return ".".join(str(b) for b in raw[12:]), port
-    return raw.hex(), port
+    # inet_ntop, not raw.hex(): the hex form matched none of the loopback
+    # exemptions, so ANY v6 socket with no peer was reported as egress.
+    # Reproduced against a process doing only socket(AF_INET6)/bind(("::1",0))/
+    # listen(1): the poller printed 00000000000000000000000000000000:0, i.e. it
+    # invented traffic leaving the host for a socket bound to v6 loopback.
+    return socket.inet_ntop(socket.AF_INET6, raw), port
 
 
-while time.time() < deadline:
-    tbl = inode_table()
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit():
-            continue
-        try:
-            cmd = open(f"/proc/{entry}/cmdline", "rb").read().decode("utf8", "replace")
-        except OSError:
-            continue
-        # the artifact path, so a sibling agent's Claude on the same host is not
-        # attributed to this run
-        if artifact not in cmd:
-            continue
-        try:
-            fds = os.listdir(f"/proc/{entry}/fd")
-        except OSError:
-            continue
-        for fd in fds:
+def is_local(ip):
+    # "::" / "0.0.0.0" are what a listening socket's REMOTE address decodes to;
+    # they are the absence of a peer, not a destination.
+    return ip.startswith("127.") or ip in ("0.0.0.0", "::", "::1")
+
+
+try:
+    while not stop and time.time() < deadline:
+        tbl = inode_table()
+        for entry in monitored_pids():
             try:
-                link = os.readlink(f"/proc/{entry}/fd/{fd}")
+                fds = os.listdir(f"/proc/{entry}/fd")
             except OSError:
                 continue
-            m = re.fullmatch(r"socket:\[(\d+)\]", link)
-            if not m or m.group(1) in seen or m.group(1) not in tbl:
-                continue
-            seen.add(m.group(1))
-            fam, rem = tbl[m.group(1)]
-            ip, port = addr(fam, rem)
-            if not (ip.startswith("127.") or ip == "::1" or ip == "0.0.0.0"):
-                out.write(f"{ip}:{port}\n")
-    time.sleep(0.03)
+            for fd in fds:
+                try:
+                    link = os.readlink(f"/proc/{entry}/fd/{fd}")
+                except OSError:
+                    continue
+                m = re.fullmatch(r"socket:\[(\d+)\]", link)
+                if not m or m.group(1) in seen or m.group(1) not in tbl:
+                    continue
+                seen.add(m.group(1))
+                fam, rem = tbl[m.group(1)]
+                ip, port = addr(fam, rem)
+                if not is_local(ip):
+                    egress_count += 1
+                    out.write(f"{ip}:{port}\n")
+        time.sleep(0.03)
+except BaseException as exc:                       # noqa: BLE001 - see above
+    status.write(f"ERROR {type(exc).__name__}: {exc}\n")
+    sys.exit(1)
+
+if stop:
+    status.write(f"OK sockets={len(seen)} loopback={len(seen) - egress_count} "
+                 f"non_loopback={egress_count}\n")
+else:
+    status.write("ERROR 600 s backstop reached; the caller never stopped this poller\n")
+    sys.exit(1)
 EOF
 
 # Which tool each case drives, and what the invocation needs for it to be
@@ -501,8 +798,10 @@ run_case() {  # run_case <case> <artifact> <label> ; prints the summary lines
   local port; port="$(cat "$port_file")"
 
   local egress_file="$SCRATCH/$tag.egress"
+  local egress_status="$SCRATCH/$tag.egress.status"
   : > "$egress_file"
-  python3 "$EGRESS" "$artifact" "$egress_file" &
+  rm -f "$egress_status"
+  python3 "$EGRESS" "$artifact" "$egress_file" "$egress_status" &
   local egress_pid=$!
   # same reason the mock's pid goes through a file: run_case runs inside a
   # command substitution, so the EXIT trap cannot see this variable, and an
@@ -539,7 +838,7 @@ run_case() {  # run_case <case> <artifact> <label> ; prints the summary lines
     # turn, so there is no transcript to summarize - the two lines it prints are
     # the result. No pty either: measured, `doctor </dev/null` writes them to a
     # plain pipe.
-    ( cd "$WORK" && timeout 120 env -i "${base_env[@]}" \
+    ( cd "$WORK" && run_timeout 120 env -i "${base_env[@]}" \
         "$BUN_BIN" --no-install "$artifact" doctor \
         </dev/null >"$out" 2>"$SCRATCH/$tag.err" ) || rc=$?
     local running search
@@ -550,7 +849,7 @@ run_case() {  # run_case <case> <artifact> <label> ; prints the summary lines
     echo "result=(doctor prints no result line)"
   else
     # shellcheck disable=SC2086
-    ( cd "$WORK" && timeout 180 env -i "${base_env[@]}" \
+    ( cd "$WORK" && run_timeout 180 env -i "${base_env[@]}" \
         "$BUN_BIN" --no-install "$artifact" \
         -p "$(case_prompt "$kase")" --output-format stream-json --verbose \
         --dangerously-skip-permissions $(case_extra "$kase") \
@@ -570,6 +869,13 @@ run_case() {  # run_case <case> <artifact> <label> ; prints the summary lines
   rm -f "$SCRATCH/$tag.egresspid"
 
   echo "egress=$(sort -u "$egress_file" | tr '\n' ' ')"
+  # The guard's own verdict, not just its findings. An empty egress file means
+  # "clean" ONLY if the poller ran to the end and said so; before this line the
+  # two were indistinguishable and a poller that crashed on its first
+  # iteration passed every case.
+  local guard; guard="$(head -1 "$egress_status" 2>/dev/null || true)"
+  if [ -z "$guard" ]; then guard="ERROR the egress guard left no status (it crashed, or was killed before it could report)"; fi
+  echo "egress_guard=$guard"
   echo "cli_rc=$rc"
   # A turn that produced no tool_result is the failure this harness is most
   # likely to hit (wrong artifact path, a Bun that cannot load it, a tool the
@@ -581,6 +887,18 @@ run_case() {  # run_case <case> <artifact> <label> ; prints the summary lines
   if grep -q '^WARN' "$SCRATCH/$tag.mock.log" 2>/dev/null; then
     grep '^WARN' "$SCRATCH/$tag.mock.log" | sed 's/^/mock_/'
   fi
+  # A turn that came off the NON-streaming fallback is a different code path
+  # from the one a real API run takes, and it is invisible in the transcript:
+  # the tool_result is identical. Measured (see the sse() comment in
+  # scripts/mock-messages-api.mjs): dropping the SSE `event:` line makes the
+  # CLI abandon every stream=true request and re-send it as stream=false, and
+  # this harness reported the case as passing. Now it does not.
+  if [ -f "$SCRATCH/$tag.mock.log" ]; then
+    local fallbacks; fallbacks="$(grep -c 'stream=false' "$SCRATCH/$tag.mock.log" || true)"
+    if [ "${fallbacks:-0}" -gt 0 ]; then
+      echo "mock_stream_fallback=$fallbacks request(s) were re-sent with stream=false; the turn did not come from the SSE stream"
+    fi
+  fi
 }
 
 # -------------------------------------------------------------------- cases
@@ -591,7 +909,15 @@ run_case() {  # run_case <case> <artifact> <label> ; prints the summary lines
 # result. Every string below was measured on this host before it was written.
 expect_for() {  # expect_for <case> <side>
   case "$1:$2" in
-    bash:*)        echo "HELLO-FROM-SUBPROCESS" ;;
+    # The WHOLE tool_result, both lines of it (the mock's Bash probe is
+    # `echo HELLO-FROM-SUBPROCESS; uname -s`). The literal \n is what the
+    # summarizer's oneline() escaping produces: expecting it is what stops the
+    # second line from being silently dropped again. `sed -n 's/^tool_result=//p'`
+    # only ever matched the first line, so before this the "Linux" half was
+    # discarded from both this check and the SAME/DIFFERS verdict, and two
+    # sides differing only after line 1 would have been reported SAME. Naming
+    # Linux is safe: the preflight refuses to run this script anywhere else.
+    bash:*)        echo "HELLO-FROM-SUBPROCESS\nLinux" ;;
     # Same expectation on the two SHIPPABLE sides, deliberately: a shim that is
     # genuinely scoped to the image call site has to keep the hit.
     grep:asshipped) echo "hay/a.txt:1:NEEDLE-12345" ;;
@@ -655,6 +981,37 @@ check_side() {  # check_side <case> <side> <summary>
   local egress; egress="$(printf '%s\n' "$out" | sed -n 's/^egress=//p')"
   if [ -n "$(printf '%s' "$egress" | tr -d '[:space:]')" ]; then
     echo "    check: FAIL (traffic left the host:$egress)"
+    FAILED=$((FAILED + 1))
+  fi
+  # ...and equally fatal if the guard cannot vouch for that emptiness. An
+  # egress file is only evidence when the process that was supposed to fill it
+  # ran to the end.
+  local guard; guard="$(printf '%s\n' "$out" | sed -n 's/^egress_guard=//p')"
+  case "$guard" in
+    OK\ *)
+      # Positive control on the guard itself, only worth asking once the guard
+      # says it finished. Every case that drives a turn talks to the mock over
+      # loopback, so a guard that attributed NO socket at all was watching the
+      # wrong processes - and that is indistinguishable from a clean run in the
+      # egress= line above. The doctor case is exempt: it drives no turn, so
+      # opening no socket at all is a legitimate outcome for it. How many
+      # sockets any run opens is not fixed and is deliberately not asserted
+      # against a constant anywhere - the count is printed in this same
+      # egress_guard= line, and what is checked is the invariant: zero
+      # non-loopback, and non-zero total wherever a turn was driven.
+      local sockets; sockets="$(printf '%s\n' "$guard" | sed -n 's/.*sockets=\([0-9]*\).*/\1/p')"
+      if [ "$kase" != "doctor" ] && [ "${sockets:-0}" -eq 0 ]; then
+        echo "    check: FAIL (the egress guard saw 0 sockets: it was watching the wrong process, so its empty result means nothing)"
+        FAILED=$((FAILED + 1))
+      fi ;;
+    *) echo "    check: FAIL (egress guard did not report clean: ${guard:-<missing>})"
+       FAILED=$((FAILED + 1)) ;;
+  esac
+  # A pass produced off the mock's non-streaming fallback is not a pass: it
+  # exercised a code path the real API run never takes.
+  local fallback; fallback="$(printf '%s\n' "$out" | sed -n 's/^mock_stream_fallback=//p')"
+  if [ -n "$fallback" ]; then
+    echo "    check: FAIL (the CLI abandoned the SSE stream: $fallback)"
     FAILED=$((FAILED + 1))
   fi
 }

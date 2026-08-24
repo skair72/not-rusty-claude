@@ -47,6 +47,17 @@ import pytest
 GATE_DEF_PLAIN = "function CE(){return Bun.isStandaloneExecutable===!0}"
 GATE_DEF_TYPEOF = 'function AE(){return typeof Bun<"u"&&Bun.isStandaloneExecutable===!0}'
 
+# A gate declaration STANDALONE_DEF does not match, in the shape a minifier
+# most plausibly produces: the same gate as an arrow. Not invented for this
+# file - the drift was reproduced end to end by replacing this exact
+# declaration in place in a copy of the linux-x64 2.1.222 binary with the
+# equal-length `var CE=()=>Bun.isStandaloneExecutable===!0;var _q0=0;` (53
+# bytes either way, one occurrence, at offset 260565233) and running a full
+# build against it on this host on 2026-08-24. Everything else about that
+# artifact - the anchor, the `if(CE())try{` branch, all 21 gate calls - was
+# untouched, and the build still announced a renamed anchor string.
+GATE_DEF_ARROW = "var CE=()=>Bun.isStandaloneExecutable===!0"
+
 HEAD = "// @bun @bytecode @bun-cjs\n(function(exports, require, module, __filename, __dirname) {\n"
 TAIL = 'r("cli_after_main_complete")}PSE();})\n'
 
@@ -98,6 +109,23 @@ DOLLAR_LOOKALIKE = 'var x$CE=()=>1;if(x$CE())return;'
 def _module(gate_def=GATE_DEF_PLAIN, name="CE", sites=(RIPGREP_SITE, IMAGE_SITE, SPREAD_SITE)):
     """A postprocess-able entry module: pragma, wrapper, gate, sites, `})`."""
     return HEAD + gate_def + ";" + "".join(s % name for s in sites) + TAIL
+
+
+def _live_gate_calls(text, name="CE"):
+    """`<name>()` call sites in `text`, counted WITHOUT postprocess's counter.
+
+    Deliberately a second implementation and not a call to
+    `_count_gate_calls`: this is what checks that the numbers postprocess
+    reports describe the text it actually produced, and a recount that goes
+    through the code under test cannot see that code being bypassed.
+
+    The declaration `function CE(){` carries the token `CE()` too and is not a
+    call site, so it is subtracted here exactly as _count_gate_calls excludes
+    its span. GATE_DEF_ARROW declares no such token, and 0 is then the right
+    thing to subtract.
+    """
+    calls = len(re.findall(r"(?<![\w$])" + re.escape(name) + r"\(\)", text))
+    return calls - text.count("function %s(){" % name)
 
 
 def _single_edit(before, after):
@@ -320,7 +348,8 @@ def test_two_differently_named_gate_declarations_refuse_to_guess(postprocess):
     # `ZZ` is two different measurements presented as one comparison, and the
     # opt-out half is the one nobody re-reads.
     assert plain_counts["gate_name"] is None
-    assert plain_counts["gate_calls_before"] == plain_counts["gate_calls_after"] == 0
+    assert plain_counts["gate_calls_before"] is None
+    assert plain_counts["gate_calls_after"] is None
 
 
 def test_two_declarations_of_the_same_gate_are_not_an_ambiguity(postprocess):
@@ -463,19 +492,70 @@ def test_no_anchor_means_no_rewrite_and_no_error(postprocess):
     assert counts["gate_name"] == "CE"
     assert counts["image_shim"] == 0
     assert counts["gate_calls_after"] == counts["gate_calls_before"] == 2
-    assert "anchor" in counts["image_shim_reason"]
+    # and it says the gate is FINE, so nobody re-measures STANDALONE_DEF: this
+    # reason is what build.sh prints as its closing headline
+    assert "not in this entry module at all" in counts["image_shim_reason"]
+    assert "not declaration drift" in counts["image_shim_reason"]
     assert postprocess.check(out, counts) == []
 
 
 def test_no_gate_declaration_at_all_means_no_rewrite_and_no_error(postprocess):
     """Nothing to capture, nothing to count, nothing to rewrite - and the
-    output is still a perfectly good CommonJS module."""
+    output is still a perfectly good CommonJS module.
+
+    The counts are None and not 0. Zero is a measurement ("this file has no
+    gate calls") and nothing measured it; the file that produced it in the
+    field held 21 of them - see
+    test_a_drifted_gate_declaration_is_not_reported_as_zero_call_sites. Here
+    the flag genuinely is absent, and the refusal says which of the two this
+    is, because the build now quotes it as its headline."""
     out, counts = postprocess.transform(HEAD + "var x=1;" + TAIL)
 
     assert counts["gate_name"] is None
     assert counts["image_shim"] == 0
-    assert counts["gate_calls_before"] == counts["gate_calls_after"] == 0
+    assert counts["gate_calls_before"] is None
+    assert counts["gate_calls_after"] is None
+    assert "not mentioned anywhere" in counts["image_shim_reason"]
     assert postprocess.check(out, counts) == []
+
+
+def test_a_drifted_gate_declaration_is_not_reported_as_zero_call_sites(postprocess):
+    """The declaration shape drifts; the anchor, the branch and every gate
+    call are exactly where they were.
+
+    Reproduced as a full build on this host on 2026-08-24 against a copy of
+    the linux-x64 2.1.222 binary with GATE_DEF_ARROW spliced in place of the
+    real declaration: postprocess printed `image shim call sites  : 0 -> 0`
+    for an artifact that still contained 21 live `CE()` calls, the anchor
+    exactly once and `if(CE())try{` exactly once, and build.sh closed with
+    "Most likely a new Claude release renamed the anchor string". Both
+    statements were false, and the second sends whoever re-measures to the one
+    thing that had not moved.
+
+    So: unknown counts stay unknown, and the reason names the declaration and
+    says explicitly that the anchor is not implicated - the gate is resolved
+    before the anchor is ever looked for, so an unmatched declaration cannot be
+    an anchor problem."""
+    src = _module(gate_def=GATE_DEF_ARROW)
+
+    out, counts = postprocess.transform(src)
+
+    assert counts["gate_name"] is None
+    assert counts["gate_calls_before"] is None
+    assert counts["gate_calls_after"] is None
+    assert counts["image_shim"] == 0
+    why = counts["image_shim_reason"]
+    assert "DECLARATION" in why
+    assert "anchor string is not implicated" in why
+    assert "mentioned 1 time(s)" in why
+    # the evidence for that sentence, in the very file the shim refused
+    assert _live_gate_calls(out) == 3, "the gate calls are still all there"
+    assert out.count("Native image processor not available") == 1
+    assert out.count("if(CE())try{") == 1
+    # still a refusal, not a failure: the artifact is the unshimmed one
+    assert postprocess.check(out, counts) == []
+    plain, _ = postprocess.transform(src, image_shim=False)
+    assert out == plain
 
 
 def test_two_anchors_refuse_to_guess(postprocess):
@@ -616,6 +696,69 @@ def test_the_honest_counts_are_not_reported_as_a_violation(postprocess):
     assert postprocess.check(out, counts) == []
 
 
+@pytest.mark.parametrize("replacement,live_after,fatal", [
+    ("true", 2, False),                 # today's constant: one call site went
+    ("CE()", 3, True),                  # a rewrite that puts the call back
+    ("true||CE()||CE()", 4, True),      # a rewrite that multiplies call sites
+])
+def test_the_after_count_is_measured_on_the_rewritten_code(
+        postprocess, monkeypatch, replacement, live_after, fatal):
+    """`gate_calls_after` must be COUNTED on the output, never derived from it.
+
+    Every other test of check() hands it its counts, so the validator is
+    thoroughly covered while the thing that PRODUCES the numbers was not
+    covered at all - and that is enough to disarm check()'s condition (f)
+    permanently. Reproduced on this host 2026-08-24 before this test existed:
+    `_apply_image_shim` returning `before - 1` in place of the recount left
+    `200 passed`, and a rewrite that then flipped EVERY gate call in the real
+    22,960,130-byte linux-x64 2.1.222 entry module reported
+    `gate=CE before=21 after=20 image_shim=1` with `check() errors: []` over an
+    artifact with 0 CE() call sites left - the global flip that breaks Grep,
+    shipped as one tidy scoped rewrite. With the real recount in place the same
+    spreading rewrite reports `after=0` and check() fires.
+
+    IMAGE_SHIM_REPLACEMENT is the seam the perturbation goes through: it stands
+    in for any future rewrite that removes more or fewer gate calls than the
+    one site it was aimed at. Row one is today's constant and must stay clean;
+    the other two can only be caught by a number measured on the text that came
+    out, and `_live_gate_calls` recounts it here independently.
+    """
+    monkeypatch.setattr(postprocess, "IMAGE_SHIM_REPLACEMENT", replacement)
+
+    out, counts = postprocess.transform(_module())
+
+    assert counts["image_shim"] == 1
+    assert _live_gate_calls(out) == live_after, "the fixture drifted"
+    assert counts["gate_calls_after"] == live_after, (
+        "the reported after-count is not the number of CE() calls left in the "
+        "output - it was assumed, not measured")
+    errors = postprocess.check(out, counts)
+    assert bool(errors) is fatal, errors
+    if fatal:
+        assert any("image shim accounting" in e for e in errors)
+        assert any("ripgrep" in e for e in errors), "the message must name the harm"
+
+
+def test_a_rewrite_claimed_against_an_unidentified_gate_is_fatal(postprocess):
+    """No gate named means no count, and "no arithmetic to do" must not become
+    "nothing to check": `applied` > 0 with unknown counts is a rewrite nothing
+    measured, over a file whose gate calls nobody enumerated. Unreachable from
+    _apply_image_shim, which returns the code untouched on every path that
+    fails to name a gate - which is exactly why check() has to say so rather
+    than trust it, and why the counts are None here instead of the 0 they used
+    to be."""
+    out, counts = postprocess.transform(_module(gate_def=GATE_DEF_ARROW))
+    assert (counts["gate_name"], counts["gate_calls_before"],
+            counts["gate_calls_after"]) == (None, None, None)
+    assert postprocess.check(out, counts) == []
+
+    counts["image_shim"] = 1
+    errors = postprocess.check(out, counts)
+
+    assert any("image shim accounting" in e for e in errors), errors
+    assert any("ripgrep" in e for e in errors), "the message must name the harm"
+
+
 # --- the opt-out -------------------------------------------------------------
 
 def test_the_opt_out_is_read_in_main_not_in_transform(postprocess, monkeypatch):
@@ -668,6 +811,12 @@ def _assert_one_real_rewrite(postprocess, src):
     assert counts["image_shim"] == 1
     assert counts["gate_calls_after"] == counts["gate_calls_before"] - 1
     assert counts["gate_calls_before"] > 1, "a lone call site proves nothing"
+    # ...and that after-count is the number of calls the 23 MB of output really
+    # holds, recounted here without postprocess's own counter. before - 1 is
+    # what the reported number is SUPPOSED to equal; this is the check that it
+    # was measured rather than computed from that expectation.
+    assert _live_gate_calls(out, counts["gate_name"]) == counts["gate_calls_after"]
+    assert _live_gate_calls(src, counts["gate_name"]) == counts["gate_calls_before"]
     assert postprocess.check(out, counts) == []
     return out, counts
 
@@ -753,8 +902,8 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 BASE_ENV = {"PATH": "/usr/bin:/bin", "PYTHONUNBUFFERED": "1"}
 
 
-def _run_postprocess(d, env=None):
-    (d / "cli.original.js").write_text(_module())
+def _run_postprocess(d, env=None, source=None):
+    (d / "cli.original.js").write_text(source if source is not None else _module())
     return subprocess.run(
         [sys.executable, str(ROOT / "tools" / "postprocess.py"), str(d)],
         capture_output=True, text=True, env=dict(BASE_ENV, **(env or {})))
@@ -767,6 +916,10 @@ def test_main_prints_the_gate_name_and_shim_count_on_stdout(tmp_path):
     assert "image shim gate        : CE" in result.stdout
     assert "image shim applied     : 1" in result.stdout
     assert "3 -> 2" in result.stdout
+    # and NO cause line: build.sh reads that line for its "NOT APPLIED"
+    # headline, so a shimmed build has to leave it empty. Its absence also
+    # keeps the build log of the default build the one docs/runbook.md quotes.
+    assert "image shim not applied" not in result.stdout
 
 
 def test_the_env_opt_out_skips_the_rewrite_and_warns(tmp_path):
@@ -789,6 +942,27 @@ def test_the_env_opt_out_skips_the_rewrite_and_warns(tmp_path):
     assert a != b
     assert len(a) == len(b), "CE() and true are both four bytes"
     assert sum(x != y for x, y in zip(a, b)) == 4
+
+
+def test_a_refusal_prints_its_cause_and_invents_no_counts(tmp_path):
+    """The two things a build printed about the drifted-declaration artifact
+    that were not true: `image shim call sites  : 0 -> 0` for a file with
+    every one of its gate calls still in it, and no statement of the cause at
+    all - leaving build.sh to guess one, which it did, wrongly.
+
+    Reproduced with a full build on this host on 2026-08-24; the module here
+    is the hermetic version of the same drift."""
+    result = _run_postprocess(tmp_path, source=_module(gate_def=GATE_DEF_ARROW))
+
+    assert result.returncode == 0, result.stderr
+    assert "image shim gate        : None" in result.stdout
+    assert "image shim call sites  : not counted (no gate identified)" in result.stdout
+    assert "0 -> 0" not in result.stdout, "a count nothing measured"
+    assert "image shim applied     : 0" in result.stdout
+    assert ("image shim not applied : no Bun.isStandaloneExecutable gate "
+            "DECLARATION matched") in result.stdout
+    # the artifact is still written - a refusal, not a failure
+    assert (tmp_path / "cli.original.cjs").exists()
 
 
 @pytest.mark.parametrize("value", ["1", "0", "false", "yes"])
@@ -854,6 +1028,43 @@ def test_build_sh_reports_the_shim_as_not_applied(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "image shim NOT APPLIED" in result.stderr
     assert "image shim APPLIED" not in result.stdout
+    # and the headline names THIS refusal's cause - the anchor - rather than a
+    # single cause for every refusal alike
+    assert "the anchor" in result.stderr
+    assert "not declaration drift" in result.stderr
+
+
+def test_build_sh_names_the_declaration_when_the_declaration_drifted(tmp_path):
+    """build.sh's closing headline must not name a cause of its own.
+
+    It used to end every refusal with "Most likely a new Claude release
+    renamed the anchor string". Measured false on 2026-08-24 by building a
+    copy of the linux-x64 2.1.222 binary whose 53-byte gate declaration had
+    been replaced in place with the equal-length GATE_DEF_ARROW form: that
+    build printed exactly that line while its own artifact still held the
+    anchor exactly once and 21 live `CE()` calls. The anchor cannot even be
+    the cause here - the gate is resolved first, so the search never reached
+    it - and the reader it sends to re-measure IMAGE_ANCHOR is the reader who
+    then has to find STANDALONE_DEF on their own.
+
+    The headline now quotes postprocess.py's reason, which is the only place
+    the cause is worked out."""
+    native = _synthetic_binary(
+        tmp_path / "native", _module(gate_def=GATE_DEF_ARROW).encode())
+    out = tmp_path / "out"
+
+    result = _build(out, native)
+
+    assert result.returncode == 0, result.stderr
+    assert ("image shim NOT APPLIED: no Bun.isStandaloneExecutable gate "
+            "DECLARATION matched") in result.stderr
+    assert "renamed the anchor string" not in result.stderr
+    assert "0 -> 0" not in result.stdout
+    # the artifact this build just made, which is what the old headline was
+    # wrong about: the anchor and the image branch are both still in it
+    artifact = (out / "extract" / "cli.original.cjs").read_text()
+    assert artifact.count("Native image processor not available") == 1
+    assert artifact.count("if(CE())try{") == 1
 
 
 def test_build_sh_leaves_no_postprocess_log_in_the_output_dir(tmp_path):
