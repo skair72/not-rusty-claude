@@ -57,13 +57,19 @@ def _synthetic_binary(path, entry=GOOD_ENTRY):
     return path
 
 
+def _build_env(out_dir, env=None):
+    """The environment a build runs under. Exposed, not inlined, so a test can
+    assert on the HOME it actually chooses - see the OS-littering test below."""
+    return {"PATH": "/usr/bin:/bin",
+            "HOME": str(fixtures.scratch_home(out_dir)),
+            "OUT_DIR": str(out_dir), "BUN_BIN": "/nonexistent/bun",
+            **(env or {})}
+
+
 def _build(out_dir, native, env=None):
     return subprocess.run(
         ["bash", str(BUILD_SH), str(native)],
-        capture_output=True, text=True,
-        env={"PATH": "/usr/bin:/bin", "HOME": str(out_dir),
-             "OUT_DIR": str(out_dir), "BUN_BIN": "/nonexistent/bun",
-             **(env or {})})
+        capture_output=True, text=True, env=_build_env(out_dir, env))
 
 
 def _gap_list(result):
@@ -152,6 +158,80 @@ def test_a_failed_extraction_leaves_no_staging_directory(tmp_path):
     assert _build(out, shutil.which("ls") or "/bin/ls").returncode != 0
 
     assert sorted(p.name for p in out.glob(".extract*")) == []
+
+
+def test_the_os_littering_in_home_does_not_count_against_the_output_dir(tmp_path):
+    """Reproduces, on Linux, the only failure a real Mac has ever produced here.
+
+    The build helper used to pass HOME=OUT_DIR. On macOS the first process to
+    touch CoreFoundation creates ~/Library, so both "nothing left behind"
+    assertions saw ['Library', 'extract'] and blamed build.sh for a directory
+    the operating system had made. Reported from a real Mac on 2026-08-24, the
+    first macOS run this project has ever had.
+
+    The dir is created in whatever HOME the helper actually chooses - reading
+    it back from _build_env rather than recomputing it - because a version of
+    this test that assumed the sibling passed happily with HOME=OUT_DIR
+    restored, i.e. it asserted nothing.
+    """
+    native = _synthetic_binary(tmp_path / "native")
+    out = tmp_path / "out"
+    home = pathlib.Path(_build_env(out)["HOME"])
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "Library").mkdir()
+
+    assert _build(out, native).returncode == 0
+
+    assert sorted(p.name for p in out.iterdir()) == ["extract"]
+
+
+def _versions_dir(home, entries):
+    """Lay out $HOME/.local/share/claude/versions the way a real install does."""
+    v = home / ".local" / "share" / "claude" / "versions"
+    v.mkdir(parents=True, exist_ok=True)
+    for name, payload in entries:
+        (v / name).write_bytes(payload)
+    return v
+
+
+def _autodiscover(home, out_dir):
+    """build.sh with NO argument, so it has to find the binary itself."""
+    return subprocess.run(
+        ["bash", str(BUILD_SH)], capture_output=True, text=True,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(home),
+             "OUT_DIR": str(out_dir), "BUN_BIN": "/nonexistent/bun"})
+
+
+def test_auto_discovery_skips_a_dud_newer_version(tmp_path):
+    """The defect a real Mac exposed on 2026-08-24. An interrupted auto-update
+    left versions/2.1.241 at 0 bytes, sorting NEWER than the 2.1.239 actually
+    in use. `ls | sort -V | tail -1` picked the dud, `-f` accepted it, and the
+    extractor reported "input is only 0 bytes" - which reads as a bug in this
+    repo rather than a broken install on the machine."""
+    home = tmp_path / "home"
+    good = fixtures.build_elf(fixtures.build_payload(
+        [("/$bunfs/root/cli", GOOD_ENTRY, 1)])) + b"\0" * 2_000_000
+    _versions_dir(home, [("2.1.239", good), ("2.1.241", b"")])
+
+    result = _autodiscover(home, tmp_path / "out")
+
+    assert result.returncode == 0, result.stderr
+    assert "2.1.239" in result.stdout
+    assert "ignored unusable version(s)" in result.stderr
+    assert "2.1.241" in result.stderr
+
+
+def test_an_explicitly_passed_stub_is_refused_as_an_install_problem(tmp_path):
+    """-f alone accepted a 0-byte file. The message has to point at the install,
+    not at the container format, or the next person debugs the wrong thing."""
+    stub = tmp_path / "stub.bin"
+    stub.write_bytes(b"")
+
+    result = _build(tmp_path / "out", stub)
+
+    assert result.returncode != 0
+    assert "too small to be a Claude standalone" in result.stderr
+    assert "container magic" not in result.stderr
 
 
 def test_the_gap_list_describes_the_artifact_that_was_just_built(tmp_path):
