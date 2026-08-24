@@ -1,12 +1,23 @@
 """scripts/build.sh end-to-end, driven by synthetic kilobyte-scale binaries.
 
-The property under test is the one the docs' worst-case recovery plan depends
-on: "keep the previous working build/extract/". A rebuild that fails - because
-the input is not a Bun standalone, or because the transform is rejected - must
-leave the last known-good artifacts exactly where they were.
+Two properties are under test.
+
+*The recovery plan.* The docs' worst case is "keep the previous working
+build/extract/". A rebuild that fails - because the input is not a Bun
+standalone, or because the transform is rejected - must leave the last
+known-good artifacts exactly where they were.
+
+*The closing summary describes THIS artifact.* build.sh prints a list of ways
+the build differs from the native binary, and that list is not a constant: the
+image-processing gap is closed in a default build and open in an opt-out one.
+It was previously unasserted - deleting the reassignment left the whole suite
+green while every default build kept announcing a gap it no longer had, which
+is worse than saying nothing, because it sends the reader to findings.md
+looking for the fix to a problem that is already fixed.
 """
 
 import pathlib
+import re
 import shutil
 import subprocess
 
@@ -22,6 +33,23 @@ GOOD_ENTRY = (b"// @bun @bytecode @bun-cjs\n"
 # no trailing `})` -> postprocess.py's check() rejects it and writes nothing
 UNTRANSFORMABLE_ENTRY = b"// @bun\n(function(exports, require, module) { oops\n"
 
+# GOOD_ENTRY has no `Bun.isStandaloneExecutable` gate at all, so the shim finds
+# nothing to do. This one does: the declaration and the image branch, cut down
+# from build/extract/cli.original.js (linux-x64 2.1.222), keeping the anchor
+# string and the branch's own `if(<gate>())try{` shape that postprocess.py
+# selects on. A build from this binary is a SHIMMED build and has to describe
+# itself as one.
+SHIMMABLE_ENTRY = (
+    b"// @bun @bytecode @bun-cjs\n"
+    b"(function(exports, require, module, __filename, __dirname) {\n"
+    b"function CE(){return Bun.isStandaloneExecutable===!0}"
+    b"if(CE()){let r={mode:\"embedded\",command:process.execPath};}"
+    b"async function uYe(){if(Fbo)return Fbo.default;if(CE())try{let r=await "
+    b"Promise.resolve().then(() => (uys(),cys)),n=r.sharp||r.default;return "
+    b"Fbo={default:n},n}catch{console.warn(\"Native image processor not "
+    b"available, falling back to sharp\");return null}}"
+    b"})\n")
+
 
 def _synthetic_binary(path, entry=GOOD_ENTRY):
     payload = fixtures.build_payload([("/$bunfs/root/cli", entry, 1)])
@@ -29,12 +57,21 @@ def _synthetic_binary(path, entry=GOOD_ENTRY):
     return path
 
 
-def _build(out_dir, native):
+def _build(out_dir, native, env=None):
     return subprocess.run(
         ["bash", str(BUILD_SH), str(native)],
         capture_output=True, text=True,
         env={"PATH": "/usr/bin:/bin", "HOME": str(out_dir),
-             "OUT_DIR": str(out_dir), "BUN_BIN": "/nonexistent/bun"})
+             "OUT_DIR": str(out_dir), "BUN_BIN": "/nonexistent/bun",
+             **(env or {})})
+
+
+def _gap_list(result):
+    """The parenthesised list in build.sh's closing `not identical` warning."""
+    match = re.search(r"not identical to the native binary \(([^)]*)\)",
+                      result.stderr)
+    assert match, f"no gap-list warning printed:\n{result.stderr}"
+    return match.group(1)
 
 
 def test_build_sh_produces_the_artifacts(tmp_path):
@@ -115,3 +152,48 @@ def test_a_failed_extraction_leaves_no_staging_directory(tmp_path):
     assert _build(out, shutil.which("ls") or "/bin/ls").returncode != 0
 
     assert sorted(p.name for p in out.glob(".extract*")) == []
+
+
+def test_the_gap_list_describes_the_artifact_that_was_just_built(tmp_path):
+    """A default build closes the image-processing gap, so the summary must not
+    still list it. Asserted as the exact list, not as a substring: the whole
+    defect being pinned here is a stale list that is *nearly* right."""
+    native = _synthetic_binary(tmp_path / "native", entry=SHIMMABLE_ENTRY)
+
+    result = _build(tmp_path / "out", native)
+
+    assert result.returncode == 0, result.stderr
+    assert "image shim APPLIED" in result.stdout
+    assert _gap_list(result) == "sandbox, ripgrep, install identity"
+
+
+def test_an_unshimmable_binary_still_lists_the_image_processing_gap(tmp_path):
+    """The other half, and the reason the list cannot simply be corrected once
+    and hardcoded: this entry module has no gate to rewrite, so the artifact
+    really does still have the gap findings.md 11 describes."""
+    native = _synthetic_binary(tmp_path / "native", entry=GOOD_ENTRY)
+
+    result = _build(tmp_path / "out", native)
+
+    assert result.returncode == 0, result.stderr
+    assert "image shim NOT APPLIED" in result.stderr
+    assert _gap_list(result) == "image processing, sandbox, ripgrep"
+
+
+def test_any_non_empty_opt_out_value_is_an_opt_out_here_too(tmp_path):
+    """build.sh decides with `[ -n ... ]` and postprocess.py with a truthiness
+    test, so both must read `NRC_NO_IMAGE_SHIM=false` as "do not shim". Under
+    the older `!= "1"` rule they disagreed: postprocess.py would shim, build.sh
+    would print the opt-out message, and a shim that genuinely FAILED would be
+    announced as a deliberate choice - the one wording that stops anyone
+    looking. The value here is deliberately not "1" and deliberately reads as
+    false to a human."""
+    native = _synthetic_binary(tmp_path / "native", entry=SHIMMABLE_ENTRY)
+
+    result = _build(tmp_path / "out", native, env={"NRC_NO_IMAGE_SHIM": "false"})
+
+    assert result.returncode == 0, result.stderr
+    assert "image shim applied     : 0" in result.stdout
+    assert "NRC_NO_IMAGE_SHIM is set" in result.stderr, (
+        "the opt-out was honoured but announced as a failure to find the gate")
+    assert _gap_list(result) == "image processing, sandbox, ripgrep"

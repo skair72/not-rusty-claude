@@ -12,6 +12,16 @@
 # Env:
 #   BUN_BIN   bun to check against (default: `command -v bun`)
 #   OUT_DIR   where artifacts land (default: ./build)
+#   NRC_NO_IMAGE_SHIM
+#             ANY non-empty value builds WITHOUT the scoped
+#             isStandaloneExecutable image shim, i.e. exactly what this repo
+#             shipped before it existed. It is the "as shipped" half of the A/B
+#             in docs/findings.md 11; passed straight through to
+#             postprocess.py, which applies the SAME any-non-empty rule. The
+#             two must agree: under a "1"-only rule, NRC_NO_IMAGE_SHIM=false
+#             would shim the artifact here and be announced as an opt-out
+#             below, so a shim that genuinely failed would look deliberate and
+#             nobody would look. Pinned by tests/test_build_script.py.
 
 set -euo pipefail
 
@@ -86,10 +96,62 @@ info "extracting cli.js + assets -> $WORK"
 [ -f "$STAGE/cli.original.js" ] || die "extraction failed: cli.original.js missing"
 
 # 4. Post-process
+#
+# stdout is teed so the shim status can be reported here as well. The log lives
+# INSIDE $STAGE so it is disposed of by whichever path runs next: the EXIT trap
+# rm -rf's $STAGE on failure, and the success path deletes it before the swap -
+# nothing of ours is ever left in $OUT_DIR.
 info "post-processing cli.js for external Bun"
-"$HERE/tools/postprocess.py" "$STAGE"
+POST_LOG="$STAGE/.postprocess.log"
+"$HERE/tools/postprocess.py" "$STAGE" | tee "$POST_LOG"
 [ -f "$STAGE/cli.original.cjs" ] || die "post-process failed: cli.original.cjs missing"
 [ -f "$STAGE/cli.js" ] || die "post-process failed: cli.js sibling missing"
+
+# 4a. Say out loud which of the two artifacts this is. Measured 2026-08-23 by
+# building each real binary both ways: the shimmed and unshimmed outputs are the
+# same length and `cmp -l` reports exactly FOUR differing bytes (`CE()`/`AE()`
+# -> `true`). That difference only becomes visible when someone Reads an image
+# big enough to need resizing - far too late to start wondering which build this
+# was. `grep -o 'if(true)try' <artifact> | wc -l` answers it after the fact: 1
+# shimmed, 0 as shipped, on both binaries.
+SHIM_N="$(sed -n 's/^image shim applied *: *\([0-9][0-9]*\).*/\1/p' "$POST_LOG")"
+# ...and WHY, when it did not apply. postprocess.py prints this line only in
+# that case and it is the only statement of the cause that reaches stdout; the
+# headline below quotes it instead of naming a cause of its own. It used to
+# name one - "a new Claude release renamed the anchor string" - for every
+# refusal alike, and that is wrong for the refusal that does not involve the
+# anchor at all: rebuilding a linux-x64 2.1.222 binary whose gate DECLARATION
+# had been replaced in place with an equal-length arrow form printed exactly
+# that line for an artifact whose anchor was still present exactly once
+# (reproduced on this host 2026-08-24).
+SHIM_WHY="$(sed -n 's/^image shim not applied *: *//p' "$POST_LOG")"
+rm -f "$POST_LOG"
+# ...and remember it, because the closing summary's list of gaps is only true
+# for one of the two builds. Printing the unshimmed list after a shimmed build
+# is worse than printing nothing: it sends the reader to findings.md 11 looking
+# for the fix to a problem this artifact no longer has. Both strings are now
+# asserted in tests/test_build_script.py: without those assertions, deleting
+# either one left the suite green while every build went on making a false
+# claim about its own artifact.
+GAPS="image processing, sandbox, ripgrep"
+if [ "${SHIM_N:-}" = "1" ]; then
+  GAPS="sandbox, ripgrep, install identity"
+  info "image shim APPLIED: the native image-processor branch is reachable,"
+  info "  which is what the Read tool needs to resize a large image. Every other"
+  info "  isStandaloneExecutable gate (ripgrep, sandbox, updater) stays false."
+elif [ -n "${NRC_NO_IMAGE_SHIM:-}" ]; then
+  warn "image shim NOT APPLIED (NRC_NO_IMAGE_SHIM is set): this is the"
+  warn "  'as shipped' build, with the native image-processor branch"
+  warn "  unreachable exactly as in every build before the shim existed."
+else
+  warn "image shim NOT APPLIED: ${SHIM_WHY:-postprocess.py refused; see its warning above}"
+  warn "  The artifact is otherwise fine, just with image processing degraded"
+  warn "  as it was before the shim existed. Drift can be in the gate"
+  warn "  DECLARATION's minified shape, in the anchor string, or in the"
+  warn "  if(<gate>())try{ branch shape, and they are re-measured differently -"
+  warn "  the line above says which one this build hit. See docs/runbook.md's"
+  warn "  troubleshooting table."
+fi
 
 # 4b. Swap the staged build in. Everything above this line is reversible; if any
 # of it failed, the previous $WORK is still untouched on disk.
@@ -108,9 +170,11 @@ printf '        %s %s mcp list\n' "${BUN_BIN:-bun}" "$WORK/cli.original.cjs"
 echo
 # Five lines, not the seventeen this used to print. A wall of warnings after
 # every successful build is a wall nobody reads, and the two that can cost the
-# user something - the updater and the behaviour gap - were buried in it.
+# user something - the updater and the behaviour gap - were buried in it. The
+# gap list is $GAPS, computed above, precisely so this block cannot go stale
+# against the artifact it is describing.
 warn "keep DISABLE_AUTOUPDATER=1: without it, 'claude update' would install a"
 warn "  DIFFERENT, npm-based Claude Code on your machine. Rebuild instead."
-warn "not identical to the native binary (image processing, sandbox, ripgrep):"
-warn "  read docs/findings.md section 11 before real use."
+warn "not identical to the native binary ($GAPS):"
+warn "  those gaps are THIS build's; docs/findings.md section 11 explains them."
 warn "nothing was installed on PATH - run the command above by full path."

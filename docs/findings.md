@@ -339,8 +339,13 @@ invocation. Stripping is necessary only because this project also invokes.
 version headroom — §10.)
 
 `postprocess.py`'s `check()` then refuses to write `cli.original.cjs` at all
-unless **five** conditions hold (it was two, then three, and grew twice as
-review found silent failure modes):
+unless **six** conditions hold (it was two, then three, then five, and grew
+again with the image shim, each time because review found a silent failure
+mode). Counted by AST in `tools/postprocess.py` on 2026-08-24: six conditions,
+eight `errors.append` sites — the sixth reports its three failure shapes
+separately (gate never identified, a rewrite count outside 0..1, and the
+before/after arithmetic), so the message never quotes an expectation the
+numbers already meet:
 
 1. the output starts with `(function`;
 2. an IIFE invocation was appended (`counts["iife"] == 1`; the pattern is
@@ -361,7 +366,14 @@ review found silent failure modes):
 5. it is **not** the case that zero `/$bunfs/` literals were rewritten while
    `assets/` holds files on disk — the "silently asset-less" outcome, which is
    what a wrong VFS prefix (Windows' `B:/~BUN/root/`, [status.md](./status.md)
-   § Windows/PE) would produce.
+   § Windows/PE) would produce;
+6. **the image shim's bookkeeping adds up** (§11's *What shipped*): rewriting
+   one gate call site leaves exactly one fewer `<gate>()` call in the file, and
+   rewriting none leaves the count untouched. It is fatal rather than a note
+   because a text rewrite that *spread* would take the ripgrep gate with it,
+   and that gate's failure mode is a wrong answer rather than an error. What
+   it does not catch is a rewrite aimed at the **wrong** site — it counts how
+   many moved, never which — which is why the site is chosen by shape (§11).
 
 A silently broken output file reaching Bun would surface only as that confusing
 panic — or, for a missing asset, as nothing at all, because both of Claude's
@@ -379,11 +391,32 @@ early instead.
 | leftover `/$bunfs/` references | **0** | **0** |
 | build-machine path notes (informational) | 3 | 3 |
 | never-referenced extracted assets | 0 | 0 |
+| image shim gate | `CE` | `AE` |
+| image shim gate call sites, before → after | **21 → 20** | **23 → 22** |
+| image shim applied | 1 | 1 |
 | size | 22,960,130 → 22,959,448 B | 28,244,743 → 28,244,063 B |
+| shimmed vs `NRC_NO_IMAGE_SHIM` artifact | **4** bytes differ, at 4,337,061 | **4** bytes differ, at 7,104,588 |
+
+Every row was re-measured on this host on **2026-08-24** by rebuilding both
+platforms from the real binaries, and the byte-diff row by rebuilding each with
+and without `NRC_NO_IMAGE_SHIM=1` and comparing the two artifacts. This table is
+where these figures live: README, [status.md](./status.md) and
+[runbook.md](./runbook.md) point at it, and quote build output rather than
+restating numbers. The four differing bytes are `CE()`/`AE()` → `true` in both
+cases; the artifacts come out the same length only because both minified gate
+names happen to be two characters long.
 
 The rewrite count equals the extracted-asset count on both platforms (5 and 9),
 and no "extracted asset never referenced" note was emitted, so every asset
 written to disk is referenced by exactly one rewritten literal.
+
+The size is unchanged by the shim, and deliberately so: `CE()`/`AE()` and
+`true` are both four bytes. Measured 2026-08-23 by building each binary twice,
+once with `NRC_NO_IMAGE_SHIM` set — the two artifacts come out the same length
+and `cmp -l` reports exactly **4** differing bytes, on both platforms. That is
+also why the shim cannot be spotted by looking at a size: the only cheap way to
+tell the two artifacts apart is the build log, which is why `postprocess.py`
+prints the three `image shim` lines above and `build.sh` repeats the verdict.
 
 ### The `fileURLToPath` correction — why the ported regex found nothing
 
@@ -510,6 +543,34 @@ extract-and-run approach is the cleaner one.
   [`patch_claude.py`](../tools/patch_claude.py) (Approach B), kept for edits
   that are **not** in the JS layer.
 
+**What that tool refuses, and why it matters on the real binary.** Its
+byte-patching half is exercised on Linux (`--no-sign`, `--dry-run`) by
+`tests/test_patch_claude.py`; the signing half still needs a Mac. Three
+refusals, all reproduced on this host on 2026-08-24:
+
+- **Hits inside the code signature are dropped, and the skip is printed.**
+  `--old com.anthropic --dry-run` against the shipped 324,973,552-byte
+  `darwin-arm64` Mach-O finds **137** occurrences, and **2** of them
+  (`0x1354BE54`, `0x135E69E5`) land inside `LC_CODE_SIGNATURE`
+  (324,320,704..324,973,552) — they are the signing Identifier
+  `com.anthropic.claude-code`, stored as a literal C string in the
+  CodeDirectory. Patching them is pointless in one direction and corrupting in
+  the other: `codesign --force --sign -` rebuilds the superblob and throws the
+  edit away, while `--no-sign` leaves a CodeDirectory whose own identifier no
+  longer matches the hashes around it. (Those two consequences are **reasoned
+  from the Mach-O layout, not run** — there is no `codesign` on this host. What
+  *was* run is the location of the hits.) Either way the count the tool printed
+  would not be the count that survives, so it now prints
+  `Found 137 occurrence(s); patching 135` and says which two it dropped.
+  `--patch-signature` overrides.
+- **A signing run on a host with no `codesign` stops before it creates
+  anything.** It used to end in an unhandled `FileNotFoundError` *after*
+  copying the input to the destination, leaving a verbatim **unpatched** copy
+  of the binary under the name the user asked for, with nothing in the output
+  saying so. Now: one sentence, exit 1, and no file at `--out`.
+- **`--out <the input>` is refused** (`samefile`, so a symlink or hard link is
+  caught too) rather than answered as an in-place patch with no `.bak`.
+
 ---
 
 ## 8. Ready-made tools (prior art) 📄
@@ -595,6 +656,14 @@ Mach-O arm64 binary in about 1.3 seconds — **on Linux, with no Mac involved**,
 and the `win32-x64` package delivered the PE the same way. Each tarball's
 `package.json` carries the exact version, `os`, and `cpu`, so the artifact
 identifies itself.
+
+**It gives you the current release, not this document's.** Re-run here on
+2026-08-24, the same command returned
+`anthropic-ai-claude-code-darwin-arm64-2.1.241.tgz` (92,295,033 bytes) — two
+releases past the 2.1.239 copy every darwin measurement in this file was taken
+against. Check the `version` in the tarball's `package.json` before comparing
+any count here with what your build prints; a mismatch is the release tripwire
+working ([status.md](./status.md) § Remaining work #1), not a broken tool.
 
 This is what made cross-platform verification possible at all. Extraction is
 byte arithmetic over a file; it does not care what OS can *execute* that file.
@@ -760,28 +829,79 @@ rather than a contract.
 
 ## 11. The equivalence gap: this is not the same program ⚠️✅
 
-**New section, 2026-08-22.** Everything above answers *does it run*. This
-answers *does it behave the same as the binary Anthropic ships*, and the answer
-is **no**. Read this before deciding whether to use this project. The word
-`isStandaloneExecutable` appeared **nowhere in this repository** before this
-section existed.
+**New section, 2026-08-22. Partly closed 2026-08-23.** Everything above answers
+*does it run*. This answers *does it behave the same as the binary Anthropic
+ships*, and the answer is still **no** — but one of the five consequences below
+is now fixed in a default build, and the rest are unchanged. Read this before
+deciding whether to use this project. The word `isStandaloneExecutable`
+appeared **nowhere in this repository** before this section existed.
+
+- **Closed** (default builds, since 2026-08-23): native image processing —
+  see *What shipped: the scoped shim*, at the end of this section.
+- **Open, and deliberately so**: the seccomp sandbox, embedded ripgrep, install
+  identity. Each is a refusal with a reason, tabulated there.
+- **Open, and not a gate at all**: both addon loaders swallow their own
+  failures, so `exit 0` still is not evidence that the asset wiring works.
 
 Claude Code decides at runtime whether it is a Bun standalone with one
 function:
 
 ```js
-function CE(){return Bun.isStandaloneExecutable===!0}
+function CE(){return Bun.isStandaloneExecutable===!0}                  // linux-x64 2.1.222
+function AE(){return typeof Bun<"u"&&Bun.isStandaloneExecutable===!0}  // darwin-arm64 2.1.239
 ```
 
 Under an external Bun that property is `undefined` (1.3.14) or `false` (1.4.0)
-✅, so `CE()` is **false** and the CLI takes its non-standalone branch at all
-**21** call sites. Most of those are correct — the generic self-spawn helper,
-for instance, has a proper `{cmd: process.execPath, prefixArgs: [process.argv[1]]}`
-branch. Some are not.
+✅, so the gate is **false** and the CLI takes its non-standalone branch at
+every call site. **The number of call sites is a fact about one binary, not
+about Claude.** Measured 2026-08-23 with `tools/postprocess.py`'s own counter:
+
+| binary | gate | call sites (declaration excluded) |
+|---|---|---|
+| `linux-x64` 2.1.222 | `CE` | **21** |
+| `darwin-arm64` 2.1.239 | `AE` | **23** |
+
+This document said "21" without that qualification, and everything below is
+measured on the linux build unless it says otherwise.
+
+> **A trap for anyone re-deriving the count — recorded because it caught us.**
+> A `\b`-style word boundary over-counts: a bare `CE\(\)` search finds **26**
+> hits on linux-x64 2.1.222 — 21 real call sites, 4 substrings of `isGCE()` /
+> `_checkIsGCE()` (`get isGCE()`, `async _checkIsGCE()`, and `this._checkIsGCE()`
+> twice), and the declaration `function CE(){`, which contains `CE()` too. This
+> paragraph used to say 25, which is the count **with the declaration
+> excluded** — the convention the table above states and a bare search does not
+> apply for you. An off-by-one in the paragraph warning about naive counting;
+> re-measured 2026-08-23, both figures, on the extracted `cli.original.js`.
+> (`AE\(\)` finds 26 on darwin as well, by a different composition: 23 call
+> sites, the declaration, and the tails of `function IAE()` and `function
+> jAE()`.) The obvious fix is a lookbehind, and the obvious lookbehind is
+> wrong. Excluding a preceding `.` as well (`(?<![\w$.])`) drops the count to
+> **18** on linux and **20** on darwin (declaration excluded, as in the table),
+> and a session on this branch reported 18 as the true figure on that basis.
+> It is not: the three excluded sites are real, and they look like this —
+>
+> ```js
+> let e=process.execPath,r=[...CE()?[e]:[e,process.argv[1]]];
+> ```
+>
+> — where the dot is the tail of a **spread** operator, not a member access.
+> There are exactly 3 such sites in each of the two binaries. `postprocess.py`
+> uses `(?<![\w$])` for exactly this reason, and says so in
+> `_gate_call_re`'s docstring: dropping those three would leave the shim's
+> safety invariant blind to a rewrite that spread into them. **21 is right.**
+> The 18 that briefly replaced it in a session summary was wrong, and that
+> correction is itself hereby retracted — the repo keeps its retractions, so
+> here is one of a retraction.
+
+Most of the sites are correct — the generic self-spawn helper, for instance,
+has a proper `{cmd: process.execPath, prefixArgs: [process.argv[1]]}` branch.
+Some are not.
 
 ### Measured consequences
 
-**1. Native image processing is silently disabled.** The image path is
+**1. Native image processing is silently disabled — fixed in a default build
+since 2026-08-23, and still true for an opt-out build.** The image path is
 
 ```js
 async function uYe(){ if(Fbo)return Fbo.default;
@@ -791,19 +911,36 @@ async function uYe(){ if(Fbo)return Fbo.default;
 
 With `CE()` false the native branch is **never attempted** — not tried and
 failed, *unreachable by construction* — and the fallback is a bundled JS sharp
-that needs libvips, which is not among the extracted assets. Measured
-end-to-end through the mock loop above, reading a 3000×3000 PNG with the
-**Read** tool ✅:
+that needs libvips, which is not among the extracted assets.
+
+**This half of the gap is now closed in a default build** — see *What shipped*
+below. The measurement that established it is still the one that matters, and
+it is now reproducible with one command:
+`scripts/ab-equivalence.sh --case read`. Reading the deterministic 3000×3000
+PNG generated below (2,329,429 bytes here; the length is zlib-dependent, the
+pixels are not) with the **Read** tool, through the
+committed loopback mock, measured 2026-08-23 on this host with Bun 1.3.14 and
+`linux-x64` 2.1.222 ✅:
 
 | build | tool result |
 |---|---|
-| as shipped | `is_error: true` — *"Unable to resize image — dimensions exceed the 2000x2000px limit and image processing failed."* |
-| same artifact, `Bun.isStandaloneExecutable` forced `true` | a correct JPEG (`ff d8 ff e0`), `media_type: image/jpeg` |
+| as shipped (`NRC_NO_IMAGE_SHIM=1`) | `is_error: true` — *"Unable to resize image — dimensions exceed the 2000x2000px limit and image processing failed."* |
+| shimmed (the default build) | a correct JPEG: `media_type: image/jpeg`, magic `ff d8 ff e0` |
+| the global flip, for comparison | the same JPEG — and a broken `Grep`, below |
 
-The flip itself is what reproduces; the JPEG's exact size does not, and this
-table used to quote one. It depended on a source PNG that is not in this repo,
-so an independent A/B measured a different number for the same qualitative
-result. Byte counts are only quoted here when the input is reproducible.
+The flip is what reproduces across hosts; the JPEG's exact size is a property
+of this addon build, and this table used to quote one taken against a source
+PNG that was not in the repo, so an independent A/B measured a different number
+for the same qualitative result. That number was retracted, and the rule it
+produced still holds: **byte counts are only quoted here when the input is
+reproducible**. The input now is — the harness generates it and verifies it
+before running: dimensions, colour type, every chunk CRC, and the md5 of the
+decoded scanlines (`95adc51dc27c1ad40b52df01793235e2` over 27,003,000 bytes).
+It deliberately does *not* assert the compressed file size, which is a
+property of the local zlib rather than of the image; see the note under the
+A/B table below. So, for the record and with the host stated: the JPEG came
+back at **494,476 bytes** decoded, identical on the shimmed and
+globally-flipped sides of the same run (re-measured 2026-08-24).
 
 The addon itself is fine, and **that** part is reproducible end to end ✅ —
 generate a deterministic 3000×3000 PNG with stock `python3`:
@@ -825,7 +962,12 @@ open(sys.argv[1], "wb").write(
     + chunk(b"IDAT", zlib.compress(bytes(raw), 6))
     + chunk(b"IEND", b""))
 EOF
-#   → /tmp/gradient-3000.png, exactly 2,329,429 bytes
+#   → /tmp/gradient-3000.png. 2,329,429 bytes on this host - but that figure is
+#     a property of the LOCAL zlib, not of the image: the scanlines are
+#     deterministic, the deflate of them is not. Identify the file by its
+#     decoded content (3000x3000 rgb8, 27,003,000 raw bytes,
+#     md5 95adc51dc27c1ad40b52df01793235e2), which is what the A/B harness
+#     asserts.
 ```
 
 then drive the extracted addon directly, the way the CLI's wrapper does
@@ -863,8 +1005,9 @@ metadata: {"width":3000,"height":3000,"format":"png"}
 jpeg bytes: 919331 magic: ff d8 ff e0
 ```
 
-Extraction and path rewriting are not the problem. **The CLI simply never asks
-for it.**
+Extraction and path rewriting are not the problem. **The CLI simply never asked
+for it** — which is what the scoped shim below changes, and only for this one
+gate.
 
 **2. `exit 0` is not evidence that the asset wiring works.** Both addon loaders
 swallow failure:
@@ -889,29 +1032,247 @@ the miss is *"ripgrep not found on PATH … or use the native claude binary whic
 embeds it."*
 
 **5. Install identity reports `unknown`.** Which is what makes the auto-updater
-hazardous — see [runbook.md](./runbook.md) § Surviving Claude updates. `doctor`,
-A/B on the same artifact ✅:
+hazardous — see [runbook.md](./runbook.md) § Surviving Claude updates. `doctor`
+on the three sides, measured 2026-08-23 with
+`scripts/ab-equivalence.sh --case doctor` ✅:
 
 ```
-as shipped                     forced isStandaloneExecutable=true
-  Running: unknown (2.1.222)     Running: native (2.1.222)
-  Search: OK (/usr/bin/rg)       Search: OK (bundled)
+as shipped                     shimmed (default build)        globally flipped
+  Running: unknown (2.1.222)     Running: unknown (2.1.222)     Running: native (2.1.222)
+  Search: OK (/usr/bin/rg)       Search: OK (/usr/bin/rg)       Search: OK (bundled)
 ```
+
+The middle column is the point: the shim moved the image gate and **nothing
+else**, so install identity — a different gate site — still answers `unknown`,
+and search still uses the system `rg`. The right-hand column is the control
+that proves the case can tell the two apart at all.
 
 ### Do not "fix" this by flipping the flag globally
 
 The obvious patch — define `Bun.isStandaloneExecutable = true` — makes the
 image path work and immediately breaks search, because "embedded ripgrep" then
 means *"re-exec `process.execPath` with argv0 `rg`"*, and `process.execPath` is
-**bun**. Measured with the same `Grep` call through the mock loop ✅:
+**bun**. Measured with the same `Grep` call through the mock loop, and
+re-measured 2026-08-23 with `scripts/ab-equivalence.sh --case grep` ✅:
 
 | build | Grep for a string that exists in the tree |
 |---|---|
 | as shipped | `hay/a.txt:1:NEEDLE-12345` |
+| shimmed (the default build) | `hay/a.txt:1:NEEDLE-12345` |
 | flag forced true | **`No matches found`** |
 
-Not an error — a *silently wrong answer*. Any shim here must be scoped to the
-image-processor call site, and is deliberately **not** implemented yet.
+Not an error — a *silently wrong answer*. This measurement is the reason the
+shim below is shaped the way it is, so it is no longer a paragraph: the harness
+carries the global flip as a **third side** and asserts the breakage. If a
+future Bun or Claude ever makes the global flip harmless, that assertion goes
+red — which is a result, not a bug in the harness: the premise this design
+rests on would have expired.
+
+### What shipped: the scoped shim ✅
+
+**Implemented 2026-08-23** (`tools/postprocess.py`, design of record:
+[`docs/superpowers/specs/2026-08-23-scoped-image-shim-design.md`](./superpowers/specs/2026-08-23-scoped-image-shim-design.md)).
+This subsection replaces the sentence that used to close §11 — *"any shim here
+must be scoped to the image-processor call site, and is deliberately not
+implemented yet"*. It is implemented; the scoping requirement it stated is what
+the implementation obeys.
+
+**What it is.** One more text rewrite in `postprocess.py`'s existing pass, over
+the entry module's source: the image branch's own gate call is replaced by the
+literal `true`. Nothing is defined, patched or monkey-patched at runtime, and
+`Bun.isStandaloneExecutable` itself is never touched.
+
+**What it is scoped to.** Exactly one call site, chosen by **shape**, not by
+proximity: the branch's own guard `if(<gate>())try{`, searched for in the 400
+bytes before the anchor string `Native image processor not available`.
+Measured on both entry modules 2026-08-23: the anchor occurs **once** in each
+file, the `if(<gate>())try{` shape occurs **once** in each whole file, and the
+guard starts **132** bytes before the anchor in both. Proximity alone would not
+be safe — see *Why not the nearest call*, below.
+
+**What stays false, and why.** Every other gate site: the count drops by
+exactly one on each binary, and the artifact differs from the unshimmed one by
+exactly **4** bytes. Both figures, per platform, are §6's table — see
+*The measured counts*; they are not repeated here so that they cannot disagree
+with it.
+
+| gate site | why it stays false |
+|---|---|
+| embedded ripgrep | flipping it is the measured `No matches found` above — a wrong answer, not an error |
+| seccomp sandbox (`kms`) | it would arm a sandbox whose `/proc/self/exe` is `bun`; unverified, and a wrong sandbox is worse than a documented missing one |
+| install identity / updater | `DISABLE_AUTOUPDATER=1` already covers the hazard, and reporting `native` would make the updater's story *less* true |
+| the two MCP self-spawns | the non-standalone branch is correct, and the `cli.js` sibling (§6) already serves it |
+| telemetry `is_native_binary` | reporting `native` would be a lie |
+
+**Why not the nearest call.** The first version of this shim rewrote the last
+gate call before the anchor. A reviewer broke it with an entry module whose
+image function has lost its own `if(<gate>())` but kept the anchor: the nearest
+preceding gate call is then **embedded ripgrep's**, and rewriting *that* passes
+every arithmetic check the transform makes, because the count invariant asks
+how many sites moved and never which. The build would have shipped clean with
+`Grep` silently wrong. Hence selection by shape, and hence
+`tests/test_image_shim.py::test_a_lost_image_guard_does_not_hand_the_rewrite_to_ripgrep`,
+which is that exploit kept as a test. For scale: the nearest *other* gate call
+is 506,792 bytes away on linux-x64 2.1.222 and 1,732,905 bytes away on
+darwin-arm64 2.1.239 (measured 2026-08-23), so the 400-byte window is not what
+is keeping ripgrep safe — the shape is.
+
+**Why not the first declaration, either.** A re-review pass ran the same attack
+one level up. Selecting the *site* by shape still left the gate's *name*
+selected by position — `STANDALONE_DEF.search()`, the first declaration in file
+order. An entry module declaring two differently named
+`Bun.isStandaloneExecutable` gates, `ZZ` before the real `CE`, with the image
+branch correctly on `if(CE())try{` and an `if(ZZ())try{` in the window, made
+`ZZ` "the gate": its branch was rewritten, `applied` reported 1, its call sites
+went 1 → 0, the arithmetic balanced, `check()` returned clean — and image
+processing was still off, with a gate nobody had looked at now true. The shim
+now refuses a file that declares more than one *distinct* gate name (two
+declarations of the *same* name are not an ambiguity and still shim), the same
+way it already refused a duplicated anchor. Measured on this host 2026-08-23:
+exactly one declaration in each real entry module, `CE` in the 22,960,130-byte
+linux-x64 2.1.222 module and `AE` in the 28,244,743-byte darwin-arm64 2.1.239
+one — the artifact this repo builds from `/usr/bin/claude` is byte-identical
+before and after the change.
+
+**When it does not apply.** A renamed anchor or a restructured function is a
+**warning, not a build failure**: the artifact degrades to exactly what this
+repo shipped before the shim existed. `postprocess.py` prints the gate name,
+the before → after counts and the applied count on stdout either way, and
+`build.sh` prints an explicit verdict line and adjusts its closing list of
+gaps.
+
+**The refusal now names *which* thing drifted**, because three different
+things can drift and they are not interchangeable: the gate **declaration**'s
+minified shape, the **anchor** string, or the `if(<gate>())try{` branch shape.
+`postprocess.py` emits the cause on stdout as `image shim not applied : …`
+and `build.sh` quotes that line instead of guessing.
+
+It used to guess, and the guess was measurably wrong. Reproduced here on
+2026-08-24, both revisions, same input: a copy of this host's `/usr/bin/claude`
+whose single 53-byte gate declaration `function CE(){return
+Bun.isStandaloneExecutable===!0}` (one occurrence, at offset 260,565,233) was
+replaced in place with an equal-length arrow form, anchor untouched. The old
+build exits 0 and closes with *"Most likely a new Claude release renamed the
+anchor string"* — for an artifact that still holds
+`Native image processor not available` exactly once — and prints
+`image shim call sites  : 0 -> 0` for an entry module with **21** live `CE()`
+call sites in it. The new build names the declaration, says in the same
+sentence that the anchor is not implicated, and prints
+`image shim call sites  : not counted (no gate identified)`: where no gate can
+be named, nothing was counted, and `0` is not a synonym for "unknown" — it is
+a claim about the artifact, and that claim measured false. `check()` now also
+treats a rewrite *claimed* against a gate nobody identified as the same fatal
+bookkeeping failure as arithmetic that does not balance.
+
+**Opting out.** `NRC_NO_IMAGE_SHIM` set to **any non-empty value** builds the
+"as shipped" artifact. Both `build.sh` (`[ -n … ]`) and `postprocess.py`
+(a truthiness test) use that one rule; they have to agree, or a shim that
+genuinely *failed* gets announced as a deliberate choice, which is the one
+wording that stops anyone looking. Verified 2026-08-23 with
+`NRC_NO_IMAGE_SHIM=false` and `NRC_NO_IMAGE_SHIM=yes` on both real binaries,
+and pinned by
+`tests/test_build_script.py::test_any_non_empty_opt_out_value_is_an_opt_out_here_too`.
+
+### Reproducing the A/B ✅
+
+The harness is committed — it used to live in `/tmp`, which is why §11's
+evidence was, for a while, unreproducible:
+
+```bash
+# builds three sides from /usr/bin/claude and drives each through the
+# loopback mock: as-shipped, shimmed, and the globally-flipped artifact
+BUN_BIN="$HOME/.bun-1.3.14/bun" scripts/ab-equivalence.sh
+scripts/ab-equivalence.sh --case grep                        # one case at a time
+scripts/ab-equivalence.sh --as-shipped OUT_A/extract \
+                          --shimmed    OUT_B/extract         # reuse two builds
+```
+
+It needs `node` for the mock and `rg` on `PATH` — an extracted build has no
+embedded ripgrep, which is point 4 above arriving as a case failure rather than
+as an explanation — and it is **Linux-only**. The egress guard below reads
+`/proc/<pid>/fd` against `/proc/net/tcp`, and there is no portable substitute
+in here yet, so the script refuses to start where `/proc` is unreadable rather
+than run the comparison with its own safety net silently missing. A preflight
+names every missing prerequisite in one message instead of dying at whichever
+line comes first (checked again 2026-08-24 with `bun` and `node` both hidden:
+both reported together, exit 1; the `/proc` branch itself cannot be exercised
+on this host, which refuses `unshare`, so what a Mac would see there is read
+from the script rather than observed). Nothing else in the script is
+Linux-specific — sizes and md5s go through `python3` rather than `stat -c` /
+`md5sum`. The per-case timeout does **not** fall back to a shell watchdog, and
+this paragraph used to say it did: `timeout(1)` (or `gtimeout`) is a hard
+preflight requirement. The fallback that used to sit there could only ever have
+run on a host with neither binary — i.e. a stock macOS — which the `/proc`
+check refuses two checks earlier, so it was unreachable code that this document
+was advertising as a portability guarantee.
+
+Four cases (`bash`, `grep`, `read`, `doctor`) × three sides. Every expectation
+is explicit per side, so the script *fails* rather than merely printing when a
+side stops behaving as this document says; it also polls `/proc/<pid>/fd`
+against `/proc/net/tcp` for the whole process tree — parent chain walked, so
+a socket opened by the Bash tool's subprocess or by `rg` is attributed to the
+run that spawned it — and fails on any non-loopback socket.
+
+Three things it now also fails on, each because an empty `egress=` line was
+otherwise indistinguishable from a guard that was not working:
+
+- the poller not reporting that it ran to the end (being SIGTERMed is the
+  *normal* end of a case, so "the poller is gone" cannot mean "clean");
+- the poller attributing **zero** sockets to a turn-driving case, which means
+  it was watching the wrong processes;
+- the mock's log showing a `stream=false` request, which means the CLI
+  abandoned the SSE stream and the turn came off the non-streaming fallback —
+  a code path a real API run never takes.
+
+Re-run in full on 2026-08-24 against `linux-x64` 2.1.222 under Bun 1.3.14
+(node v22.23.2 for the mock): four cases × three sides, twelve runs, `all
+expected results reproduced`, exit 0. All twelve `egress=` lines empty, all
+twelve `egress_guard=` lines `OK`.
+
+**The invariant is: zero non-loopback sockets on every run, and at least one
+socket attributed to every run that drives an API turn.** *How many* sockets a
+run opens is not an invariant, and is deliberately not written down here or in
+the script's header. It moves from run to run — `doctor` drives no API turn, so
+its sides may open one socket or none — and three write-ups of that number in
+this repo ended up disagreeing with each other, which is exactly what a
+run-to-run variable frozen into prose does. The harness enforces the invariant
+itself and prints its own count on every `egress_guard=` line
+(`sockets=… loopback=… non_loopback=…`), so the number is available where it is
+true: in the output of the run in front of you. It fails on any non-loopback
+socket, and separately on a turn-driving case to which it attributed no socket
+at all — an empty `egress=` line from a guard that was watching the wrong
+processes is otherwise indistinguishable from a clean one.
+
+| case | as shipped | shimmed | globally flipped |
+|---|---|---|---|
+| `read` (3000×3000 PNG) | *"Unable to resize image…"* | JPEG, `ff d8 ff e0` | JPEG, `ff d8 ff e0` |
+| `grep` (string that exists) | `hay/a.txt:1:NEEDLE-12345` | `hay/a.txt:1:NEEDLE-12345` | **`No matches found`** |
+| `doctor` | `Running: unknown` | `Running: unknown` | `Running: native` |
+| `bash` (control) | `HELLO-FROM-SUBPROCESS\nLinux` | `HELLO-FROM-SUBPROCESS\nLinux` | `HELLO-FROM-SUBPROCESS\nLinux` |
+
+The `bash` row is the control: a case that comes out the same on all three
+sides is what tells you the harness is comparing artifacts rather than
+comparing failures. Its `\n` is literal — the harness escapes a tool_result
+onto one line, and the escape is load-bearing rather than cosmetic: the
+comparison pulls the value back out with `sed -n 's/^tool_result=//p'`, which
+matches only the line that starts with that prefix, so before the escaping
+existed the `Linux` half was dropped from both the expectation check and the
+SAME/DIFFERS verdict and two sides differing only after line 1 would have been
+reported SAME. The probe is `echo HELLO-FROM-SUBPROCESS; uname -s`, so `Linux`
+is the second line, and the whole two-line value is what the row asserts.
+
+The `read` row's shimmed and globally-flipped sides are the same JPEG:
+`IMAGE media=image/jpeg decoded_bytes=494476 magic=ff d8 ff e0`, from the
+2,329,429-byte 3000×3000 fixture (2026-08-24). The fixture is checked on its
+**decoded** content — dimensions, colour type and the md5 of its 27,003,000
+scanline bytes, `95adc51dc27c1ad40b52df01793235e2` — and not on its file size:
+the compressed length is a property of the local deflate, not of the image
+(measured here 2026-08-24: the same 27,003,000 scanline bytes at level 6
+deflate to a 2,329,372-byte IDAT through this `python3`'s zlib 1.2.13 and a
+2,329,196-byte one through node v22's zlib 1.3.1-e00f703 — 2,329,429 and
+2,329,253 bytes on disk once the 57 bytes of PNG framing are added). A hard
+size assertion there was a `die` in fixture setup, before any case ran, for
+anyone whose `python3` links a different-but-correct zlib.
 
 ## Appendix: exact commands used ✅
 
@@ -928,9 +1289,13 @@ BUN_BIN="$HOME/.bun-1.3.14/bun" scripts/build.sh /usr/bin/claude
 
 # the same pipeline against the real macOS binary, on Linux
 npm pack @anthropic-ai/claude-code-darwin-arm64                    # → a .tgz
+#   re-run 2026-08-24: returns whatever version is CURRENT (2.1.241 that day),
+#   not the 2.1.239 these numbers were measured against - see §9.
 # The tarball's payload is named `claude`. This repo never creates a file by
 # that name - a stray `claude` is exactly what could later be found on a PATH
 # and shadow a real installation - so rename it as it comes out of the archive.
+# Re-checked 2026-08-24: the transform below yields a thin arm64 Mach-O
+# (cf fa ed fe) at the size §1's table records for darwin-arm64.
 mkdir -p /tmp/ccmac
 tar xf anthropic-ai-claude-code-darwin-arm64-*.tgz -C /tmp/ccmac \
     --transform='s|package/claude$|package/claude-darwin-arm64.bin|'
@@ -949,11 +1314,19 @@ OUT_DIR=/tmp/macbuild scripts/build.sh /tmp/ccmac/package/claude-darwin-arm64.bi
 DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \
   "$HOME/.bun-1.3.14/bun" build/extract/cli.original.cjs mcp list
 
-# regression. The count depends on what this host has: 86 passed with both real
-# binaries and a Bun; 83/3 skipped without the Mach-O one; 80/6 with neither;
-# 77/9 with no Bun either. NRC_TEST_ELF / NRC_TEST_MACHO / BUN_BIN override the
-# paths (see README's table).
-python3 -m pytest tests/ -q            # 86 passed, on a host with both binaries
+# regression. What this prints depends on what the host has; NRC_TEST_ELF /
+# NRC_TEST_MACHO / BUN_BIN override the paths. The four per-host counts are
+# NOT repeated here - README's table is the single place that states them,
+# along with the exact invocation that forces each row. Four counts used to
+# live here as well, contradicting README's table from the commit that
+# introduced them (9c98027: README said 199 passed, this block said 190) and
+# ten too low by 18916ca - under this section's own promise that every command
+# below was run on this host. A number that lives in one place cannot drift
+# against itself.
+python3 -m pytest tests/ -q
+
+# the equivalence A/B, three sides through the committed loopback mock
+BUN_BIN="$HOME/.bun-1.3.14/bun" scripts/ab-equivalence.sh
 ```
 
 `scripts/syntax-check.js` is a **secondary** check only: `new Function(source)`
