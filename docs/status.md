@@ -17,11 +17,18 @@ risk in §10, and it is a *positive* one **for that version, on that platform,
 on those code paths** — nothing wider.
 
 ⚠️ **"It runs" is not "it behaves the same as the shipped binary."** Because
-`Bun.isStandaloneExecutable` is not defined outside a standalone, ~21 branches
-in the CLI take their non-standalone path: native image processing is
-unreachable, the seccomp sandbox is off, embedded ripgrep becomes a system
-`rg`, and install identity reports `unknown`. Read
-[findings.md](./findings.md) **§11** before relying on this build.
+`Bun.isStandaloneExecutable` is not defined outside a standalone, every branch
+in the CLI that asks takes its non-standalone path — 21 call sites on
+`linux-x64` 2.1.222 and 23 on `darwin-arm64` 2.1.239 (the number is a fact
+about one binary, re-measured 2026-08-23). The seccomp sandbox is off, embedded
+ripgrep becomes a system `rg`, and install identity reports `unknown`.
+
+**One of those consequences is now fixed.** Since 2026-08-23 `postprocess.py`
+rewrites the *one* gate call that guards native image processing, so a default
+build can resize a large image; every other gate stays false, deliberately, and
+`NRC_NO_IMAGE_SHIM` set to any non-empty value builds the old artifact. Read
+[findings.md](./findings.md) **§11** — in particular *What shipped: the scoped
+shim* — before relying on this build.
 
 The single evidence record is
 [**verification-2026-08-22.md**](./verification-2026-08-22.md): every command
@@ -72,9 +79,10 @@ installed on this host, the macOS and Windows binaries were downloaded from npm
 | `scripts/build.sh` end to end | ✅ (Step 2) | ✅ (Step 3b) | ⛔ |
 | Output accepted by Bun 1.3.14's parser | 🔎 `bun build --no-bundle`, exit 0 (Step 3) | 🔎 `bun build --no-bundle`, exit 0 (Step 3b) | ⛔ |
 | **Runs under external Bun** | ✅ `doctor`, `mcp list`, `--help`, `--version` all exit 0 on **1.3.14 and 1.4.0** (Steps 5, 5b + addendum) | ✅ the darwin JS boots under **Linux** Bun → `2.1.239 (Claude Code)`; macOS-*specific* behaviour still needs a Mac | ⛔ would also need a Windows Bun |
-| Runtime asset (`assets/*`) resolution | ✅ `image-processor.node` loads and works through the rewritten path; but the CLI never asks for it — [findings.md](./findings.md) §11 | 🔎 static only (Mach-O addons cannot dlopen on Linux) | ⛔ |
-| **Behaves the same as the native binary** | ⚠️ **No.** Native image processing unreachable, seccomp sandbox off, embedded ripgrep → system `rg`, install identity `unknown` — all measured, all §11 | ⚠️ same by construction (same `CE()` branches) | ⛔ |
-| Test suite | ✅ **86 passed** with both real binaries present (77 passed / 9 skipped on a host with neither binary nor Bun — see README's table) | ✅ same run | — |
+| Runtime asset (`assets/*`) resolution | ✅ `image-processor.node` loads and works through the rewritten path — and since the scoped shim (2026-08-23) the CLI does ask for it: a **Read** of a 3000×3000 PNG comes back a JPEG, measured end to end through the committed mock ([findings.md](./findings.md) §11) | 🔎 static only (Mach-O addons cannot dlopen on Linux) | ⛔ |
+| **Behaves the same as the native binary** | ⚠️ **No.** Seccomp sandbox off, embedded ripgrep → system `rg`, install identity `unknown` — all measured, all §11. Native image processing **is** reachable in a default build since 2026-08-23 (scoped shim, §11) | ⚠️ same by construction (same gate branches; the shim applies here too — `AE`, 23 → 22 call sites) | ⛔ |
+| Scoped image shim applied | ✅ `CE`, call sites 21 → 20, artifact 4 bytes from the unshimmed one (2026-08-23) | ✅ `AE`, 23 → 22, likewise 4 bytes — built here, **not** executed on a Mac | ⛔ |
+| Test suite | ✅ **200 passed** with both real binaries and a Bun present (187 passed / 13 skipped on a host with neither binary nor Bun — see README's table) | ✅ same run | — |
 | Approach B: byte-patch + re-sign (`tools/patch_claude.py`) | n/a (macOS-only concern) | 📓 verified 2026-08-21 on 2.1.238; not re-checked here | n/a |
 
 Step numbers refer to sections of
@@ -86,7 +94,11 @@ the real binaries are present: `NRC_TEST_ELF` (default `/usr/bin/claude`) and
 the older `/tmp/ccmac/package/claude` still accepted), plus `BUN_BIN` (default
 `~/.bun-1.3.14/bun`, then `bun` on `PATH`) for the tests that actually boot the
 artifact. Without them the suite skips those tests and still passes, which is
-why a bare "86 passed" needs the host stated alongside it.
+why a bare "200 passed" needs the host stated alongside it. All four counts
+were re-measured on this host on 2026-08-23, after the last test landed, and
+they still sum to the 200 tests `--collect-only` reports; README's table says
+how each row was forced, including the `PYTHONPATH` the no-Bun row needs on a
+host whose pytest is a `--user` install.
 
 The macOS column is worth reading twice: **extraction, post-processing *and*
 execution of the real Mach-O binary's JavaScript are not a projection — they
@@ -244,35 +256,45 @@ part that genuinely needs the hardware. See
 
 ### 3. Close the equivalence gap ⚠️
 
-**Reframed 2026-08-22.** This item used to read "verify runtime asset
-resolution", on the assumption that nothing was known about whether the
-rewritten paths work. That much is now settled in the *good* direction, and a
-worse problem was found underneath it.
+**Reframed 2026-08-22. Image half closed 2026-08-23.** This item used to read
+"verify runtime asset resolution", on the assumption that nothing was known
+about whether the rewritten paths work. That much is now settled in the *good*
+direction, a worse problem was found underneath it, and one part of that
+problem has since been fixed.
 
 - **Settled** ✅: `require("<extract>/assets/image-processor.node")` under Bun
   1.3.14 loads and works — it reads a 3000×3000 PNG's metadata and resizes it
   to a valid JPEG. The rewritten `require('path').join(__dirname,'assets',…)`
   shape is correct. The three `file`-loader assets also read back through the
   same shape via `fs/promises.readFile`: 208,522 / 955,678 / 3,312,874 chars.
-- **The real problem** (findings §11): the CLI *never asks* for the native
+- **The real problem** (findings §11): the CLI *never asked* for the native
   image processor, because that call site is gated on
   `Bun.isStandaloneExecutable`, which is undefined outside a standalone.
   Measured: as shipped, reading a 3000×3000 PNG fails with *"Unable to resize
-  image…"*; with the flag forced true, the same artifact returns a correct
-  JPEG. (The flip reproduces; the JPEG's exact size does not, because the
-  source PNG is not in this repo — findings §11 ships a generator and a
-  reproducible direct-addon measurement instead.) The seccomp sandbox is off,
-  embedded ripgrep degrades to a system `rg`, and install identity is
-  `unknown`, for the same reason.
+  image…"*; with the gate true, the same artifact returns a correct JPEG. The
+  seccomp sandbox is off, embedded ripgrep degrades to a system `rg`, and
+  install identity is `unknown`, for the same reason.
 - **Also settled, and it matters for every "exit 0" claim in this repo:** both
   addon loaders swallow failure (`try{…}catch{ …=null }`), so a missing or
   broken asset degrades silently. **Exit 0 is not evidence that asset wiring
   works.**
-- **Fix:** shim `Bun.isStandaloneExecutable` **scoped to the image-processor
-  call site only**. A global flip breaks search: "embedded ripgrep" then means
-  re-exec `process.execPath` (bun) with argv0 `rg`, and a `Grep` for a string
-  that exists returns `No matches found` — silently wrong, not an error.
-  Deliberately not implemented yet.
+- **Fixed, for the image half** ✅ (2026-08-23, findings §11 *What shipped*):
+  `postprocess.py` rewrites the image branch's own gate call — and only that
+  one — to `true`, selecting it by the shape `if(<gate>())try{` in the 400
+  bytes before the anchor string `Native image processor not available`.
+  Measured: 21 → 20 gate call sites on linux-x64 2.1.222, 23 → 22 on
+  darwin-arm64 2.1.239, a 4-byte difference from the unshimmed artifact on
+  both. A **global** flip is still not the fix and never was: it breaks search,
+  because "embedded ripgrep" then means re-exec `process.execPath` (bun) with
+  argv0 `rg`, and a `Grep` for a string that exists returns `No matches found`
+  — silently wrong, not an error. That is now a *case* in
+  `scripts/ab-equivalence.sh`, not a paragraph: the script builds the
+  globally-flipped artifact as a third side and asserts the breakage.
+- **Still open, deliberately:** the seccomp sandbox, embedded ripgrep and
+  install identity stay on their non-standalone branches. findings §11
+  tabulates why each refusal is a refusal. Measured 2026-08-23: a shimmed build
+  still reports `Running: unknown` and `Search: OK (/usr/bin/rg)` from
+  `doctor`, which is the positive evidence that the rewrite did not spread.
 - **Still genuinely unverified:** whether `mermaid.min.js`,
   `hljsBundle.generated.min.js` and `chart.umd.min.js` are read on their real
   feature paths (they are read via `fs/promises.readFile` of the rewritten
@@ -311,11 +333,15 @@ previous `build/extract/` intact.
 - **Minified call shapes drift.** `postprocess.py`'s regexes target minified
   output that changes every release. They are measured against two real
   binaries, not contracts.
-- **The equivalence gap is characterised, not closed.** findings §11 lists what
-  differs and why. Three of the branches have an A/B measurement behind them —
-  the image path, `doctor`'s install-identity and search lines, and `Grep`
-  (which is the one that shows why a global flip is *not* the fix). The
-  remaining `CE()` branches were read, not exercised.
+- **The equivalence gap is characterised, and one item of it is closed.**
+  findings §11 lists what differs and why. Four branches have an A/B
+  measurement behind them, all of them now reproducible in one command
+  (`scripts/ab-equivalence.sh`): the image path (closed by the scoped shim),
+  `Grep` (the case that shows why a global flip is *not* the fix), `doctor`'s
+  install-identity and search lines, and a `Bash` control that must come out
+  the same on all three sides. The remaining gate branches were read, not
+  exercised — 21 call sites on linux-x64 2.1.222, of which the shim touches
+  one.
 - **`CLAUDE_CODE_EXECPATH`.** Measured: the CLI **never reads** it (0
   occurrences of `process.env.CLAUDE_CODE_EXECPATH`) and unconditionally
   *writes* it as `process.execPath` — now the bun binary — into every spawned

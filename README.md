@@ -23,7 +23,10 @@ ever *read*: not modified, not re-signed, not executed by this pipeline.
 
 Verified 2026-08-22 on Linux x86_64 (Debian 12, glibc 2.36). Every ✅ below is
 a command whose output is pasted in
-[`docs/verification-2026-08-22.md`](docs/verification-2026-08-22.md).
+[`docs/verification-2026-08-22.md`](docs/verification-2026-08-22.md) — except
+the image-processing rows, which changed on 2026-08-23 when the scoped shim
+landed and are reproducible with `scripts/ab-equivalence.sh` rather than pasted
+into that record.
 
 | Piece | `linux-x64` (ELF, 2.1.222) | `darwin-arm64` (Mach-O, 2.1.239) | `win32-x64` (PE, 2.1.239) |
 |---|---|---|---|
@@ -32,8 +35,8 @@ a command whose output is pasted in
 | `scripts/build.sh` end to end | ✅ executed | ✅ executed | ⛔ |
 | Output accepted by Bun 1.3.14's own parser | 🔎 exit 0 | 🔎 exit 0 | ⛔ |
 | **Runs under external Bun** | ✅ `doctor`, `mcp list`, `--help`, `--version` — on **1.3.14 *and* 1.4.0** | ✅ the JS boots under **Linux** Bun → `2.1.239 (Claude Code)` | ⛔ would also need a Windows Bun |
-| Runtime asset loading | ✅ `image-processor.node` loads and works — but the CLI never asks for it | 🖥️ Mach-O addons cannot load on Linux | ⛔ |
-| Behaves the same as the shipped binary | ⚠️ **no** — see the equivalence gap below | ⚠️ no | ⛔ |
+| Runtime asset loading | ✅ `image-processor.node` loads, works, **and is now reached by the CLI** — a `Read` of a 3000×3000 PNG returns a JPEG | 🖥️ Mach-O addons cannot load on Linux | ⛔ |
+| Behaves the same as the shipped binary | ⚠️ **no** — smaller than it was, see the equivalence gap below | ⚠️ no | ⛔ |
 
 ✅ executed here · 🔎 static check only, nothing executed · 🖥️ needs hardware
 we do not have · ⚠️ measured difference from the native binary · ⛔ deliberately
@@ -44,8 +47,8 @@ the real Linux binary runs under vanilla Bun 1.3.14 and answers `doctor` and
 `mcp list` (which really read and write `.claude.json`), plus `--help` and
 `--version`. Driven by a **loopback mock** of the Messages API it also completes
 a full agentic loop — SSE streaming, multi-turn tool use, the Bash tool spawning
-a real subprocess — and renders the Ink TUI under a pty, with no Bun-API failure
-anywhere. That is a positive answer, **for Claude Code 2.1.222, on Linux**, to
+a real subprocess, the Read tool returning a resized image — and renders the Ink
+TUI under a pty, with no Bun-API failure anywhere. That is a positive answer, **for Claude Code 2.1.222, on Linux**, to
 the risk in [`docs/findings.md`](docs/findings.md) §10. It is a measurement, not
 a guarantee.
 
@@ -55,14 +58,23 @@ a guarantee.
 > `mcp list` initialise ~2760.
 
 **⚠️ The equivalence gap — read this before using it.** `Bun.isStandaloneExecutable`
-is undefined outside a standalone, so the CLI takes its non-standalone branch in
-~21 places. Measured consequences: **native image processing is silently
-disabled** (a large PNG fails to resize as shipped, and comes back a correct
-JPEG when the flag is forced true — the addon itself is fine), the
-**seccomp sandbox is off**, embedded ripgrep becomes a **system `rg`** (so `rg`
-is a de facto prerequisite), and install identity reports `unknown`. Both addon
-loaders swallow failure, so **exit 0 is not evidence that the asset wiring
-works**. Full detail: [`docs/findings.md`](docs/findings.md) §11.
+is undefined outside a standalone, so the CLI takes its non-standalone branch
+at every site that asks — **21** of them in `linux-x64` 2.1.222 and **23** in
+`darwin-arm64` 2.1.239 (a per-binary count, re-measured 2026-08-23; §11 records
+why a plausible-looking regex gets 18). Measured consequences: the **seccomp
+sandbox is off**, embedded ripgrep becomes a **system `rg`** (so `rg` is a de
+facto prerequisite), and install identity reports `unknown`. Both addon loaders
+swallow failure, so **exit 0 is not evidence that the asset wiring works**.
+
+**One of those gaps is closed.** `postprocess.py` rewrites the *single* gate
+call that guards native image processing, so a default build resizes a large
+image instead of erroring. It is scoped to that one call site on purpose:
+flipping `Bun.isStandaloneExecutable` globally is measured to make `Grep`
+answer `No matches found` for a string that exists — a wrong answer, not an
+error. `NRC_NO_IMAGE_SHIM` (any non-empty value) builds the old artifact, and
+`scripts/ab-equivalence.sh` reproduces the whole A/B — as-shipped, shimmed and
+globally-flipped — against a committed loopback mock. Full detail:
+[`docs/findings.md`](docs/findings.md) §11.
 
 **What is honestly not known:** no request from this build has ever gone to
 Anthropic — the agentic loop above was a loopback mock. macOS-*specific*
@@ -119,28 +131,68 @@ not-rusty-claude/
 │   ├── findings.md                 measured facts about the binary and the transforms
 │   ├── bun-section-format.md       byte-level spec (Mach-O / ELF / PE containers)
 │   ├── runbook.md                  step-by-step, Linux and macOS
-│   └── verification-2026-08-22.md  the evidence record: commands + pasted output
+│   ├── verification-2026-08-22.md  the evidence record: commands + pasted output
+│   └── superpowers/specs/          designs of record, one per change
 ├── tools/
 │   ├── extract_bun.py              extract cli.js + assets from the Bun section
-│   ├── postprocess.py              make cli.js runnable under an external Bun
+│   ├── postprocess.py              make cli.js runnable under an external Bun,
+│   │                               including the scoped image shim (findings §11)
 │   └── patch_claude.py             Approach B: byte-patch + re-sign (macOS only)
 ├── scripts/
 │   ├── build.sh                    extract → post-process → print the run command
+│   ├── ab-equivalence.sh           the findings §11 A/B: as-shipped vs shimmed vs
+│   │                               globally-flipped, through the mock below
+│   ├── mock-messages-api.mjs       loopback-only mock of the Messages API
 │   └── syntax-check.js             fast secondary syntax check (JSC, not Bun)
-└── tests/                          86 tests: hermetic fixtures + real-binary integration
+└── tests/                          200 tests: hermetic fixtures + real-binary integration
 ```
 
 The tools themselves need no third-party packages — stock `python3` (3.9+) is
 enough. Running the test suite additionally needs `pytest`: `python3 -m pytest
 tests/ -q`. What that prints depends on what the host has, because the
-integration tests need a real 300 MB binary and skip cleanly without one:
+integration tests need a real Claude binary — 289,467,400 bytes for the Linux
+one on this host, 324,973,552 for the macOS one — and skip cleanly without it:
 
-| host has | result |
-| --- | --- |
-| both binaries + Bun | **86 passed** |
-| ELF binary + Bun, no Mach-O | 83 passed, 3 skipped |
-| Bun only | 80 passed, 6 skipped |
-| none of them | 77 passed, 9 skipped |
+Every row below was re-measured on this host on 2026-08-23, by forcing the row
+with the environment variables named underneath; the four rows sum to the same
+200 collected tests (`python3 -m pytest tests/ -q --collect-only` → `200 tests
+collected`).
+
+| host has | result | how the row was forced |
+| --- | --- | --- |
+| both binaries + Bun | **200 passed** | nothing set (this host's defaults) |
+| ELF binary + Bun, no Mach-O | 195 passed, 5 skipped | `NRC_TEST_MACHO=/nonexistent/macho` |
+| Bun only | 190 passed, 10 skipped | …plus `NRC_TEST_ELF=/nonexistent/elf` |
+| none of them | 187 passed, 13 skipped | …plus `BUN_BIN=/nonexistent/bun` and a `HOME` with no Bun under it — the command below |
+
+That last row needs the extra care, and for two independent reasons.
+
+`BUN_BIN` is a *first* choice, not an override, so the fixture still falls back
+to `~/.bun-1.3.14/bun` and then to `bun` on `PATH`. Measured: `BUN_BIN` pointed
+at a nonexistent file with this host's real `HOME` still in place gives the
+Bun-**only** row, 190 passed / 10 skipped — not the no-Bun one. So `HOME` has to
+move too, and `bun` must not be on `PATH` (it is not on this host: the runbook
+unpacks 1.3.14 without installing it, so nothing extra was needed here; a host
+that does have one has to strip it from `PATH` as well).
+
+And moving `HOME` can take `pytest` with it. Followed literally, "an empty
+`HOME`" printed `/usr/bin/python3: No module named pytest` here and exited 1 —
+pytest on this host is a `--user` install, under `$HOME/.local`. So put it back
+explicitly, derived rather than hardcoded (it resolves to
+`/home/claude/.local/lib/python3.11/site-packages` on this host, which is a
+fact about this host and not about the recipe):
+
+```bash
+# the "none of them" row, as run. $(...) is evaluated before HOME is replaced.
+PYTHONPATH="$(python3 -m site --user-site)" \
+NRC_TEST_ELF=/nonexistent/elf NRC_TEST_MACHO=/nonexistent/macho \
+BUN_BIN=/nonexistent/bun HOME="$(mktemp -d)" \
+  python3 -m pytest tests/ -q
+#   → 187 passed, 13 skipped
+```
+
+Where pytest is installed system-wide instead, `--user-site` names a directory
+that need not exist and the `PYTHONPATH` is a harmless no-op.
 
 Point them at binaries with `NRC_TEST_ELF` (default `/usr/bin/claude`) and
 `NRC_TEST_MACHO` (default `/tmp/ccmac/package/claude-darwin-arm64.bin`, the
@@ -149,7 +201,9 @@ tarball under; the older `/tmp/ccmac/package/claude` is still accepted), and at
 a Bun with `BUN_BIN`
 (default: `~/.bun-1.3.14/bun`, then whatever `bun` is on `PATH`). The
 integration tests' hardcoded counts are a deliberate tripwire for the next
-Claude release (see [`docs/status.md`](docs/status.md)).
+Claude release (see [`docs/status.md`](docs/status.md)) — and so is this table:
+a stale total here disarms it, because "the number changed" stops meaning
+anything.
 
 ## Two approaches
 

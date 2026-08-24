@@ -100,7 +100,10 @@ The unpack above keeps this experiment entirely self-contained.
 
 ```bash
 BUN_BIN="$HOME/.bun-1.3.14/bun" scripts/build.sh "$NATIVE"
-#   OUT_DIR=/somewhere  to put artifacts elsewhere (default: ./build)
+#   OUT_DIR=/somewhere      to put artifacts elsewhere (default: ./build)
+#   NRC_NO_IMAGE_SHIM=1     build the "as shipped" artifact, without the scoped
+#                           image shim. ANY non-empty value opts out; leave it
+#                           unset (or empty) for the default, shimmed build.
 ```
 
 `build.sh` extracts, post-processes, and then **stops**. It installs nothing —
@@ -117,18 +120,33 @@ pragma block stripped  : 1
 /$bunfs/ paths rewired : 5
 file:// leaks rewritten: 7
 IIFE invocations added : 1  (expected 1)
+image shim gate        : CE
+image shim call sites  : 21 -> 20
+image shim applied     : 1  (expected 1)
 size: 22960130 -> 22959448 bytes
 wrote: .../.extract.stage.NNNN/cli.original.cjs
 wrote: .../.extract.stage.NNNN/cli.js  (sibling for Claude's MCP self-spawns)
+==> image shim APPLIED: the native image-processor branch is reachable,
+==>   which is what the Read tool needs to resize a large image. Every other
+==>   isStandaloneExecutable gate (ripgrep, sandbox, updater) stays false.
 ==> staged build swapped into place -> .../build/extract
 ```
+
+(Copied from a build run on this host on 2026-08-23. The gate's minified name
+and the call-site count belong to `linux-x64` 2.1.222: the darwin-arm64 2.1.239
+build prints `AE` and `23 -> 22`.)
 
 (The `wrote:` lines name the **staging** directory; `build.sh` prints the final
 paths in its "artifacts ready" block immediately afterwards. The `cli.js`
 sibling is not optional — Claude's own code resolves `join(__filename,'..',
 'cli.js')` for two MCP self-spawns.)
 
-**Read the counts.** `IIFE invocations added` must be exactly 1 — if it is not,
+**Read the counts.** `image shim applied` must be **1** in a default build.
+`0` is not a build failure — the artifact is exactly as good as every artifact
+this repo shipped before the shim existed — but it means the Read tool will
+refuse an oversized image, so the script says so out loud either way and adjusts
+its closing list of gaps to match. `IIFE invocations added` must be exactly 1 —
+if it is not,
 `postprocess.py` refuses to write the output at all rather than handing Bun a
 file that fails with a confusing panic. A surviving `/$bunfs/` (or Windows
 `B:/~BUN/`) reference is refused the same way: it used to be a warning printed
@@ -266,6 +284,13 @@ reaches its `native` case, falls through to npm/global heuristics over
 `process.execPath` (which is now *bun*), shells out to `npm config get prefix`,
 and ends at `unknown`.
 
+**The scoped image shim does not change this, on purpose.** It rewrites the
+image branch's own gate call and nothing else, so install identity is still
+decided by a `CE()` that returns false. Measured 2026-08-23 with
+`scripts/ab-equivalence.sh --case doctor`: a shimmed build still reports
+`Running: unknown (2.1.222)`, byte-identical to the as-shipped build's line.
+Keep `DISABLE_AUTOUPDATER=1`.
+
 Measured here, in a throwaway `HOME`, with `doctor` alone:
 
 ```
@@ -306,9 +331,10 @@ artifacts keep running the version you extracted until you do.
 
 ```bash
 BUN_BIN="$HOME/.bun-1.3.14/bun" scripts/build.sh "$NATIVE"
-# 86 passed on a host with both real binaries; 77 passed / 9 skipped with
-# neither binary nor Bun. NRC_TEST_ELF / NRC_TEST_MACHO / BUN_BIN choose them
-# (README has the full table). The measured counts are version-specific:
+# Measured 2026-08-23: 200 passed on a host with both real binaries and a Bun;
+# 187 passed / 13 skipped with neither binary nor Bun. NRC_TEST_ELF /
+# NRC_TEST_MACHO / BUN_BIN choose them (README has the full table). The
+# measured counts inside the tests are version-specific:
 python3 -m pytest tests/ -q
 DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \
   "$BUN_BIN" build/extract/cli.original.cjs mcp list   # not --version: findings §10
@@ -348,9 +374,9 @@ Two things to expect:
 |---|---|---|
 | `Expected CommonJS module to have a function wrapper` | **Ambiguous** — Bun older than 1.3.14, *or* the pragma/IIFE transform did not apply, *or* the pragma was kept **and** the IIFE appended (findings §6's 2×2). Not a reliable "Claude needs a newer Bun" canary | Confirm `bun --version` is ≥ 1.3.14; confirm `cli.original.cjs` starts with `(function` and ends with the `(exports, require, module, …)` call |
 | `TypeError: … is not a function` naming a `Bun.*` property | **This** is the missing-API signal — findings §10's risk | Pin to an older Claude version, or shim the API |
-| Images are refused with *"Unable to resize image…"* | Expected, not a bug in your build: native image processing is unreachable outside a Bun standalone (findings §11) | No supported fix yet; do **not** flip `Bun.isStandaloneExecutable` globally — it silently breaks search |
+| Images are refused with *"Unable to resize image…"* | **Not expected in a default build any more.** Since 2026-08-23 `postprocess.py` rewrites the image-processor gate so the native path is reachable (findings §11, *What shipped*). Seeing this means one of three things: the artifact predates the shim; it was built with `NRC_NO_IMAGE_SHIM` set to a non-empty value; or the shim could not find its anchor in this Claude release, in which case the build printed `image shim NOT APPLIED` | Check the artifact itself: `grep -o 'if(true)try' build/extract/cli.original.cjs \| wc -l` prints **1** for a shimmed build and **0** for an as-shipped one (measured on linux-x64 2.1.222 and darwin-arm64 2.1.239). If it prints 0, rebuild without `NRC_NO_IMAGE_SHIM` and read the `image shim` lines in the build output. If the build says NOT APPLIED with the env var unset, a new Claude release moved the anchor — re-measure, see findings §11. Never "fix" it by flipping `Bun.isStandaloneExecutable` globally: measured, that silently breaks `Grep` |
 | `ripgrep not found on PATH` | Embedded ripgrep needs a standalone; this build uses a system `rg` (findings §11) | Install `ripgrep` |
-| `postprocess.py` exits non-zero and writes nothing | one of `check()`'s **five** fatal conditions ([findings.md](./findings.md) §6): no trailing IIFE; the file does not start with `(function`; a `/$bunfs/` or `B:/~BUN/` reference survived the rewrite; the rewritten code reaches for an `assets/<name>` that was never extracted; or **zero** `/$bunfs/` literals were rewritten while `assets/` has files | The error names which. Shape problems (IIFE, `(function`) mean the entry module changed — read its last ~200 bytes and re-measure before editing a regex. A surviving reference means a `/$bunfs/` shape the rewriter does not cover. A missing asset means `extract_bun.py` dropped a loader kind — check its `LOADERS`/`WRITTEN_LOADERS` against Bun's `src/bundler/options.zig`. Zero rewrites with populated assets means a different VFS prefix ([status.md](./status.md) § Windows/PE) |
+| `postprocess.py` exits non-zero and writes nothing | one of `check()`'s **six** fatal conditions ([findings.md](./findings.md) §6; counted in `tools/postprocess.py` on 2026-08-23): no trailing IIFE; the file does not start with `(function`; a `/$bunfs/` or `B:/~BUN/` reference survived the rewrite; the rewritten code reaches for an `assets/<name>` that was never extracted; **zero** `/$bunfs/` literals were rewritten while `assets/` has files; or the image shim's before/after gate-call arithmetic does not add up | The error names which. Shape problems (IIFE, `(function`) mean the entry module changed — read its last ~200 bytes and re-measure before editing a regex. A surviving reference means a `/$bunfs/` shape the rewriter does not cover. A missing asset means `extract_bun.py` dropped a loader kind — check its `LOADERS`/`WRITTEN_LOADERS` against Bun's `src/bundler/options.zig`. Zero rewrites with populated assets means a different VFS prefix ([status.md](./status.md) § Windows/PE). Failed shim arithmetic means the one-site rewrite spread — nothing is written, deliberately, because the site it would reach next is embedded ripgrep and that failure is a wrong answer, not an error |
 | `Cannot find module '.../assets/X.node'` | asset not extracted, or its path not rewritten | Should no longer be reachable from a build that succeeded: `check()` fails the build when the rewritten code references an asset that is not on disk. If you see it anyway, the artifact and its `assets/` came from different runs — rebuild |
 | A mermaid/highlight/chart feature breaks | a `file`-loader asset still referenced via `/$bunfs/`, or an unverified runtime path | The rewritten path shape is verified to work (`image-processor.node` loads through it), but no command here has exercised these three features — [status.md](./status.md) remaining work #3 |
 | `error: PE (Windows) executable detected` | you pointed the extractor at `claude.exe` | Not supported by design — [status.md](./status.md) § Windows/PE |
