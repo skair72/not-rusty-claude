@@ -19,10 +19,18 @@ closed PR #1:
 2. Give `tools/patch_claude.py` — the one tool in this repo that writes to a
    signed binary — a real test suite. Checked out and counted 2026-08-23: at
    `7ea5562~1` the tool was **261** lines with **no** `tests/test_patch_claude.py`
-   at all; as shipped it is **507** lines with **94** tests (re-counted
-   2026-08-24, after the review fleet's fixes landed; the figures this
-   paragraph carried before — 330 lines, 58 tests — were correct at `9c98027`
-   and went stale in the very next commit).
+   at all (re-checked with `git show` on 2026-08-24: still 261). As of
+   2026-08-24 it is **602** lines with **111** tests.
+
+   > **Retraction, 2026-08-24.** This paragraph said **507** lines and **94**
+   > tests, claiming to have been "re-counted 2026-08-24". Both were wrong on
+   > that date: `wc -l` reports 602 and `pytest --collect-only` reports 111. The
+   > figures before those — 330 lines, 58 tests — were correct at `9c98027` and
+   > went stale in the very next commit, which is the same failure twice. The
+   > numbers above were measured on 2026-08-24 on the Linux host, on this
+   > branch's working tree; a count in a dated design document is a transcript of
+   > its day and will go stale again. The live figure is
+   > [README's test section](../../../README.md#the-test-suite-and-its-counts).
 
 ---
 
@@ -277,7 +285,9 @@ oversight:
 
 ### Verification
 
-**Static**, in `tests/test_image_shim.py` (**59** tests, collected 2026-08-24): the
+**Static**, in `tests/test_image_shim.py` (**60** tests, re-collected on the
+Linux host 2026-08-24; the **59** that stood here was measured before that day's
+fixes landed and is retracted): the
 gate name is captured from both real declaration shapes; exactly one site is
 rewritten and it is the one before the anchor; every *other* gate call site is
 byte-identical, asserted by reconstruction rather than by spot check; the
@@ -320,8 +330,11 @@ real recount: `before=21 after=0`, and `check()` fires with the accounting
 error. `test_the_after_count_is_measured_on_the_rewritten_code` (in
 `tests/test_image_shim.py`) now recounts the output independently and kills
 the mutant: with `before - 1` applied to a private copy, that file goes from
-`59 passed` to `2 failed, 57 passed`. So the tally above should be read as of
-its own date — that mutation is no longer a survivor.
+`59 passed` to `2 failed, 57 passed`. That transcript is from the day the
+mutation run happened, when `tests/test_image_shim.py` held **59** tests; it
+holds **60** as of 2026-08-24, which is the figure the *Verification* heading
+above now carries. Both are correct for their own date, and this one is quoted
+output rather than a claim about the suite you are running.
 
 **Dynamic**, on the real artifact: an A/B driven through a **loopback-only mock
 of the Messages API**, committed to this repo as
@@ -411,6 +424,36 @@ every turn onto a code path a real API run never takes while the A/B still
 prints the expected string, so the harness now greps each case's mock log for
 `stream=false` and fails the case.
 
+### Addendum, 2026-08-24 — the shim met a real Mac, halfway
+
+This design was written on a project whose host had no Mac. On 2026-08-24 an
+Apple Silicon host ran the pipeline and reported the result first-hand. What it
+settles about Part 1, and what it does not, is worth stating here because this
+is the document that argued for the design:
+
+- **Selection works on a real Mac, against a real binary.** Building that
+  machine's own installed Claude Code 2.1.239, the transform captured gate `AE`,
+  moved the call sites `23 -> 22` and reported `applied: 1` — the same three
+  figures the Linux host measures for `darwin-arm64` 2.1.239. So "learn the
+  name, find the anchor, match the shape, check the arithmetic" survives contact
+  with macOS.
+- **Nothing about the *effect* is settled.** An image was attached in that
+  session and the model described it, so image *input* works — but the branch
+  this shim unlocks is the one the **Read** tool needs to **resize** an image
+  over 2000×2000, and an image that does not need resizing never reaches it.
+  Nothing in the report says the attached image was oversized. The problem this
+  document opens with — *"the Read tool cannot resize a large image"* — is
+  therefore **still unverified on macOS**, in both directions: nobody has seen it
+  fail there without the shim, and nobody has seen it succeed there with it.
+- **`scripts/ab-equivalence.sh` still cannot run there**, so none of the
+  three-way evidence above has a macOS counterpart, and the *Verification*
+  section's A/B remains a `linux-x64` measurement.
+- **Part 2 is untouched by that run.** It never invoked `patch_claude.py`, so
+  the `codesign` half remains what it has always been: unexercised.
+
+The one-line probe that would close the first two bullets is in
+[status.md](../../status.md) § macOS execution, alongside the addon-load check.
+
 ---
 
 ## Part 2 — `patch_claude.py` tests
@@ -453,8 +496,9 @@ turned something up: overlapping `--old` matches that would write over each
 other's padding, back-to-back hits that only *look* overlapping, `--out`
 pointing at the input, the quarantine xattr having to be dropped *after* the
 signature lands, a failed `codesign --verify` being fatal, and `--verify`
-actually launching the patched binary. **94** tests in total, collected on
-this host on 2026-08-24.
+actually launching the patched binary. **111** tests in total, collected on the
+Linux host on 2026-08-24 — see the retraction at the top of this document, which
+is where the **94** that used to stand here came from.
 
 ### What the tests changed
 
