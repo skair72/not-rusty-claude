@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - **Zero runtime dependencies.** `tools/*.py` must run on stock `/usr/bin/python3` (3.9+). stdlib only. pytest is a *test-time* dependency, never imported by the tools.
-- **The signed binary is only ever read.** Never modified, never executed, never re-signed.
+- **The native binary is only ever read.** Never modified, never executed.
 - **Nothing is installed on `PATH`.** `build.sh` produces artifacts and prints the run command. It must never create or overwrite a `claude` executable — the host's `/usr/bin/claude` is the running session.
 - **PE is detection-only.** Refuse with a clear message; extraction is explicitly out of scope.
 - **Bun floor is `1.3.14`** — simultaneously the last Zig release and the minimum that loads Claude's `cli.js`.
