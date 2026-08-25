@@ -191,3 +191,24 @@ def build_pe(payload):
     buf[sect_table:sect_table + 40] = s
 
     return bytes(buf) + section
+
+
+def scratch_home(out_dir):
+    """A HOME for a build, deliberately NOT the OUT_DIR being asserted on.
+
+    build.sh falls back to $XDG_DATA_HOME / $HOME/.local/share to auto-discover
+    a native binary, so a test has to point HOME somewhere harmless or the
+    build finds the developer's real install. It used to point at OUT_DIR
+    itself, which is fine on Linux and WRONG on macOS: the first process to
+    touch CoreFoundation creates ~/Library, so the "nothing left behind"
+    assertions saw ['Library', 'extract'] and blamed build.sh for a directory
+    the operating system had made. Reported from a real Mac (Python 3.14.7,
+    2026-08-24) - the first macOS run this project has ever had.
+
+    Sibling of out_dir rather than a child, so nothing HOME accumulates can
+    ever land inside the directory under assertion.
+    """
+    import pathlib
+    home = pathlib.Path(str(out_dir) + ".home")
+    home.mkdir(parents=True, exist_ok=True)
+    return home

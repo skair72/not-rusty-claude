@@ -998,12 +998,18 @@ def _synthetic_binary(path, entry):
     return path
 
 
+def _build_env(out_dir, env=None):
+    """Exposed so a test can assert on the HOME a build really uses; see
+    test_a_home_littered_by_the_platform_stays_out_of_the_output_dir."""
+    return dict(BASE_ENV, HOME=str(fixtures.scratch_home(out_dir)),
+                OUT_DIR=str(out_dir), BUN_BIN="/nonexistent/bun", **(env or {}))
+
+
 def _build(out_dir, native, env=None):
     return subprocess.run(
         ["bash", str(ROOT / "scripts" / "build.sh"), str(native)],
         capture_output=True, text=True,
-        env=dict(BASE_ENV, HOME=str(out_dir), OUT_DIR=str(out_dir),
-                 BUN_BIN="/nonexistent/bun", **(env or {})))
+        env=_build_env(out_dir, env))
 
 
 def test_build_sh_reports_the_shim_as_applied(tmp_path):
@@ -1078,3 +1084,18 @@ def test_build_sh_leaves_no_postprocess_log_in_the_output_dir(tmp_path):
 
     assert sorted(p.name for p in out.iterdir()) == ["extract"]
     assert list(out.rglob(".postprocess.log")) == []
+
+
+def test_a_home_littered_by_the_platform_stays_out_of_the_output_dir(tmp_path):
+    """The macOS half of the same defect test_build_script.py pins: this file's
+    build helper conflated HOME with OUT_DIR too, so ~/Library landed in the
+    directory the assertion above walks. Reported from a real Mac 2026-08-24."""
+    native = _synthetic_binary(tmp_path / "native", _module().encode())
+    out = tmp_path / "out"
+    home = pathlib.Path(_build_env(out)["HOME"])
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "Library").mkdir()
+
+    assert _build(out, native).returncode == 0
+
+    assert sorted(p.name for p in out.iterdir()) == ["extract"]

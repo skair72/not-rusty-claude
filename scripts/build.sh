@@ -39,16 +39,61 @@ warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 # 1. Locate the native binary
+#
+# A versions directory can contain a DUD, and the newest name is not
+# necessarily a working binary. Measured on a real Mac 2026-08-24: an
+# interrupted auto-update had left versions/2.1.241 as a 0-byte,
+# non-executable file, sorting NEWER than the 2.1.239 that the `claude`
+# symlink actually pointed at and that the user was really running. The old
+# `sort -V | tail -1` took the dud, -f accepted it, and the extractor then
+# said "input is only 0 bytes" - which reads as a format bug in this repo
+# rather than a broken install on the machine. Walk newest-first and take the
+# first plausible candidate instead.
+MIN_NATIVE_BYTES=1048576   # a Bun standalone is hundreds of MB; a dud is 0
+
+file_size() { wc -c < "$1" 2>/dev/null | tr -d ' '; }
+
+plausible() {
+  local sz
+  sz="$(file_size "$1")"
+  case "$sz" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$sz" -ge "$MIN_NATIVE_BYTES" ]
+}
+
 NATIVE="${1:-}"
 if [ -z "$NATIVE" ]; then
   DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
-  NATIVE="$(ls -1d "$DATA"/claude/versions/* 2>/dev/null | sort -V | tail -1 || true)"
+  SKIPPED=""
+  for cand in $(ls -1d "$DATA"/claude/versions/* 2>/dev/null | sort -Vr || true); do
+    [ -f "$cand" ] || continue
+    if plausible "$cand"; then NATIVE="$cand"; break; fi
+    SKIPPED="$SKIPPED $(basename "$cand")"
+  done
+  if [ -n "$SKIPPED" ]; then
+    warn "ignored unusable version(s) in $DATA/claude/versions:$SKIPPED"
+    warn "  (a 0-byte or truncated entry is what an interrupted update leaves)"
+  fi
 fi
 if [ -z "$NATIVE" ]; then
   NATIVE="$(command -v claude || true)"
 fi
 [ -n "$NATIVE" ] && [ -f "$NATIVE" ] || die "native Claude binary not found; pass it as an argument"
-info "native binary: $NATIVE"
+
+# An explicitly-passed path is only checked for being EMPTY, not against
+# MIN_NATIVE_BYTES: auto-discovery is choosing among real installs of hundreds
+# of megabytes, but an explicit argument is a deliberate choice and is
+# routinely a kilobyte-scale synthetic fixture - this suite is built on them,
+# and a floor here failed 14 of its own tests.
+NATIVE_BYTES="$(file_size "$NATIVE")"
+case "$NATIVE_BYTES" in ''|*[!0-9]*) NATIVE_BYTES=0 ;; esac
+if [ "$NATIVE_BYTES" -lt 4 ]; then
+  die "$NATIVE is $NATIVE_BYTES bytes - too small to be a Claude standalone.
+       An interrupted install leaves a stub like this. Look in
+       \$XDG_DATA_HOME/claude/versions (default ~/.local/share/claude/versions)
+       and pass a working binary, or follow the \`claude\` symlink to the one
+       actually in use."
+fi
+info "native binary: $NATIVE ($NATIVE_BYTES bytes)"
 
 # 2. Check Bun (advisory - extraction works without it)
 BUN_BIN="${BUN_BIN:-$(command -v bun || true)}"

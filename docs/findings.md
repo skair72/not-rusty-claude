@@ -6,19 +6,35 @@ bundles.
 
 > **Verification legend**
 > ✅ **executed here** — run on this host (Linux x86_64, Debian 12, glibc 2.36) on 2026-08-22; command + output pasted in [verification-2026-08-22.md](./verification-2026-08-22.md), in its original body or its **2026-08-22 addendum** ·
+> 🍎 **executed on the reporting Mac** — run on an Apple Silicon host on 2026-08-24 and reported first-hand, against that machine's own installed 2.1.239. **Not** measured here. Kept distinct from ✅ everywhere, because *which machine* a number came from is the discipline this document exists to keep ·
 > 🔎 **static check here** — real bytes parsed/transformed, or the output accepted by Bun's own parser, but **nothing executed** ·
 > 🖥️ **needs hardware we do not have** ·
 > ⛔ **deliberately not implemented** ·
 > 📓 **prior-session record** — observed on a Mac on 2026-08-21 against 2.1.238, *not* re-checked here ·
 > 📄 read from source (ClawGod / upstream docs), not measured
 
-**The three binaries these findings are measured against:**
+**The four binaries these findings are measured against:**
 
 | Platform | Container | Version | Size | How obtained |
 |---|---|---|---|---|
 | `linux-x64` | ELF | **2.1.222** | 289,467,400 B | `/usr/bin/claude`, pre-installed on this host (read-only; not executed by this project) |
 | `darwin-arm64` | Mach-O (thin arm64) | **2.1.239** | 324,973,552 B | `npm pack @anthropic-ai/claude-code-darwin-arm64` (§9) |
+| `darwin-x64` | Mach-O (thin x86_64) | **2.1.241** | 333,784,816 B | first-party download endpoint, checksum-verified (§9) — added 2026-08-24 |
 | `win32-x64` | PE | **2.1.239** | 337,672,352 B | `npm pack @anthropic-ai/claude-code-win32-x64` (§9) |
+
+The `darwin-x64` row is new, and it matters more than a fourth row usually
+would: until 2026-08-24 **every Mach-O number in this file came from one
+architecture**. Where a darwin figure is now given per architecture, both are
+shown.
+
+**The `darwin-arm64` row has now been corroborated from a Mac** 🍎. On
+2026-08-24 an Apple Silicon host reported its *own* installed Claude Code
+2.1.239, under `~/.local/share/claude/versions/<version>`, at **324,973,552
+bytes** — the byte count in that row, reached on this host through `npm pack`.
+Two independent acquisition routes and two operating systems, one number. That
+is a cross-check on the whole darwin column and not just on this table: the
+figures §3 and §6 record for `darwin-arm64` 2.1.239 were reproduced there
+exactly, and are marked 🍎 where they appear.
 
 Where a number differs between platforms or versions, **both** are given. That
 is the single most important lesson of this round: almost nothing here is a
@@ -89,12 +105,25 @@ Only the container differs; the payload inside has the same layout everywhere
 | Platform | Section | File offset | Section size | Payload size | Modules |
 |---|---|---|---|---|---|
 | `linux-x64` 2.1.222 ✅ | `.bun` (ELF) | 86904832 | 202513494 | 202513486 | 8 |
-| `darwin-arm64` 2.1.239 ✅ | `__BUN,__bun` (Mach-O) | 69107712 | 255007133 | 255007125 | 15 |
+| `darwin-arm64` 2.1.239 ✅🍎 | `__BUN,__bun` (Mach-O) | 69107712 | 255007133 | 255007125 | 15 |
 | `win32-x64` 2.1.239 🔎 | `.bun` (PE) | 95182336 | 242479616 | 242479175 | 9 |
 
 (The ELF and Mach-O rows are from `build.sh` runs pasted in the verification
 record, Steps 2 and 3b. The PE row was read by hand with a section-header walk —
 `extract_bun.py` refuses PE by design; see [status.md](./status.md) § Windows/PE.)
+
+**The `darwin-arm64` row carries 🍎 as well as ✅, and that is this document's
+strongest single result.** Every Mach-O figure in this file was produced by
+parsing a darwin binary *on Linux*, on the argument that walking a container is
+byte arithmetic and therefore platform-independent. On 2026-08-24 the same
+pipeline ran on an Apple Silicon Mac, against that machine's own installed
+2.1.239, and printed **the same four numbers** — offset `69107712`, section size
+`255007133`, payload `255007125`, `Modules: 15 (entry id=0)` — together with the
+same asset count and the same shim figures (§6). The argument was right; it is
+no longer only an argument. Note precisely what this does and does not show: it
+shows the *container parse* is platform-independent, which is what was claimed.
+It shows nothing about the macOS-specific layer underneath
+([status.md](./status.md) § macOS execution).
 
 Note the PE section is **padded**: `rawsize` 242479616 exceeds `payload_size + 8`
 by 433 bytes of file-alignment padding, whereas on ELF and Mach-O the section
@@ -382,41 +411,60 @@ early instead.
 
 ### The measured counts ✅
 
-| | `linux-x64` 2.1.222 | `darwin-arm64` 2.1.239 |
-|---|---|---|
-| pragma block stripped | 1 | 1 |
-| `/$bunfs/` literals rewritten | **5** | **9** |
-| `file://` leaks rewritten | **7** | **8** |
-| IIFE invocations added | 1 | 1 |
-| leftover `/$bunfs/` references | **0** | **0** |
-| build-machine path notes (informational) | 3 | 3 |
-| never-referenced extracted assets | 0 | 0 |
-| image shim gate | `CE` | `AE` |
-| image shim gate call sites, before → after | **21 → 20** | **23 → 22** |
-| image shim applied | 1 | 1 |
-| size | 22,960,130 → 22,959,448 B | 28,244,743 → 28,244,063 B |
-| shimmed vs `NRC_NO_IMAGE_SHIM` artifact | **4** bytes differ, at 4,337,061 | **4** bytes differ, at 7,104,588 |
+| | `linux-x64` 2.1.222 | `darwin-arm64` 2.1.239 | `darwin-x64` 2.1.241 |
+|---|---|---|---|
+| pragma block stripped | 1 | 1 | 1 |
+| `/$bunfs/` literals rewritten | **5** | **9** | **9** |
+| `file://` leaks rewritten | **7** | **8** | **8** |
+| IIFE invocations added | 1 | 1 | 1 |
+| leftover `/$bunfs/` references | **0** | **0** | **0** |
+| build-machine path notes (informational) | 3 | 3 | 3 |
+| never-referenced extracted assets | 0 | 0 | 0 |
+| image shim gate | `CE` | `AE` | `Tw` |
+| image shim gate call sites, before → after | **21 → 20** | **23 → 22** | **23 → 22** |
+| image shim applied | 1 | 1 | 1 |
+| size | 22,960,130 → 22,959,448 B | 28,244,743 → 28,244,063 B | 28,245,789 → 28,245,109 B |
+| shimmed vs `NRC_NO_IMAGE_SHIM` artifact | **4** bytes differ, at 4,337,061 | **4** bytes differ, at 7,104,588 | **4** bytes differ, at 7,103,971 |
 
-Every row was re-measured on this host on **2026-08-24** by rebuilding both
-platforms from the real binaries, and the byte-diff row by rebuilding each with
-and without `NRC_NO_IMAGE_SHIM=1` and comparing the two artifacts. This table is
-where these figures live: README, [status.md](./status.md) and
+Every row was re-measured on this host on **2026-08-24** by rebuilding all
+three binaries from the real files, and the byte-diff row by rebuilding each
+with and without `NRC_NO_IMAGE_SHIM=1` and comparing the two artifacts. This
+table is where these figures live: README, [status.md](./status.md) and
 [runbook.md](./runbook.md) point at it, and quote build output rather than
-restating numbers. The four differing bytes are `CE()`/`AE()` → `true` in both
-cases; the artifacts come out the same length only because both minified gate
-names happen to be two characters long.
+restating numbers.
 
-The rewrite count equals the extracted-asset count on both platforms (5 and 9),
-and no "extracted asset never referenced" note was emitted, so every asset
-written to disk is referenced by exactly one rewritten literal.
+**The `darwin-arm64` column was independently reproduced on a Mac** 🍎 on the
+same date, by an Apple Silicon host building its own installed 2.1.239: gate
+`AE`, call sites `23 -> 22`, `applied: 1`, `28244743 -> 28244063` bytes — every
+figure in that column that a single build prints, identical. The byte-diff row
+was **not** re-run there (that needs a second build with `NRC_NO_IMAGE_SHIM`
+set, which was not part of the reported run), and neither was anything in the
+`linux-x64` or `darwin-x64` columns. What that run establishes about the shim is
+that it **applies** on macOS. Whether the branch it unlocks then works there is a
+separate question and an open one — §11, and
+[status.md](./status.md) § macOS execution. The four differing bytes are `CE()`/`AE()`/`Tw()` → `true` in
+all three cases; the artifacts come out the same length only because all three
+minified gate names happen to be two characters long.
 
-The size is unchanged by the shim, and deliberately so: `CE()`/`AE()` and
-`true` are both four bytes. Measured 2026-08-23 by building each binary twice,
-once with `NRC_NO_IMAGE_SHIM` set — the two artifacts come out the same length
-and `cmp -l` reports exactly **4** differing bytes, on both platforms. That is
-also why the shim cannot be spotted by looking at a size: the only cheap way to
-tell the two artifacts apart is the build log, which is why `postprocess.py`
-prints the three `image shim` lines above and `build.sh` repeats the verdict.
+The two darwin columns are the same release family measured at different
+versions — 2.1.239 for `arm64`, because that is the copy the rest of this
+document was measured against, and 2.1.241 for `x64`, because that is what the
+download endpoint served on the day it was first fetched (§9). They agree on
+every count and disagree on every offset, which is what a per-build minifier
+should look like.
+
+The rewrite count equals the extracted-asset count on all three builds (5, 9
+and 9), and no "extracted asset never referenced" note was emitted, so every
+asset written to disk is referenced by exactly one rewritten literal.
+
+The size is unchanged by the shim, and deliberately so: `CE()`, `AE()`, `Tw()`
+and `true` are all four bytes. Measured 2026-08-23 (linux, darwin-arm64) and
+2026-08-24 (darwin-x64) by building each binary twice, once with
+`NRC_NO_IMAGE_SHIM` set — the two artifacts come out the same length and the
+byte-diff reports exactly **4** differing bytes, on all three. That is also why
+the shim cannot be spotted by looking at a size: the only cheap way to tell the
+two artifacts apart is the build log, which is why `postprocess.py` prints the
+three `image shim` lines above and `build.sh` repeats the verdict.
 
 ### The `fileURLToPath` correction — why the ported regex found nothing
 
@@ -543,10 +591,16 @@ extract-and-run approach is the cleaner one.
   [`patch_claude.py`](../tools/patch_claude.py) (Approach B), kept for edits
   that are **not** in the JS layer.
 
+**Nothing here changed on 2026-08-24.** A real macOS run happened that day and
+is recorded throughout this document 🍎 — but it exercised the extract-and-run
+path only. It never invoked `patch_claude.py`, so it re-checked none of the
+facts above and did not put a real `codesign` in front of the tool. This section
+remains 📓: a prior-session record, one Mac, 2026-08-21, 2.1.238.
+
 **What that tool refuses, and why it matters on the real binary.** Its
 byte-patching half is exercised on Linux (`--no-sign`, `--dry-run`) by
-`tests/test_patch_claude.py`; the signing half still needs a Mac. Three
-refusals, all reproduced on this host on 2026-08-24:
+`tests/test_patch_claude.py`; the signing half still needs a Mac — and still has
+not had one. Three refusals, all reproduced on this host on 2026-08-24:
 
 - **Hits inside the code signature are dropped, and the skip is printed.**
   `--old com.anthropic --dry-run` against the shipped 324,973,552-byte
@@ -627,9 +681,97 @@ until 2026-08-23.
 
 ---
 
-## 9. The npm route: dead for `cli.js`, alive for the native binaries ✅
+## 9. Getting the native binaries — without a Mac, and without installing ✅
 
-**This is a correction.** This section previously read "the npm shortcut is
+### The first-party download endpoint — the documented route ✅
+
+Claude Code's own installer fetches its binaries from a plain HTTPS host, and
+so can you. The base URL is read from `claude.ai/install.sh` itself, where it
+is the value of `DOWNLOAD_BASE_URL`:
+
+```
+https://downloads.claude.ai/claude-code-releases
+```
+
+Measured on this host on **2026-08-24** (Linux; no Mac, no npm, no account, no
+token):
+
+| Path | What came back |
+|---|---|
+| `/latest` | `2.1.241` |
+| `/stable` | `2.1.231` |
+| `/<v>/manifest.json` | JSON: `version`, `commit`, `buildDate`, `platforms`, `sdkCompat` |
+| `/<v>/<platform>/claude` | `200` — checked for `darwin-arm64`, `darwin-x64`, `linux-x64` |
+| `/<v>/<platform>/claude.zst` | `200` — checked for `darwin-arm64`, `darwin-x64`, `linux-x64` |
+| `/<v>/manifest.zst.json` | `200` — a *second* manifest, for the compressed files |
+
+(The other five platforms were read out of `manifest.json` but not requested;
+no claim is made that their paths exist.)
+
+`latest` and `stable` **are not the same pointer and today they do not agree**
+(2.1.241 vs 2.1.231, ten version numbers apart). Whichever you use is a choice;
+pinning `<v>` to a literal version is a third.
+
+`manifest.json` for 2.1.241 carried `commit c87e2742fc9ad269ec8920460d00a091b1e410f0`,
+`buildDate 2026-08-22T23:04:33Z`, and a `platforms` object with **eight** keys —
+`darwin-arm64`, `darwin-x64`, `linux-arm64`, `linux-arm64-musl`, `linux-x64`,
+`linux-x64-musl`, `win32-arm64`, `win32-x64` — each an object of exactly
+`binary` (always the string `claude`), `checksum` (sha256) and `size`. The two
+darwin entries:
+
+| Platform | `checksum` (sha256, 2.1.241) |
+|---|---|
+| `darwin-arm64` | `1495eb7c42d3b4451f5f1cd38b6d498d22a4a38c802bc2be5c1cf1795e64820d` |
+| `darwin-x64` | `cf01b8cace66485ef5b476f14d96f69af61194a38c3df8412a80eb8f1316c10d` |
+
+Those two lines are the only place in this repo that states a binary checksum.
+Both files were downloaded here and both matched: `shasum -a 256 -c -` printed
+`OK`, and the on-disk size and the CDN's `Content-Length` both equalled the
+manifest's `size` — for the version actually fetched. That is §1's table for
+`darwin-x64` (both 2.1.241) but **not** for `darwin-arm64`, whose §1 row is the
+2.1.239 copy at 324,973,552 B, 82,080 bytes below 2.1.241's 325,055,632 B. The full runnable flow, with
+verification *inside* it rather than after it, is
+[README's macOS section](../README.md#macos) step 1; the failure branch was
+exercised too (truncated file + wrong checksum → `FAILED`, file deleted).
+
+Two traps worth writing down:
+
+- **The `.zst` files have their own checksums.** `manifest.json`'s `checksum`
+  is of the *decompressed* binary — install.sh fetches `manifest.zst.json`
+  separately when it wants the compressed one. `Content-Length` here was
+  64,578,859 B (`darwin-arm64/claude.zst`) and 69,188,990 B
+  (`darwin-x64/claude.zst`), matching the `size` fields in that second
+  manifest. This repo takes the plain `claude`; nothing here has run `zstd -d`
+  on one.
+- **The last path component is `claude`.** `curl -O` would create a file by
+  that name, which is precisely what can later be found on a `PATH` and shadow
+  a real installation. Always `-o` a name of your own.
+
+**Do not pipe `install.sh` to `bash`** if the goal is to avoid installing. Read
+from the script: it downloads into `$HOME/.claude/downloads` and then executes
+`"$binary_path" install`, which its own comment describes as setting up the
+launcher and shell integration.
+
+**Both Mac architectures are thin Mach-O.** First four bytes `cf fa ed fe` on
+both, `cputype` `0x0100000c` (arm64) and `0x01000007` (x86_64) — no
+fat/universal header, so `extract_bun.py`'s single `LC_SEGMENT_64` walk handles
+both with no slice selection. Measured 2026-08-24; the `darwin-x64` pipeline
+results are §6's third column.
+
+**On Linux too.** The same eight-platform manifest covers `linux-x64` and
+`linux-arm64` (and `-musl` builds of each), so this is also the answer for a
+Linux box with no `claude` installed. Checked only as far as `curl -I` on
+`/2.1.241/linux-x64/claude` → `200`, `Content-Length` 342,636,848 = the
+manifest `size`. Nothing on this host has extracted that copy: the Linux
+figures in this document come from the pre-installed `/usr/bin/claude` 2.1.222.
+
+### The npm route: dead for `cli.js`, alive for the native binaries ✅
+
+Kept because it is where this repo's `darwin-arm64` 2.1.239 and `win32-x64`
+2.1.239 measurements came from, not because it is the recommended route — that
+is the endpoint above.
+
+**This is a correction.** This subsection previously read "the npm shortcut is
 dead," full stop. Half of that is right, and the useful half was missing.
 
 **Dead:** `npm pack @anthropic-ai/claude-code` no longer yields a runnable
@@ -669,6 +811,16 @@ This is what made cross-platform verification possible at all. Extraction is
 byte arithmetic over a file; it does not care what OS can *execute* that file.
 The Mach-O extraction results throughout this document were produced this way.
 
+**And those historical numbers still describe the same artifact.** Measured
+2026-08-24: the `package/claude` payload inside
+`@anthropic-ai/claude-code-darwin-arm64` 2.1.241 and the file served by the
+download endpoint for `darwin-arm64` 2.1.241 have the **same sha256** — the
+`darwin-arm64` value in the checksum table above, on both — and the same size.
+Byte-identical. Both were hashed on this host. That is recorded here only so that the appendix's `npm pack` run
+does not read as evidence about some *other* build: the two routes deliver one
+artifact. It is not a second recommended route, and nothing below turns it into
+one.
+
 **Correction, 2026-08-22 — and it makes the darwin evidence stronger, not
 weaker.** This paragraph used to end "only *running* the extracted darwin
 JavaScript still needs Apple hardware", and the README, `status.md` and the
@@ -681,14 +833,33 @@ $ DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR=$(mktemp -d) \
 2.1.239 (Claude Code)          rc=0
 ```
 
-The extracted darwin JavaScript boots and runs. What actually needs a Mac is
-verifying **macOS-specific behaviour**, and that limit is precise:
+The extracted darwin JavaScript boots and runs — and since 2026-08-24 that is
+measured on **both** Mac architectures: the `darwin-x64` 2.1.241 artifact
+answers `mcp list` (`No MCP servers configured…`, rc 0) as well as `--version`
+(`2.1.241 (Claude Code)`, rc 0), under the same Linux Bun 1.3.14.
 
-- The darwin `.node` addons are Mach-O — `cffaedfe` (thin arm64) for
-  `image-processor` / `audio-capture` / `url-handler`, `cafebabe` (universal)
-  for `computer-use-swift` / `computer-use-input`. Loading one on Linux fails
-  with `ERR_DLOPEN_FAILED … invalid ELF header` ✅. Nothing about the darwin
-  native layer can be exercised here.
+**A second correction, 2026-08-24, in the same direction.** The paragraph that
+followed here used to say that what needs a Mac "is verifying macOS-specific
+behaviour", with the implication that none of it had been. Some of it has been,
+now: on 2026-08-24 an Apple Silicon host ran the `arm64` artifact **on macOS**
+under a darwin Bun 1.3.14 🍎 — `mcp list` rc 0, the interactive TUI, an
+authenticated session against a real account, and an image attached and
+described. The two bullets below are still exactly true **of this host**, which
+is what they were always about; what is no longer true is reading them as the
+state of the project. The narrowed macOS gap — the addon load, the image
+*resize* path, `codesign`, the A/B harness, and Intel Macs — is
+[status.md](./status.md) § macOS execution.
+
+So, for **this host**, the limit is precise:
+
+- The darwin `.node` addons are Mach-O, with the same split on both
+  architectures ✅: `cffaedfe` (thin — `cputype` arm64 on the `arm64` build,
+  x86_64 on the `x64` build) for `image-processor` / `audio-capture` /
+  `url-handler`, `cafebabe` (universal) for `computer-use-swift` /
+  `computer-use-input`. Loading one on Linux fails with
+  `ERR_DLOPEN_FAILED … invalid ELF header` — re-checked 2026-08-24 against the
+  `darwin-x64` `image-processor.node`. Nothing about the darwin native layer
+  can be exercised here, on either architecture.
 - `process.platform` is `linux`, so every platform-conditional branch takes the
   Linux path. Nothing that depends on being *on* macOS is exercised.
 
@@ -928,6 +1099,18 @@ committed loopback mock, measured 2026-08-23 on this host with Bun 1.3.14 and
 | shimmed (the default build) | a correct JPEG: `media_type: image/jpeg`, magic `ff d8 ff e0` |
 | the global flip, for comparison | the same JPEG — and a broken `Grep`, below |
 
+**That table is `linux-x64` only, and the macOS run did not add a row to it**
+🍎. On 2026-08-24 an Apple Silicon host built the shimmed artifact and ran a
+real session in which an image was attached and the model described it — so
+image *input* works there. But this table is about **resizing**: the as-shipped
+row is an image over the 2000×2000 limit failing, and the shimmed row is that
+same image coming back a JPEG. An image small enough not to need resizing never
+reaches the native branch at all, and nothing in the reported run says the one
+that was attached was oversized. So the honest statement is: **the shim applied
+on macOS, image input worked on macOS, and the resize path specifically is
+untested there.** Do not let "an image reached the model" stand in for this
+table.
+
 The flip is what reproduces across hosts; the JPEG's exact size is a property
 of this addon build, and this table used to quote one taken against a source
 PNG that was not in the repo, so an independent A/B measured a different number
@@ -1096,6 +1279,15 @@ exactly **4** bytes. Both figures, per platform, are §6's table — see
 *The measured counts*; they are not repeated here so that they cannot disagree
 with it.
 
+**It applies on macOS, and that is all that is known there** 🍎. Built on an
+Apple Silicon host on 2026-08-24 against that machine's own 2.1.239, the shim
+selected gate `AE`, moved the call sites `23 -> 22` and reported `applied: 1` —
+the same three figures this host measures for `darwin-arm64` 2.1.239. So the
+*selection* logic — the anchor, the `if(<gate>())try{` shape, the single-gate
+refusal — works against a real binary on a real Mac. What was not observed there
+is the branch it unlocks doing anything: see the paragraph under the A/B table
+in *Measured consequences*.
+
 | gate site | why it stays false |
 |---|---|
 | embedded ripgrep | flipping it is the measured `No matches found` above — a wrong answer, not an error |
@@ -1128,11 +1320,25 @@ went 1 → 0, the arithmetic balanced, `check()` returned clean — and image
 processing was still off, with a gate nobody had looked at now true. The shim
 now refuses a file that declares more than one *distinct* gate name (two
 declarations of the *same* name are not an ambiguity and still shim), the same
-way it already refused a duplicated anchor. Measured on this host 2026-08-23:
-exactly one declaration in each real entry module, `CE` in the 22,960,130-byte
-linux-x64 2.1.222 module and `AE` in the 28,244,743-byte darwin-arm64 2.1.239
-one — the artifact this repo builds from `/usr/bin/claude` is byte-identical
-before and after the change.
+way it already refused a duplicated anchor. Measured on this host 2026-08-23
+and 2026-08-24: exactly one declaration in each real entry module, and a
+**different name in each** — `CE` in the 22,960,130-byte linux-x64 2.1.222
+module, `AE` in the 28,244,743-byte darwin-arm64 2.1.239 one, and `Tw` in the
+28,245,789-byte darwin-x64 2.1.241 one. The artifact this repo builds from
+`/usr/bin/claude` is byte-identical before and after the change.
+
+**Three names, three modules — and what that does and does not show.** This is
+the strongest evidence the repo has that the gate name must be *captured* from
+the module rather than hard-coded: three real entry modules, three distinct
+two-character names, no overlap. But be exact about the experiment. The three
+samples differ in **both** platform *and* version — linux-x64 2.1.222,
+darwin-arm64 2.1.239, darwin-x64 2.1.241 — so they do **not** on their own show
+that the name varies *by platform*. A per-build minifier that renamed on every
+release would produce exactly this table too. What is established is that the
+name is not a constant across the binaries this project actually handles, which
+is all the transform needs; which axis it varies along would take two builds of
+the *same* version on different platforms to separate, and this repo has never
+held such a pair.
 
 **When it does not apply.** A renamed anchor or a restructured function is a
 **warning, not a build failure**: the artifact degrades to exactly what this
@@ -1189,7 +1395,10 @@ scripts/ab-equivalence.sh --as-shipped OUT_A/extract \
 
 It needs `node` for the mock and `rg` on `PATH` — an extracted build has no
 embedded ripgrep, which is point 4 above arriving as a case failure rather than
-as an explanation — and it is **Linux-only**. The egress guard below reads
+as an explanation — and it is **Linux-only**, which the 2026-08-24 macOS run did
+nothing to change: the script cannot start there, so the three-way A/B has been
+run on exactly one operating system and every figure it produces is a
+`linux-x64` figure. The egress guard below reads
 `/proc/<pid>/fd` against `/proc/net/tcp`, and there is no portable substitute
 in here yet, so the script refuses to start where `/proc` is unreadable rather
 than run the comparison with its own safety net silently missing. A preflight
@@ -1276,7 +1485,12 @@ anyone whose `python3` links a different-but-correct zlib.
 
 ## Appendix: exact commands used ✅
 
-Every command below was run on this host. `/usr/bin/claude` was only ever read.
+Every command below was run on **this host** — Linux x86_64. `/usr/bin/claude`
+was only ever read. Nothing from the 2026-08-24 Apple Silicon run 🍎 is in this
+block, deliberately: that run's commands and figures live in
+[README's macOS section](../README.md#macos), attributed to the machine that
+executed them. Keeping the two apart is the whole point of this appendix's
+opening sentence.
 
 ```bash
 # Bun 1.3.14, installed WITHOUT touching PATH or any rc file
@@ -1287,15 +1501,31 @@ unzip -o -j /tmp/bun-1.3.14.zip 'bun-linux-x64/bun' -d "$HOME/.bun-1.3.14"
 # extract + post-process, Linux ELF
 BUN_BIN="$HOME/.bun-1.3.14/bun" scripts/build.sh /usr/bin/claude
 
-# the same pipeline against the real macOS binary, on Linux
+# get a darwin binary without a Mac: the first-party endpoint (§9). Run here
+# 2026-08-24 for BOTH P=darwin-arm64 and P=darwin-x64; the verification is
+# inside the flow, and the file is deleted if it does not match. The full form,
+# with the manifest parse, is README's macOS section step 1 - it is one place,
+# not two. Never `curl -O`: the last path component is `claude`, and a stray
+# file by that name is what could later be found on a PATH and shadow a real
+# installation.
+BASE=https://downloads.claude.ai/claude-code-releases
+V="$(curl -fsSL "$BASE/latest")"        # 2.1.241 on 2026-08-24; /stable said 2.1.231
+P=darwin-x64                            # or darwin-arm64; both were run
+mkdir -p /tmp/ccdl
+curl -fsSL "$BASE/$V/manifest.json" -o /tmp/ccdl/manifest.json
+SUM="$(python3 -c 'import json,sys; print(json.load(open("/tmp/ccdl/manifest.json"))["platforms"][sys.argv[1]]["checksum"])' "$P")"
+curl -fsSL "$BASE/$V/$P/claude" -o /tmp/ccdl/claude-$P.bin
+printf '%s  %s\n' "$SUM" /tmp/ccdl/claude-$P.bin | shasum -a 256 -c -   # → OK
+
+# the same pipeline against a real macOS binary, on Linux - x64 run 2026-08-24
+OUT_DIR=/tmp/nrc-x64/build scripts/build.sh /tmp/ccdl/claude-darwin-x64.bin
+
+# how the darwin-arm64 2.1.239 and win32-x64 2.1.239 copies in §1's table were
+# obtained, historically (§9). Kept for provenance, not as a recommended route;
+# `npm pack` gives whatever is CURRENT, which on 2026-08-24 was 2.1.241, not the
+# 2.1.239 those numbers were measured against. Measured 2026-08-24: the 2.1.241
+# payload it delivers is byte-identical to the endpoint download above.
 npm pack @anthropic-ai/claude-code-darwin-arm64                    # → a .tgz
-#   re-run 2026-08-24: returns whatever version is CURRENT (2.1.241 that day),
-#   not the 2.1.239 these numbers were measured against - see §9.
-# The tarball's payload is named `claude`. This repo never creates a file by
-# that name - a stray `claude` is exactly what could later be found on a PATH
-# and shadow a real installation - so rename it as it comes out of the archive.
-# Re-checked 2026-08-24: the transform below yields a thin arm64 Mach-O
-# (cf fa ed fe) at the size §1's table records for darwin-arm64.
 mkdir -p /tmp/ccmac
 tar xf anthropic-ai-claude-code-darwin-arm64-*.tgz -C /tmp/ccmac \
     --transform='s|package/claude$|package/claude-darwin-arm64.bin|'
@@ -1315,8 +1545,10 @@ DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \
   "$HOME/.bun-1.3.14/bun" build/extract/cli.original.cjs mcp list
 
 # regression. What this prints depends on what the host has; NRC_TEST_ELF /
-# NRC_TEST_MACHO / BUN_BIN override the paths. The four per-host counts are
-# NOT repeated here - README's table is the single place that states them,
+# NRC_TEST_MACHO / BUN_BIN override the paths. The five per-host counts - and
+# the Apple Silicon run's, which are different again because that run predates
+# tests/test_makefile.py - are NOT repeated here. README's table is the single
+# place that states them,
 # along with the exact invocation that forces each row. Four counts used to
 # live here as well, contradicting README's table from the commit that
 # introduced them (9c98027: README said 199 passed, this block said 190) and
