@@ -6,10 +6,10 @@ against three real Claude Code binaries.
 
 **The container is the only thing that differs between platforms.** Mach-O
 carries the graph in `__BUN,__bun`, ELF and PE in a section named `.bun`, and
-inside all three the wrapped payload has an **identical byte layout** — the same
-u64 length prefix, the same module-record table, the same 16-byte trailer. All
-three were parsed with the same payload code path here (§2–§4); only §1's
-section lookup is platform-specific.
+inside all three the wrapped payload has an **identical byte layout**. All three
+were parsed with the same payload code path here (§2–§4); only §1's section
+lookup is platform-specific. The per-binary section offsets and sizes are
+[findings.md](./findings.md) §2's table.
 
 All integers are **little-endian**.
 
@@ -39,9 +39,6 @@ section_64 (80 bytes each):
   +0x30 u32       offset           → rawOffset (file offset)
 ```
 
-Observed on `darwin-arm64` 2.1.239: `rawOffset = 69107712`,
-`rawSize = 255007133`.
-
 ---
 
 ## 1b. Locate the section — ELF (Linux)
@@ -65,8 +62,6 @@ elf64_shdr (e_shentsize bytes, fields used here):
 
 Read the header at index `e_shstrndx` to find the string table, then compare
 each section's NUL-terminated name against `.bun`.
-
-Observed on `linux-x64` 2.1.222: `rawOffset = 86904832`, `rawSize = 202513494`.
 
 **Failure mode to handle explicitly:** a fully stripped ELF (`e_shoff == 0` or
 `e_shnum == 0`) has no section headers at all, so `.bun` cannot be located this
@@ -96,10 +91,9 @@ section header (40 bytes each):
   +0x14 u32      PointerToRawData     → rawOffset
 ```
 
-Observed on `win32-x64` 2.1.239: `rawOffset = 95182336`,
-`SizeOfRawData = 242479616`, `VirtualSize = 242479183`.
+Observed on `win32-x64` 2.1.239: `VirtualSize = 242479183`.
 
-**PE pads the section to the file alignment.** `SizeOfRawData` here exceeds
+**PE pads the section to the file alignment.** `SizeOfRawData` exceeds
 `payload_size + 8` by 433 bytes; on ELF and Mach-O the section size matched
 `payload_size + 8` exactly. Never derive the payload length from the section
 size — always read the u64 length prefix in §2. (`VirtualSize` happens to equal
@@ -126,13 +120,8 @@ TRAILER = "\n---- Bun! ----\n"   (16 bytes — both newlines count)
 assert payload[-16:] == TRAILER
 ```
 
-Observed:
-
-| Binary | `payload_size` | trailer |
-|---|---|---|
-| `linux-x64` 2.1.222 | 202513486 | matches |
-| `darwin-arm64` 2.1.239 | 255007125 | matches |
-| `win32-x64` 2.1.239 | 242479175 | matches |
+The trailer matched on all three binaries; their `payload_size` values are
+[findings.md](./findings.md) §2's table.
 
 ---
 
@@ -150,11 +139,11 @@ start = len(payload) - len(TRAILER) - 32      # = len(payload) - 48
 (The remaining fields of the 32-byte struct are other section offsets not needed
 for extraction.)
 
-> **Arithmetic note.** Earlier revisions of this document called the trailer 15
-> bytes and gave `len(payload) - 47`. Both were wrong: `"\n---- Bun! ----\n"` is
-> **16** bytes, so the struct starts at `len(payload) - 48`. The code was never
-> affected — it computes `len(TRAILER)` — but anyone reimplementing from the
-> prose would have been off by one and read a shifted `modules_offset`.
+> **Arithmetic note.** Earlier revisions called the trailer 15 bytes and gave
+> `len(payload) - 47`. `"\n---- Bun! ----\n"` is **16** bytes, so the struct
+> starts at `len(payload) - 48`. The code was never affected — it computes
+> `len(TRAILER)` — but anyone reimplementing from the prose would have read a
+> shifted `modules_offset`.
 
 Observed:
 
@@ -200,13 +189,11 @@ at tag `bun-v1.3.14` (`pub const Loader = enum(u8)`, lines 568-589):
 14 bunsh 15 sqlite 16 sqlite_embedded 17 html 18 yaml 19 json5 20 md
 ```
 
-> **This table was wrong here until 2026-08-22, and the error was consequential.**
-> An earlier revision omitted `jsonc = 7`, which shifts every id from 7 upward
-> down by one. Under that table the `.node` addons — which carry raw loader
-> **byte 10** — read as `base64` instead of `napi`, and a whole (false) story
-> about a "`base64` loader that stores raw bytes" was written to rationalise
-> it. See [findings.md](./findings.md) §5a for the post-mortem. Transcribe this
-> from Bun's source, not from another extractor.
+> **This table was wrong here until 2026-08-22, and consequentially.** An
+> earlier revision omitted `jsonc = 7`, shifting every id from 7 upward down by
+> one, so the `.node` addons — raw loader **byte 10** — read as `base64` instead
+> of `napi` ([findings.md](./findings.md) §5a). Transcribe this from Bun's
+> source, not from another extractor.
 
 **Measured** ✅ — the raw loader byte at record offset 49, read by a
 standalone parser (not this repo's tools) on both shipped binaries:
@@ -221,11 +208,8 @@ module).
 
 **Critical, and independent of the enum:** the **content is always the raw
 stored bytes**. The loader id tells Bun how to *present* the module to JS at
-runtime — `base64` would mean "expose this asset to JS as a base64 string" — it
-never means the stored bytes are base64-encoded. That holds for every loader,
-including a real `base64` one: **do not decode.** The `.node` addons are stored
-as raw Mach-O (macOS) or raw ELF (Linux) because *all* stored content is raw,
-not because of anything specific to their loader.
+runtime; it never means the stored bytes are encoded. That holds for every
+loader, including a real `base64` one: **do not decode.**
 
 ---
 

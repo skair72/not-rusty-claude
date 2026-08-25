@@ -69,7 +69,6 @@ anyway, which is where the risk actually lived.
 - PE *extraction* (detection only — explicitly scoped out).
 - Installing anything on `PATH`. `build.sh` emits artifacts and prints the run
   command; it must never shadow the system `claude`.
-- Touching Approach B (`patch_claude.py`), which is already verified and orthogonal.
 - Deobfuscating or modifying Claude's application behaviour.
 
 ## 4. Architecture

@@ -1,8 +1,8 @@
-# Scoped `isStandaloneExecutable` shim + `patch_claude.py` test coverage
+# Scoped `isStandaloneExecutable` shim
 
 **Date:** 2026-08-23
 **Status:** design of record for branch `claude/image-shim-and-patch-tests`.
-Both parts are **implemented**, and this document has been reconciled with what
+Implemented, and this document has been reconciled with what
 actually shipped: where the implementation departed from the plan, the plan's
 wording is kept and the departure is marked **Changed during implementation**
 (or **Changed during re-review**, for what a second adversarial pass falsified
@@ -11,30 +11,11 @@ falsified the original claim.
 The user-facing record is [findings.md](../../findings.md) §11 (*What shipped:
 the scoped shim*).
 
-Two independent pieces of work, both carried forward from the fleet review that
-closed PR #1:
-
-1. Close the *image-processing* half of the equivalence gap
-   ([findings.md](../../findings.md) §11) with a shim scoped to one call site.
-2. Give `tools/patch_claude.py` — the one tool in this repo that writes to a
-   signed binary — a real test suite. Checked out and counted 2026-08-23: at
-   `7ea5562~1` the tool was **261** lines with **no** `tests/test_patch_claude.py`
-   at all (re-checked with `git show` on 2026-08-24: still 261). As of
-   2026-08-24 it is **602** lines with **111** tests.
-
-   > **Retraction, 2026-08-24.** This paragraph said **507** lines and **94**
-   > tests, claiming to have been "re-counted 2026-08-24". Both were wrong on
-   > that date: `wc -l` reports 602 and `pytest --collect-only` reports 111. The
-   > figures before those — 330 lines, 58 tests — were correct at `9c98027` and
-   > went stale in the very next commit, which is the same failure twice. The
-   > numbers above were measured on 2026-08-24 on the Linux host, on this
-   > branch's working tree; a count in a dated design document is a transcript of
-   > its day and will go stale again. The live figure is
-   > [README's test section](../../../README.md#the-test-suite-and-its-counts).
+Carried forward from the fleet review that closed PR #1: close the
+*image-processing* half of the equivalence gap
+([findings.md](../../findings.md) §11) with a shim scoped to one call site.
 
 ---
-
-## Part 1 — the scoped shim
 
 ### The problem, restated
 
@@ -448,118 +429,6 @@ is the document that argued for the design:
 - **`scripts/ab-equivalence.sh` still cannot run there**, so none of the
   three-way evidence above has a macOS counterpart, and the *Verification*
   section's A/B remains a `linux-x64` measurement.
-- **Part 2 is untouched by that run.** It never invoked `patch_claude.py`, so
-  the `codesign` half remains what it has always been: unexercised.
 
 The one-line probe that would close the first two bullets is in
 [status.md](../../status.md) § macOS execution, alongside the addon-load check.
-
----
-
-## Part 2 — `patch_claude.py` tests
-
-### What the tool is
-
-A length-preserving byte patcher and ad-hoc re-signer for the *native* Mach-O
-binary. It is pre-existing and macOS-only in its second half; it *was* untested,
-which is what this part of the work is about. Its load-bearing invariant is that
-the output is **exactly** as long as the input: Mach-O offsets are absolute, so
-a file that grows or shrinks mid-patch is corrupt — and under `--in-place` it
-corrupts the signed binary where it stands (the `darwin-arm64` 2.1.239 build
-measured here is 324,973,552 bytes).
-
-### What is testable on Linux, and how
-
-`--no-sign` returns from `main()` before any `codesign` call, so the entire
-byte-patching path runs end-to-end on this host against a synthetic binary. The
-suite drives the real CLI through `subprocess`, in the style of
-`tests/test_build_script.py`, and covers (all of the following shipped):
-
-- the length invariant: `--new` longer than `--old` is refused *before* any
-  write; padding lands at the end; the output size is unchanged
-- `--pad`: one byte only; `\0` accepted for C strings
-- `--occurrence`: `all`, a valid 1-based index, out of range, non-integer
-- `--dry-run` writes nothing at all
-- `--out` vs `--in-place`, and that `--in-place` leaves a `.bak` that is the
-  *pristine* original even across repeated runs
-- neither `--out` nor `--in-place` is an error, not a silent no-op
-- a `--old` that is absent is refused
-- multi-byte UTF-8 is measured in bytes, not characters
-
-The macOS-only helpers (`original_identifier`, `dump_entitlements`, `resign`)
-are unit-tested against a stubbed `run()`, which is also how the *ordering*
-requirement is checked: entitlements and identifier must be read from the
-binary **before** its bytes are overwritten.
-
-The shipped suite went past this list, in the places where writing the tests
-turned something up: overlapping `--old` matches that would write over each
-other's padding, back-to-back hits that only *look* overlapping, `--out`
-pointing at the input, the quarantine xattr having to be dropped *after* the
-signature lands, a failed `codesign --verify` being fatal, and `--verify`
-actually launching the patched binary. **111** tests in total, collected on the
-Linux host on 2026-08-24 — see the retraction at the top of this document, which
-is where the **94** that used to stand here came from.
-
-### What the tests changed
-
-"No behaviour change beyond what a test proves wrong" was the rule, and the
-tests did prove something wrong, so this is what moved:
-
-- **`splice()` is now a function of its own**, and it raises rather than
-  returning a resized buffer. The length invariant used to be checked by
-  `os.path.getsize()` *after* the write — and under `--in-place` the
-  destination *is* the source, so by the time that check could fire the
-  original was already overwritten. It now runs on the in-memory buffer before
-  the destination is opened, and before `--dry-run` returns, so a rehearsal
-  reports it too.
-- The post-write size check survives, with a narrower job: catching a write
-  that lands **short** (quota, `ENOSPC`) and telling the user to recover from
-  the `.bak`, instead of printing `Patched` over a truncated binary.
-- The `--verify` help text says to attach dashed arguments with `=`
-  (`--verify=--version`), because argparse otherwise reads them as options.
-- The measured cost of an empty `--old` was re-stated as load-dependent
-  ("tens of seconds per MiB") rather than as a single wall-clock figure, since
-  this host is shared between agents.
-
-**Changed during re-review.** The review fleet found four more. Three of them
-are behaviour a user of this tool has to know about, and each was reproduced
-on this Linux host on 2026-08-24:
-
-- **A signing run on a host with no `codesign` used to leave an unpatched copy
-  of the input at `--out`.** This was a regression introduced by the same
-  reordering that made `splice()` raise: `shutil.copy2(src, dest)` ran before
-  the `codesign` reads, and those raise `FileNotFoundError` rather than
-  returning non-zero, so the destination was created and then never written.
-  `printf 'HEAD NEEDLE TAIL' > fixture.bin` with
-  `--old NEEDLE --new N --out out.bin` left `out.bin` holding
-  `HEAD NEEDLE TAIL` — verbatim, unpatched, under the name the user asked for,
-  behind an unhandled traceback that said nothing about it. There is now a
-  pre-flight refusal before anything is created, and `main()` reads the
-  signing metadata before it creates the destination so that a failure in
-  `codesign` itself cannot leave a file behind either. The same fixture now
-  prints one sentence and leaves no `out.bin` at all.
-- **Hits inside `LC_CODE_SIGNATURE` are dropped, reported, and excluded from
-  the patched count.** On the shipped 324,973,552-byte `darwin-arm64` Mach-O,
-  `--old com.anthropic --dry-run` finds **137** hits and **2** of them
-  (`0x1354BE54`, `0x135E69E5`) are inside the signature blob
-  (324,320,704..324,973,552) — the signing Identifier
-  `com.anthropic.claude-code`, stored as a literal C string in the
-  CodeDirectory. It now prints `Found 137 occurrence(s); patching 135` and
-  names the two it skipped; `--patch-signature` overrides.
-  `code_signature_range()` reads the Mach-O header and load-command table only,
-  so the check costs the same on a 325 MB binary as on a 3 KB one, and returns
-  `None` — "I cannot tell", not a refusal — for anything that is not a thin
-  Mach-O it recognises, which is what keeps the test suite's Mach-O-shaped
-  fixtures patchable.
-- **`--out <the input>` is refused**, by `os.path.samefile` rather than a
-  string compare, so a symlink or hard link to the input is caught too.
-  Answering it as written was an in-place patch with no `.bak`; it now dies
-  with `--out names the input; use --in-place, which keeps a .bak`.
-- The fourth, not user-visible: the third full in-RAM copy of the binary that
-  this work had added was removed —
-  `blob` is read as `bytes` and no longer re-copied at the find and at every
-  preview line. `splice()` takes its own `bytearray()` and `preview()` only
-  slices, so the change is behaviour-preserving.
-
-Still out of scope: this tool is not part of the extract → postprocess → run
-pipeline; it is a macOS utility that happens to live here.
