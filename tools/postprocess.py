@@ -414,7 +414,13 @@ def check(code, counts, assets_on_disk=None, asset_names_on_disk=None):
                       "function wrapper'")
     if counts["iife"] == 0:
         # `\})\s*$` is $-anchored, so subn() can never make more than one
-        # substitution; 0 is the only failure this can report.
+        # substitution; 0 is the only failure this can report. That anchor is
+        # what makes the sentence above true, so it is pinned by a test of its
+        # own (tests/test_postprocess.py::
+        # test_only_the_final_wrapper_is_invoked_not_every_closure): without
+        # it, an entry with two interior `})` transforms to iife == 3 - the
+        # invocation spliced in after every closure - and this branch still
+        # reports 0 errors, because it only asks about 0.
         errors.append("no trailing IIFE to invoke - the file does not end in "
                       "'})', so require()-ing it would define the wrapper and "
                       "never run it")

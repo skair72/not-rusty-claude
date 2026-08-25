@@ -58,6 +58,48 @@ def test_trailing_iife_is_invoked(postprocess):
     assert out.rstrip().endswith("})(exports, require, module, __filename, __dirname)")
 
 
+# Interior closures: two `})` before the wrapper's own, in the two shapes the
+# real entry module is full of - a factory call and an event handler. Every
+# other fixture in this file ends at its first and only `})`, which is what
+# left the `$` anchor untested.
+INTERIOR_CLOSURES = ('var a=re(function(A,q){q.exports=1});'
+                     'process.on("exit",function(){})\n')
+
+INVOCATION = "})(exports, require, module, __filename, __dirname)"
+
+
+def test_only_the_final_wrapper_is_invoked_not_every_closure(postprocess):
+    """The `$` on the IIFE regex is load-bearing, and only this pins it.
+
+    Dropping the anchor (`\\}\\)\\s*$` -> `\\}\\)\\s*`) left the whole hermetic
+    suite green before this test existed, and with it in place this is the
+    only test that fails - measured both ways on a copy of the tree. Every
+    other fixture here contains exactly one `})`, at the very end, so subn()
+    makes one substitution either way. On this input the un-anchored form makes
+    three: counts["iife"] == 3, and the output becomes
+
+        ...function(A,q){q.exports=1})(exports, require, module, __filename,
+        __dirname);...function(){})(exports, require, module, __filename,
+        __dirname)r("cli_after_main_complete")...
+
+    - two function expressions called with five arguments they do not take,
+    and, because `\\s*` also eats the newline that separated them, `)r(...)`,
+    which is a syntax error. check() reports 0 errors on all of it, since it
+    only asks whether iife == 0. So the corruption is what has to be asserted
+    here, not the reasoning in check()'s comment: that reasoning is the thing
+    the anchor makes true.
+    """
+    out, counts = postprocess.transform(REAL_HEAD + INTERIOR_CLOSURES + REAL_TAIL)
+
+    assert counts["iife"] == 1
+    assert out.count(INVOCATION) == 1
+    assert out.endswith(INVOCATION)
+    # the interior closures survive untouched, newline and all
+    assert 'var a=re(function(A,q){q.exports=1});' in out
+    assert 'process.on("exit",function(){})\n' in out
+    assert postprocess.check(out, counts) == []
+
+
 def test_baked_in_build_machine_file_url_is_rewritten(postprocess):
     """Bun's bundler resolved import.meta.url into a literal file:// URL of the
     build machine. The namespace prefix must be consumed too, or the result is

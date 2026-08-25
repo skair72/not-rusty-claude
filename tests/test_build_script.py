@@ -92,6 +92,50 @@ def test_build_sh_produces_the_artifacts(tmp_path):
     assert (out / "extract" / "cli.js").is_file()
 
 
+def _marked_entry(marker):
+    """A transformable entry module carrying a distinguishable string, so a
+    rebuild's output can be told apart from the build it replaced."""
+    return (b"// @bun @bytecode @bun-cjs\n"
+            b"(function(exports, require, module, __filename, __dirname) {\n"
+            b"module.exports=\"" + marker + b"\";\n"
+            b"})\n")
+
+
+def test_a_second_successful_build_replaces_the_artifact_and_leaves_no_debris(tmp_path):
+    """The swap's HAPPY path, which every other test here leaves unpinned.
+
+    The three rebuild tests below all make the second build FAIL, so none of
+    them reaches `mv "$WORK" "$PREV"` at all, and the surviving assertion about
+    debris only looks at OUT_DIR's top level. Turning that mv into `cp -r`
+    therefore survived the whole suite - and it is not a harmless mutation:
+    $WORK still exists afterwards, so the following `mv "$STAGE" "$WORK"` moves
+    the staging directory INSIDE it. The user is left with build/extract/
+    containing the OLD cli.original.cjs plus a nested .extract.stage.NNN
+    holding the new one, after a build that reported success. Running a
+    rebuilt artifact that is silently the previous release's is exactly what
+    this swap exists to prevent, so a successful rebuild is asserted here on
+    both halves: the artifact is the new bytes, and nothing is left over.
+    """
+    out = tmp_path / "out"
+    first = _synthetic_binary(tmp_path / "native1", entry=_marked_entry(b"BUILD-ONE"))
+    assert _build(out, first).returncode == 0
+    extract = out / "extract"
+    first_names = sorted(p.name for p in extract.iterdir())
+    assert b"BUILD-ONE" in (extract / "cli.original.cjs").read_bytes()
+
+    second = _synthetic_binary(tmp_path / "native2", entry=_marked_entry(b"BUILD-TWO"))
+    result = _build(out, second)
+
+    assert result.returncode == 0, result.stderr
+    cjs = (extract / "cli.original.cjs").read_bytes()
+    assert b"BUILD-TWO" in cjs, "the rebuild reported success but the artifact is stale"
+    assert b"BUILD-ONE" not in cjs
+    assert sorted(p.name for p in extract.iterdir()) == first_names, \
+        "the swap left something extra inside %s" % extract
+    assert [str(p.relative_to(out)) for p in out.rglob(".extract*")] == []
+    assert sorted(p.name for p in out.iterdir()) == ["extract"]
+
+
 def test_a_failed_extraction_leaves_the_previous_build_intact(tmp_path):
     """Reproduces the reported loss: `scripts/build.sh /bin/ls` on top of a
     good build used to rm -rf the artifacts before extraction could fail."""
@@ -219,6 +263,36 @@ def test_auto_discovery_skips_a_dud_newer_version(tmp_path):
     assert "2.1.239" in result.stdout
     assert "ignored unusable version(s)" in result.stderr
     assert "2.1.241" in result.stderr
+
+
+def test_auto_discovery_skips_a_truncated_dud_at_the_size_boundary(tmp_path):
+    """The value of build.sh's MIN_NATIVE_BYTES, pinned from both sides.
+
+    The sibling test above writes its dud as 0 bytes, which fails any threshold
+    from 1 upward - so MIN_NATIVE_BYTES=1048576 could be mutated to 1 and the
+    suite stayed green, while the "truncated" case the constant's own comment
+    names (an interrupted update leaves "a 0-byte or truncated entry") sailed
+    through and got selected. Here the newer version is a real binary cut to
+    exactly one byte BELOW the threshold, and the older one is exactly AT it:
+    a threshold any lower selects the truncated 2.1.241 and the extractor then
+    reports a container error for what is really a broken install, and a
+    threshold any higher rejects the good binary too and the build dies with
+    "native Claude binary not found".
+    """
+    home = tmp_path / "home"
+    good = fixtures.build_elf(fixtures.build_payload(
+        [("/$bunfs/root/cli", GOOD_ENTRY, 1)]))
+    good = good + b"\0" * (1048576 - len(good))
+    assert len(good) == 1048576
+    dud = good[:1048575]
+    _versions_dir(home, [("2.1.239", good), ("2.1.241", dud)])
+
+    result = _autodiscover(home, tmp_path / "out")
+
+    assert result.returncode == 0, result.stderr
+    assert "2.1.239" in result.stdout
+    assert "2.1.241" in result.stderr
+    assert "ignored unusable version(s)" in result.stderr
 
 
 def test_an_explicitly_passed_stub_is_refused_as_an_install_problem(tmp_path):

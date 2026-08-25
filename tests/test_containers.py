@@ -309,19 +309,30 @@ def test_payload_shorter_than_its_own_footer_is_rejected_cleanly(extract_bun, ca
     assert "too short" in capsys.readouterr().err
 
 
-def test_elf_section_header_entry_too_small_is_rejected_cleanly(extract_bun, capsys):
+# 39 and 8 below, and 3 and 999 in the test after it, are the boundary and the
+# far case of the same two guards. Only the far cases were pinned, so both
+# guards could be relaxed by one - `< 39`, `> e_shnum` - and stay green while
+# reintroducing exactly the struct.error each was added to prevent. A test that
+# never sits ON the boundary cannot see an off-by-one there.
+
+@pytest.mark.parametrize("e_shentsize", [39, 8])
+def test_elf_section_header_entry_too_small_is_rejected_cleanly(
+        extract_bun, capsys, e_shentsize):
     """e_shentsize below the 40 bytes shdr() unpacks.
 
     The table-extends-past-EOF check multiplies e_shnum by e_shentsize, so a
     small enough entry size satisfies it while each individual read still runs
     off the end: here the table is declared to end exactly at EOF, and reading
     one 40-byte header at its start already goes past. Raw struct.error without
-    this guard.
+    this guard - measured at e_shentsize=39 with the guard relaxed to `< 39`:
+    "unpack_from requires a buffer of at least 398 bytes for unpacking 40 bytes
+    at offset 358 (actual buffer size is 397)".
     """
     payload = fixtures.build_payload([("/$bunfs/root/cli", b"x", 1)])
     blob = bytearray(fixtures.build_elf(payload))
-    struct.pack_into("<Q", blob, 0x28, len(blob) - 8)   # e_shoff: 8 bytes from EOF
-    struct.pack_into("<H", blob, 0x3A, 8)               # e_shentsize
+    # table declared to end exactly at EOF, whatever the entry size
+    struct.pack_into("<Q", blob, 0x28, len(blob) - e_shentsize)   # e_shoff
+    struct.pack_into("<H", blob, 0x3A, e_shentsize)
     struct.pack_into("<H", blob, 0x3C, 1)               # e_shnum
     struct.pack_into("<H", blob, 0x3E, 0)               # e_shstrndx
 
@@ -331,12 +342,21 @@ def test_elf_section_header_entry_too_small_is_rejected_cleanly(extract_bun, cap
     assert "too small" in capsys.readouterr().err
 
 
-def test_elf_string_table_index_out_of_range_is_rejected_cleanly(extract_bun, capsys):
+@pytest.mark.parametrize("e_shstrndx", [3, 999])
+def test_elf_string_table_index_out_of_range_is_rejected_cleanly(
+        extract_bun, capsys, e_shstrndx):
     """e_shstrndx indexes the section table before any loop bound applies to
-    it - the one field the earlier bounds check did not cover."""
+    it - the one field the earlier bounds check did not cover.
+
+    The fixture has 3 sections, so index 3 is the FIRST invalid one: with the
+    guard relaxed to `> e_shnum` it reaches shdr(3) and raises "unpack_from
+    requires a buffer of at least 437 bytes ... (actual buffer size is 397)",
+    measured. 999 is the same field simply corrupt.
+    """
     payload = fixtures.build_payload([("/$bunfs/root/cli", b"x", 1)])
     blob = bytearray(fixtures.build_elf(payload))
-    struct.pack_into("<H", blob, 0x3E, 999)   # e_shstrndx, only 3 sections
+    assert struct.unpack_from("<H", blob, 0x3C)[0] == 3   # e_shnum
+    struct.pack_into("<H", blob, 0x3E, e_shstrndx)
 
     with pytest.raises(SystemExit):
         extract_bun.find_bun_section_elf(bytes(blob))
