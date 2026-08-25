@@ -126,6 +126,28 @@ yourself does nothing — the CLI never reads it
 troubleshooting: [`docs/runbook.md`](docs/runbook.md); on a Mac, read the
 section below first.
 
+### Under Node instead of Bun
+
+Yes — **Node ≥ 24 only**: the bundle's `using` declarations (ES explicit
+resource management) are a parse error before that — `node --check` fails on
+22.23.2 and 23.11.1, passes on 24.0.0 and 26.7.0. Node also has no `ws`, no
+`undici` and no `Bun` global; the targets below and `scripts/bun-shim.cjs`
+supply all three.
+
+```bash
+make node-deps                          # ws + undici into ~/.cache, not this repo
+make node-run NODE_BIN=/path/to/node24  # node --require scripts/bun-shim.cjs …
+#   → No MCP servers configured. Use `claude mcp add` to add a server.
+```
+
+Measured 2026-08-25, Bun 1.3.14 against Node 24.0.0 and 26.7.0: `--version`,
+`--help`, `mcp list` and `config ls` print **byte-identical stdout with equal
+exit codes**; `doctor` differs in one line, the `Path:` naming the interpreter
+actually running. **A real agentic conversation under Node has never been run** —
+that is the command surface only, and where the shim cannot match Bun (`YAML`,
+`wrapAnsi`, `spawn`, …) it throws naming the API rather than guessing. Detail:
+[`docs/findings.md`](docs/findings.md) §11.
+
 ## macOS
 
 **Three levels of confidence, kept apart on purpose:** block 1 was never
@@ -274,6 +296,7 @@ not-rusty-claude/
 │                                   plus the scoped image shim (findings §10)
 ├── scripts/
 │   ├── build.sh                    extract → post-process → print the run command
+│   ├── bun-shim.cjs                globalThis.Bun stand-in, so Node ≥ 24 can run it
 │   ├── ab-equivalence.sh           the findings §10 A/B (Linux-only: /proc)
 │   ├── mock-messages-api.mjs       loopback-only mock of the Messages API
 │   └── syntax-check.js             fast secondary syntax check (JSC, not Bun)
@@ -291,30 +314,31 @@ run's, reconciled below rather than written out twice — the repo's convention
 being that **a measured figure is stated in one place, and appears elsewhere
 only as quoted command output labelled with the binary and date that produced
 it.** These counts *move*, in both directions, as test files are added and removed —
-which is exactly why. Every row was re-measured here on 2026-08-24
+which is exactly why. Every row was re-measured here on 2026-08-25
 by forcing it with the variables named beside it; `--collect-only` reports the
-same total, **182**, in all five configurations, because what the host has
+same total, **216**, in all six configurations, because what the host has
 changes the skips, never the collection.
 
 | host has | result | how the row was forced |
 | --- | --- | --- |
-| both binaries + Bun | **182 passed** | nothing set (this host's defaults) |
-| ELF binary + Bun, no Mach-O | 177 passed, 5 skipped | `NRC_TEST_MACHO=/nonexistent/macho` |
-| Mach-O binary + Bun, no ELF | 177 passed, 5 skipped | `NRC_TEST_ELF=/nonexistent/elf` |
-| Bun only | 172 passed, 10 skipped | both of those two variables at once |
-| none of them | 169 passed, 13 skipped | …plus `BUN_BIN=/nonexistent/bun` and a `HOME` with no Bun under it — the command below |
+| both binaries, Bun, Node 24 | **216 passed** | `NRC_TEST_NODE=…/v24.0.0/bin/node` (this host's own `node` is 22.23.2) |
+| …no Mach-O | 211 passed, 5 skipped | `NRC_TEST_MACHO=/nonexistent/macho` |
+| …no ELF | 211 passed, 5 skipped | `NRC_TEST_ELF=/nonexistent/elf` |
+| …neither binary | 206 passed, 10 skipped | both of those two variables at once |
+| …and no Bun | 190 passed, 26 skipped | …plus `BUN_BIN=/nonexistent/bun` and a `HOME` with no Bun under it |
+| none of them, Node 22 | 169 passed, 47 skipped | …and drop `NRC_TEST_NODE` — the command below |
 
-Every row adds up to 182, and the skips decompose: **5** tests need the Mach-O
-binary, **5** need the ELF one (5 + 5 = 10), and **3** more need only a Bun
-(10 + 3 = 13).
+Every row adds up to 216, and the skips decompose: **5** tests need the Mach-O
+binary, **5** the ELF one, **3** more only a Bun (5 + 5 + 3 = 13), and **34**
+need Node ≥ 24 — of which **13** also use Bun as their oracle (13 + 34 = 47).
 
 **The Apple Silicon run is not reconcilable to this table, and should not be.**
 It reported **257 passed, 6 skipped, 0 failed, 263 collected** — a true
 measurement of the tree as it stood on 2026-08-24, whose test set is not
-today's. No arithmetic connects 263 to 182 and none is offered. What the Mac run
+today's. No arithmetic connects 263 to 216 and none is offered. What the Mac run
 established is in [§ macOS](#macos); its totals belong to the tree it ran on.
 
-The last row needs care twice over. `BUN_BIN` is a *first* choice, not an
+The last two rows need care twice over. `BUN_BIN` is a *first* choice, not an
 override — the fixture still falls back to `~/.bun-1.3.14/bun` and then to `bun`
 on `PATH`, so pointing it at a nonexistent file while `HOME` stays put
 reproduces the Bun-**only** row instead. And moving `HOME` can take `pytest`

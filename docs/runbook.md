@@ -242,6 +242,11 @@ evidence that the path exists, not characterisation of it. And "it runs" is not
 "it behaves like the native binary": read [findings.md](./findings.md) **§10**
 before real use.
 
+**Under Node instead of Bun.** Node **≥ 24** only — the bundle's `using`
+declarations do not parse before it. `make node-deps && make node-run NODE_BIN=<node24>`
+runs the artifact under `node --require scripts/bun-shim.cjs`; the command surface is
+byte-identical to Bun, the agentic path untested ([findings.md](./findings.md) §11).
+
 **Run it by full path.** Do not create a `claude` shim on `PATH`; it would shadow
 your real installation, and every command in this repo is written to be run by
 full path for that reason.

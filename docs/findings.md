@@ -1111,6 +1111,41 @@ request, meaning the CLI abandoned the SSE stream for the non-streaming fallback
 
 ---
 
+## 11. Running the artifact under Node instead of Bun ✅
+
+Measured 2026-08-25, `linux-x64` 2.1.231 artifact, Bun 1.3.14 as the oracle.
+`scripts/bun-shim.cjs` loads via `node --require`; `make node-run` wires it up.
+
+**The parse boundary is Node 24, and it is hard.** The bundle has **35** `using`
+declarations — ES explicit resource management. `node --check` exits 1 on 22.23.2
+and 23.11.1 (`SyntaxError: Unexpected identifier`) and 0 on 24.0.0, 24.19.0,
+25.0.0, 25.9.0 and 26.7.0; V8 13.6 arrives with the major, not with a patch.
+
+**Of 12 non-builtin bare specifiers, Node needs two.** `ws` and `undici` are Bun
+builtins the bundle really imports; `make node-deps` puts them in
+`~/.cache/not-rusty-claude/node/node_modules`, never in this checkout, never
+globally. `bun:ffi` and `bun:jsc` need nothing — each call site is inside a
+`try`/`catch`, `bun:ffi`'s also behind a `!== "macos"` return. The rest
+(`react`, `node-fetch`, `ajv/*`) are dead or optional paths that fail under Bun.
+
+**The `Bun` global: 45 references, 25 distinct APIs.** The shim implements
+**seven** — `stringWidth`, `stripANSI`, `hash`, `which`, `semver.order`,
+`deepEquals`, `gc` — each pinned by a differential test against Bun in
+`tests/test_node_runtime.py`. Twelve throw, naming the API (`YAML`, `spawn`,
+`file`, `serve`, …); **six** stay deliberately *undefined* (`Terminal`,
+`WebView`, `JSONL`, `version`, `isStandaloneExecutable`, `stdin`) because the
+bundle feature-detects them — a plausible-looking stub is the §10 failure mode.
+
+**What was compared, and what was not.** Same artifact, throwaway `HOME` and
+`CLAUDE_CONFIG_DIR` per side, Bun 1.3.14 against Node 24.0.0 and 26.7.0:
+`--version` (22 B), `--help` (16,890 B), `mcp list` (65 B) and `config ls`
+(35 B, exit 1 both) give byte-identical stdout and equal exit codes; `doctor`
+(973 B) differs in one line, `Path:`, naming the interpreter actually running.
+⚠️ **No agentic or interactive session has ever been run under Node**, here or
+anywhere — this is the command surface only.
+
+---
+
 ## Appendix: exact commands used ✅
 
 Every command below was run on **this host**. `/usr/bin/claude` was only ever
