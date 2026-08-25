@@ -212,6 +212,12 @@ def parse_payload(section):
         die(f"section is only {len(section)} bytes - too short to hold a Bun "
             f"module graph (need at least {minimum})")
     payload_size = struct.unpack_from("<Q", section, 0)[0]
+    # The u64 length prefix - not the section's raw_size - is what delimits the
+    # payload: a container is free to pad its section past the graph, and one
+    # stray trailing byte inside `payload` moves the trailer off the end of the
+    # slice and fails the check below. (No padding on the ELF specimen at
+    # /usr/bin/claude - raw_size 202513494 == 8 + payload_size, measured
+    # 2026-08-25 - which is exactly why a padded fixture has to be synthetic.)
     payload = section[8:8 + payload_size]
     if len(payload) < OFFSET_STRUCT_SIZE + len(TRAILER):
         die(f"payload is only {len(payload)} bytes - too short to hold the "
@@ -229,6 +235,19 @@ def parse_payload(section):
     count = modules_size // MODULE_RECORD_SIZE
     if count == 0:
         die("modules table is empty")
+    if modules_offset + modules_size > len(payload):
+        # modules_offset is as attacker-controlled as its three siblings above
+        # and was the one this function never bounded. Slicing past the end of
+        # a bytes object yields b"" instead of raising, so an out-of-range
+        # offset is invisible here and surfaces in extract() as
+        # struct.unpack_from() on a short/empty record: a raw struct.error
+        # traceback where this tool promises a diagnosis. Reproduced with
+        # modules_offset=0xFFFFFF on an otherwise valid 130-byte payload. The
+        # ELF specimen at /usr/bin/claude ends its table 49 bytes before the
+        # payload does (measured 2026-08-25), so this bound constrains nothing
+        # a genuine Bun graph does.
+        die(f"modules table at offset {modules_offset} ({modules_size} bytes) "
+            f"runs past the end of the {len(payload)}-byte payload")
     if entry_point_id >= count:
         die(f"entry point id {entry_point_id} out of range (only {count} modules)")
     return payload, modules_offset, modules_size, entry_point_id
@@ -253,6 +272,7 @@ def extract(binary, out_dir):
     table = payload[modules_offset:modules_offset + modules_size]
 
     asset_count = shim_count = 0
+    entry_dest = None   # set when the entry module actually reaches disk
     written = {}    # basename -> content already written under assets/
     for i in range(count):
         rec = table[i * MODULE_RECORD_SIZE:(i + 1) * MODULE_RECORD_SIZE]
@@ -267,6 +287,7 @@ def extract(binary, out_dir):
             dest = os.path.join(out_dir, "cli.original.js")
             with open(dest, "wb") as fh:
                 fh.write(content)
+            entry_dest = dest
             print(f"  entry   {loader:7} {len(content)/1024/1024:6.2f} MB -> {dest}")
         elif loader in WRITTEN_LOADERS:
             # Native addons (.node, loader napi) and runtime assets (mermaid,
@@ -276,11 +297,15 @@ def extract(binary, out_dir):
             # bytes; a loader name describes how Bun would later expose the
             # module to JS (base64 = as a base64 string), NOT how it is stored.
             # Decoding would corrupt the payload. Write verbatim.
-            if base in ("", ".", ".."):
-                # base is already reduced to a basename (see above), so this
-                # is never a traversal hole - just a name that would collide
-                # with the assets/ directory itself and raise
-                # IsADirectoryError from open() below. Fail cleanly instead.
+            if base in ("", ".", "..") or "\0" in base:
+                # base is already reduced to a basename (see above), so none of
+                # this is a traversal hole - these are simply names open()
+                # cannot be given: ''/'.'/'..' name the assets/ directory
+                # itself or its parent (IsADirectoryError), and a NUL byte
+                # makes open() raise ValueError("embedded null byte") before
+                # any syscall. Both used to escape as a traceback, and because
+                # the entry module is written earlier in this same loop they
+                # left a half-populated out-dir behind. Fail cleanly instead.
                 die(f"module {i} ({name!r}) reduces to an unsafe basename "
                     f"{base!r} - refusing to write it under assets/")
             if base in written:
@@ -323,9 +348,17 @@ def extract(binary, out_dir):
                     "LOADERS against Bun's src/bundler/options.zig.\n")
             shim_count += 1
 
-    # No cli_count guard: exactly one module has i == entry_point_id, and
-    # parse_payload() has already rejected entry_point_id >= count, so the
-    # entry branch fires exactly once by construction.
+    # parse_payload() rejects entry_point_id >= count, so exactly one module
+    # has i == entry_point_id and the entry branch fires exactly once. That
+    # argument is only as good as the check it rests on: relaxing that check to
+    # `> count` accepts entry_point_id == count, no iteration matches, and the
+    # run prints "Extracted: 1 cli.js" and exits 0 over an out-dir with no
+    # cli.original.js in it (measured). Claiming success for an artifact that
+    # was never written is the one failure mode this whole tool exists to
+    # prevent, so the claim is now tied to the file.
+    if entry_dest is None:
+        die(f"entry point id {entry_point_id} matched no module of {count} - "
+            "no cli.original.js was written, so this extraction failed")
     print(f"Extracted: 1 cli.js + {asset_count} assets "
           f"({shim_count} loader shims left inlined in cli.js)")
 

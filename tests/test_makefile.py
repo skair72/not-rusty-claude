@@ -14,10 +14,13 @@ suite: the only prerequisite is `make`, and `make` is how these tests are
 normally reached in the first place.
 """
 
+import hashlib
+import os
 import pathlib
 import re
 import shutil
 import subprocess
+import zipfile
 
 import pytest
 
@@ -64,10 +67,19 @@ def _phony_targets():
     return []
 
 
-def _make(*args):
+def _make(*args, **kwargs):
+    """`make -C <repo> <args>`. env= adds to (not replaces) the environment,
+    which is how the setup tests point TMPDIR at a directory they can assert
+    on afterwards."""
+    extra = kwargs.pop("env", None)
+    assert not kwargs, kwargs
+    env = None
+    if extra:
+        env = dict(os.environ)
+        env.update(extra)
     return subprocess.run(
         ["make", "-C", str(ROOT), *args],
-        capture_output=True, text=True, timeout=120,
+        capture_output=True, text=True, timeout=120, env=env,
     )
 
 
@@ -211,3 +223,134 @@ def test_ab_refuses_on_non_linux_with_one_clear_line():
     assert proc.returncode != 0
     assert "Linux-only" in proc.stderr
     assert "/proc" in proc.stderr
+
+
+# --- `make setup` integrity, i.e. the executable that runs everything else ---
+#
+# `make binary` sha256-verifies the Claude binary it downloads; `make setup`
+# used to verify nothing at all about the bun it downloads, unzips, chmod
+# 0755s and then RUNS - the same bun that goes on to execute the extracted
+# Claude code, `make smoke` and `make ab`. Its one check was `bun --version`,
+# which any substituted executable can print.
+#
+# These tests are hermetic: BUN_URL is a file:// URL curl fetches from tmp_path
+# (curl supports file://), PLATFORM is pinned to linux-x64 so the checksum in
+# force is this repo's pinned constant rather than whatever the host maps to,
+# and the fallback tests point BUN_SHASUMS_URL at a local list. No network, no
+# real bun, and nothing is written outside tmp_path.
+
+FAKE_BUN = b"#!/bin/sh\necho 1.3.14\n"
+
+
+def _fake_bun_zip(path, member="bun-linux-x64/bun", body=FAKE_BUN):
+    """A stand-in for a release asset: one */bun member, which is the only
+    thing `unzip -j '*/bun'` in the recipe looks for."""
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr(member, body)
+    return path
+
+
+def _setup(tmp_path, *extra, **kwargs):
+    """`make setup` against a local zip, with its own BUN_DIR and TMPDIR."""
+    zip_path = kwargs.pop("zip_path")
+    assert not kwargs, kwargs
+    bun_dir = tmp_path / "bundir"
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir(exist_ok=True)
+    proc = _make("setup", "PLATFORM=linux-x64",
+                 "BUN_URL=file://%s" % zip_path,
+                 "BUN_DIR=%s" % bun_dir, *extra,
+                 env={"TMPDIR": str(tmpdir)})
+    return proc, bun_dir, tmpdir
+
+
+@requires_make
+def test_setup_refuses_a_bun_zip_whose_sha256_does_not_match(tmp_path):
+    """The security asymmetry, at the point it matters: a downloaded bun whose
+    bytes are not the published ones must never be installed, let alone run.
+
+    No BUN_SHA256= override here on purpose - this exercises the constant the
+    Makefile actually pins for linux-x64, so deleting or blanking that row
+    fails the test too."""
+    proc, bun_dir, tmpdir = _setup(
+        tmp_path, zip_path=_fake_bun_zip(tmp_path / "bun.zip"))
+
+    assert proc.returncode != 0, "an unverified bun was accepted:\n" + proc.stdout
+    assert "CHECKSUM MISMATCH" in proc.stderr, proc.stderr
+    assert not (bun_dir / "bun").exists(), "the unverified bun was installed"
+    assert not bun_dir.exists(), "a failed setup left %s behind" % bun_dir
+    assert sorted(p.name for p in tmpdir.iterdir()) == [], \
+        "the rejected download was left in TMPDIR"
+
+
+@requires_make
+def test_setup_installs_a_bun_whose_sha256_matches(tmp_path):
+    """The other half: verification must not be a blanket refusal. With the
+    real digest of the asset it is about to fetch, setup completes and leaves
+    an executable bun - and still nothing in TMPDIR."""
+    zip_path = _fake_bun_zip(tmp_path / "bun.zip")
+    digest = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+
+    proc, bun_dir, tmpdir = _setup(
+        tmp_path, "BUN_SHA256=%s" % digest, zip_path=zip_path)
+
+    assert proc.returncode == 0, proc.stderr
+    assert "sha256 OK: %s" % digest in proc.stdout, proc.stdout
+    assert os.access(str(bun_dir / "bun"), os.X_OK)
+    assert sorted(p.name for p in tmpdir.iterdir()) == []
+
+
+@requires_make
+def test_setup_falls_back_to_the_published_shasums_list(tmp_path):
+    """An unpinned version/asset (e.g. `make setup BUN_VERSION=...`) must still
+    be verified, against the SHASUMS256.txt Bun publishes beside the assets.
+    The decoy row is there because taking the FIRST hash in the file, rather
+    than the row naming this asset, would also pass a one-row fixture."""
+    zip_path = _fake_bun_zip(tmp_path / "bun.zip")
+    digest = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+    shasums = tmp_path / "SHASUMS256.txt"
+    shasums.write_text("%s  bun-darwin-x64.zip\n%s  bun-linux-x64.zip\n"
+                       % ("0" * 64, digest))
+
+    proc, bun_dir, tmpdir = _setup(
+        tmp_path, "BUN_SHA256=", "BUN_SHASUMS_URL=file://%s" % shasums,
+        zip_path=zip_path)
+
+    assert proc.returncode == 0, proc.stderr
+    assert "sha256 OK: %s" % digest in proc.stdout, proc.stdout
+    assert (bun_dir / "bun").is_file()
+
+
+@requires_make
+def test_setup_refuses_when_no_checksum_can_be_obtained(tmp_path):
+    """No pin and no row in the list -> refuse. The failure mode this guards
+    is a checksum step that degrades to "no expectation, so anything matches"
+    the moment the list does not name the asset."""
+    shasums = tmp_path / "SHASUMS256.txt"
+    shasums.write_text("%s  bun-darwin-x64.zip\n" % ("0" * 64))
+
+    proc, bun_dir, tmpdir = _setup(
+        tmp_path, "BUN_SHA256=", "BUN_SHASUMS_URL=file://%s" % shasums,
+        zip_path=_fake_bun_zip(tmp_path / "bun.zip"))
+
+    assert proc.returncode != 0, proc.stdout
+    assert "refusing to install an unverified bun" in proc.stderr, proc.stderr
+    assert not bun_dir.exists()
+    assert sorted(p.name for p in tmpdir.iterdir()) == []
+
+
+@requires_make
+def test_every_supported_platform_has_a_pinned_bun_checksum(tmp_path):
+    """Drift guard for the pin table. `make doctor` reports the asset and the
+    checksum in force, so a BUN_VERSION bump or a new PLATFORM that silently
+    fell back to "fetch whatever the server says" is visible here. The list is
+    exactly the set tests/test_platform_resolves_to_a_release_endpoint_string
+    accepts."""
+    for platform in ("darwin-arm64", "darwin-x64", "linux-x64", "linux-arm64",
+                     "linux-x64-musl", "linux-arm64-musl"):
+        out = _make("doctor", "PLATFORM=%s" % platform).stdout
+        pinned = re.search(r"^\s+pinned sha256\s+(\S+)", out, re.M)
+        assert pinned, "make doctor does not report a checksum:\n" + out
+        assert re.match(r"^[0-9a-f]{64}$", pinned.group(1)), \
+            "no pinned bun sha256 for PLATFORM=%s (got %r)" % (
+                platform, pinned.group(1))

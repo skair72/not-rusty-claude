@@ -2,7 +2,7 @@
 #
 # A bare `make` prints help and changes nothing. The first-run path is:
 #
-#     make setup     private Bun 1.3.14, not on PATH
+#     make setup     private Bun 1.3.14, sha256-verified, not on PATH
 #     make binary    this platform's Claude Code binary, sha256-verified
 #     make build     extract + rewrite into build/extract
 #     make smoke     run the artifact once
@@ -95,8 +95,46 @@ PLATFORM ?= $(shell \
 # 2026-08-24 that all four of bun-{darwin,linux}-{x64,aarch64}.zip exist under
 # the 1.3.14 tag (HTTP 200), and that bun-darwin-aarch64.zip unzips to exactly
 # one executable at bun-darwin-aarch64/bun.
-BUN_ASSET := bun-$(patsubst %-arm64,%-aarch64,$(PLATFORM))
+#
+# $(subst), not $(patsubst %-arm64,...): the pattern form is anchored at the
+# end, so it renamed darwin-arm64 but left PLATFORM=linux-arm64-musl as
+# bun-linux-arm64-musl - a name that does not exist. Bun's own
+# SHASUMS256.txt for 1.3.14, fetched 2026-08-25, lists
+# bun-linux-aarch64-musl.zip and no bun-linux-arm64-musl.zip, and
+# tests/test_makefile.py accepts linux-arm64-musl as a PLATFORM.
+BUN_ASSET := bun-$(subst -arm64,-aarch64,$(PLATFORM))
 BUN_URL   := https://github.com/oven-sh/bun/releases/download/bun-v$(BUN_VERSION)/$(BUN_ASSET).zip
+
+# `setup` downloads an EXECUTABLE and then runs it, and so does everything
+# after it: this bun executes the extracted Claude code, the smoke test and
+# `make ab`. That is a strictly larger trust surface than the read-only
+# binary `make binary` fetches - and it was the download with NO integrity
+# check at all. Its only check was `bun --version` == $(BUN_VERSION), a string
+# any substituted executable can print, so a swapped asset or an intercepted
+# transfer installed silently and then ran everything.
+#
+# These are Bun's own sha256 values, copied from the SHASUMS256.txt GitHub
+# publishes beside the bun-v1.3.14 assets, fetched 2026-08-25. The
+# bun-darwin-aarch64.zip row was additionally confirmed end to end here:
+# downloading that asset (23586433 bytes, per its content-length) and hashing
+# it gave exactly d8b96221828ad6f97ac7ac0ab7e95872341af763001e8803e8267652c2652620.
+# Six rows because those are the six PLATFORM strings this Makefile can emit
+# or tests/test_makefile.py accepts; `make doctor` prints the one in force.
+BUN_SHASUMS_URL := https://github.com/oven-sh/bun/releases/download/bun-v$(BUN_VERSION)/SHASUMS256.txt
+
+BUN_SHA256_1.3.14_bun-darwin-aarch64     := d8b96221828ad6f97ac7ac0ab7e95872341af763001e8803e8267652c2652620
+BUN_SHA256_1.3.14_bun-darwin-x64         := 4183df3374623e5bab315c547cfa0974533cd457d86b73b639f7a87974cd6633
+BUN_SHA256_1.3.14_bun-linux-aarch64      := a27ffb63a8310375836e0d6f668ae17fa8d8d18b88c37c821c65331973a19a3b
+BUN_SHA256_1.3.14_bun-linux-x64          := 951ee2aee855f08595aeec6225226a298d3fea83a3dcd6465c09cbccdf7e848f
+BUN_SHA256_1.3.14_bun-linux-aarch64-musl := b98e0ad3625c5c00d1d5b5ff55605c7adddbfae151861e68ade57b2d3b8703bb
+BUN_SHA256_1.3.14_bun-linux-x64-musl     := 14bd9aedeebf1dba67e8def9531c89bc989ecfdf1de42e5bfcaf1b8cd9294719
+
+# Keyed by version as well as asset so that `make setup BUN_VERSION=x.y.z`
+# cannot silently check a 1.3.14 hash against a different release's zip: an
+# unknown version simply has no pinned row and takes the fetch path below.
+# `:=`, not `?=`, so only an explicit `make setup BUN_SHA256=...` on the
+# command line can replace a pin - never something already in the environment.
+BUN_SHA256 := $(BUN_SHA256_$(BUN_VERSION)_$(BUN_ASSET))
 
 # The download is saved per version, with a fixed-name symlink beside it so
 # `build`/`test` have one path to look for. Neither name is `claude`.
@@ -127,7 +165,7 @@ help:
 	  '' \
 	  '  help        this list; the default target, and it changes nothing' \
 	  '  doctor      report what this host has: platform, bun, python, binaries' \
-	  '  setup       download Bun $(BUN_VERSION) into $(BUN_DIR) (idempotent, not on PATH)' \
+	  '  setup       download Bun $(BUN_VERSION) into $(BUN_DIR), verify its sha256 (not on PATH)' \
 	  '  binary      download this platform'"'"'s Claude Code binary and verify its sha256' \
 	  '  build       run scripts/build.sh -> $(OUT_DIR)/extract' \
 	  '  smoke       run the built artifact once (mcp list) under bun' \
@@ -170,6 +208,12 @@ doctor:
 	else \
 	  printf '    %-22s %s\n' 'bun' 'not installed - run: make setup'; \
 	fi; \
+	printf '    %-22s %s\n' 'bun asset' '$(BUN_ASSET).zip'; \
+	if [ -n '$(BUN_SHA256)' ]; then \
+	  printf '    %-22s %s\n' 'pinned sha256' '$(BUN_SHA256)'; \
+	else \
+	  printf '    %-22s %s\n' 'pinned sha256' 'none pinned - setup will read $(BUN_SHASUMS_URL)'; \
+	fi; \
 	echo '==> claude binaries'; \
 	if [ -e '$(BINARY_LINK)' ]; then \
 	  printf '    %-22s %s -> %s\n' 'downloaded' '$(BINARY_LINK)' "$$(readlink '$(BINARY_LINK)' || echo '?')"; \
@@ -200,11 +244,30 @@ setup:
 	if [ -x '$(BUN_DIR)/bun' ] && v="$$('$(BUN_DIR)/bun' --version 2>/dev/null)" && [ "$$v" = '$(BUN_VERSION)' ]; then \
 	  echo "==> bun $(BUN_VERSION) already at $(BUN_DIR)/bun - nothing to download"; \
 	else \
+	  want='$(BUN_SHA256)'; \
+	  if [ -z "$$want" ]; then \
+	    echo '==> no pinned sha256 for $(BUN_ASSET).zip at bun $(BUN_VERSION); asking SHASUMS256.txt'; \
+	    want="$$(curl -fsSL '$(BUN_SHASUMS_URL)' | python3 -c 'import sys; w=sys.argv[1]; print(next((f[0] for f in (l.split() for l in sys.stdin) if len(f) > 1 and f[1].lstrip("*") == w), ""))' '$(BUN_ASSET).zip')"; \
+	  fi; \
+	  python3 -c 'import re,sys; sys.exit(0 if re.match(r"^[0-9a-f]{64}$$", sys.argv[1] or "") else 1)' "$$want" \
+	    || { echo 'error: no published sha256 for $(BUN_ASSET).zip at bun $(BUN_VERSION) - refusing to install an unverified bun, because this is the executable that runs every artifact this repo builds. Pass BUN_SHA256=<64 hex> from a source you trust.' >&2; exit 1; }; \
 	  echo '==> downloading $(BUN_ASSET).zip'; \
-	  mkdir -p '$(BUN_DIR)'; \
 	  tmp="$$(mktemp -d "$${TMPDIR:-/tmp}/nrc-bun.XXXXXX")"; \
 	  trap 'rm -rf "$$tmp"' EXIT INT TERM; \
 	  curl -fL --retry 3 --progress-bar -o "$$tmp/bun.zip" '$(BUN_URL)'; \
+	  echo '==> verifying sha256'; \
+	  got="$$(python3 -c 'import hashlib,sys; h=hashlib.sha256(); f=open(sys.argv[1],"rb"); [h.update(c) for c in iter(lambda: f.read(1<<20), b"")]; print(h.hexdigest())' "$$tmp/bun.zip")"; \
+	  if [ "$$got" != "$$want" ]; then \
+	    rm -rf "$$tmp"; \
+	    echo '' >&2; \
+	    echo 'error: CHECKSUM MISMATCH - the download was DELETED, nothing was installed.' >&2; \
+	    echo "  expected sha256 $$want" >&2; \
+	    echo "  got      sha256 $$got" >&2; \
+	    echo '  This bun would have EXECUTED the extracted Claude code and every' >&2; \
+	    echo '  smoke test. Do not use it. Retry; if it repeats, stop and investigate.' >&2; \
+	    exit 1; \
+	  fi; \
+	  echo "==> sha256 OK: $$want"; \
 	  unzip -q -j -o "$$tmp/bun.zip" '*/bun' -d "$$tmp"; \
 	  [ -f "$$tmp/bun" ] || { echo 'error: $(BUN_ASSET).zip contained no bun executable' >&2; exit 1; }; \
 	  chmod 0755 "$$tmp/bun"; \
@@ -212,6 +275,7 @@ setup:
 	    xattr -d com.apple.quarantine "$$tmp/bun" 2>/dev/null || true; \
 	    xattr -c "$$tmp/bun" 2>/dev/null || true; \
 	  fi; \
+	  mkdir -p '$(BUN_DIR)'; \
 	  mv "$$tmp/bun" '$(BUN_DIR)/bun'; \
 	  v="$$('$(BUN_DIR)/bun' --version 2>/dev/null || true)"; \
 	  if [ "$$v" != '$(BUN_VERSION)' ]; then \

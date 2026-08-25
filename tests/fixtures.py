@@ -43,9 +43,16 @@ def build_payload(modules, entry=0):
     return bytes(blob)
 
 
-def _section_bytes(payload):
-    """A __bun/.bun section is a u64 length prefix followed by the payload."""
-    return struct.pack("<Q", len(payload)) + payload
+def _section_bytes(payload, pad=0):
+    """A __bun/.bun section is a u64 length prefix followed by the payload.
+
+    pad: filler bytes appended AFTER the payload, i.e. a section whose raw size
+    exceeds 8 + payload_size. Without it every fixture makes the two lengths
+    identical, so parse_payload()'s `section[8:8 + payload_size]` slice could
+    be off by one in either direction and no test could see it - the length
+    prefix would never actually be the thing delimiting the payload.
+    """
+    return struct.pack("<Q", len(payload)) + payload + b"\xAB" * pad
 
 
 SEGMENT_COMMAND_64_SIZE = 0x48
@@ -123,12 +130,15 @@ def build_macho(payload, decoy_commands=(), decoy_sections=0):
     return bytes(hdr) + decoys + bytes(cmd) + section
 
 
-def build_elf(payload):
+def build_elf(payload, section_pad=0):
     """Minimal ELF64 little-endian with a .bun section.
 
     Sections: [0] NULL, [1] .shstrtab, [2] .bun
+
+    section_pad: bytes of filler inside the .bun section but after the payload,
+    so sh_size > 8 + payload_size. See _section_bytes().
     """
-    section = _section_bytes(payload)
+    section = _section_bytes(payload, pad=section_pad)
     shstrtab = b"\0.shstrtab\0.bun\0"
     name_shstrtab = 1
     name_bun = 11

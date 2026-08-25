@@ -52,10 +52,20 @@ def test_bad_trailer_is_rejected(extract_bun, capsys):
     assert "trailer" in capsys.readouterr().err
 
 
-def test_misaligned_module_table_is_rejected(extract_bun, capsys):
+@pytest.mark.parametrize("modules_size", [53, 54, 103])
+def test_misaligned_module_table_is_rejected(extract_bun, capsys, modules_size):
+    """Every non-multiple of 52 must be refused, not just one of them.
+
+    This pinned only 53 before, which is remainder 1 - so weakening the guard
+    to `% 52 == 1` kept the test green while ACCEPTING 54 (count truncates to
+    1 and the trailing 2 bytes vanish in silence). 54 and 103 (remainders 2 and
+    51) are the cases that make the assertion about the property rather than
+    about one value; asserting the message keeps a different guard firing from
+    counting as a pass.
+    """
     payload = bytearray(fixtures.build_payload([("/$bunfs/root/cli", b"x", 1)]))
     start = len(payload) - len(fixtures.TRAILER) - 32
-    struct.pack_into("<I", payload, start + 12, 53)   # modules_size not a multiple of 52
+    struct.pack_into("<I", payload, start + 12, modules_size)
 
     with pytest.raises(SystemExit):
         extract_bun.parse_payload(fixtures._section_bytes(bytes(payload)))
@@ -63,15 +73,180 @@ def test_misaligned_module_table_is_rejected(extract_bun, capsys):
     assert "not a multiple" in capsys.readouterr().err
 
 
-def test_entry_point_id_out_of_range_is_rejected(extract_bun, capsys):
+# entry_point_id indexes the module table, so `count` itself is the first
+# out-of-range value and 99 cannot tell `>= count` from `> count`. Both are
+# parametrized here because the far case is what a corrupt field looks like and
+# the boundary is what an off-by-one looks like.
+@pytest.mark.parametrize("entry_id", [1, 99])
+def test_entry_point_id_out_of_range_is_rejected(extract_bun, capsys, entry_id):
     payload = bytearray(fixtures.build_payload([("/$bunfs/root/cli", b"x", 1)]))
     start = len(payload) - len(fixtures.TRAILER) - 32
-    struct.pack_into("<I", payload, start + 16, 99)
+    struct.pack_into("<I", payload, start + 16, entry_id)   # count is 1
 
     with pytest.raises(SystemExit):
         extract_bun.parse_payload(fixtures._section_bytes(bytes(payload)))
 
     assert "entry" in capsys.readouterr().err
+
+
+def test_extract_does_not_claim_success_without_writing_the_entry_module(
+        extract_bun, tmp_path, capsys, monkeypatch):
+    """The other half of the boundary above: the report must follow the file.
+
+    parse_payload() is stubbed to hand back entry_point_id == count, which is
+    exactly the state a relaxed range check (`> count` instead of `>= count`)
+    lets through. The loop in extract() then matches no module, so nothing is
+    written to cli.original.js - and before this guard the run still printed
+    "Extracted: 1 cli.js" and exited 0 (measured on a mutated copy). A silent
+    wrong success is the failure this tool exists to prevent, so success is now
+    conditional on the entry file existing.
+    """
+    payload = fixtures.build_payload([("/$bunfs/root/cli", b"(function(){})", 1)])
+    binary = tmp_path / "claude"
+    binary.write_bytes(fixtures.build_elf(payload))
+    out = tmp_path / "out"
+    real = extract_bun.parse_payload
+
+    def entry_id_equal_to_count(section):
+        parsed, mod_off, mod_size, _ = real(section)
+        return parsed, mod_off, mod_size, mod_size // extract_bun.MODULE_RECORD_SIZE
+
+    monkeypatch.setattr(extract_bun, "parse_payload", entry_id_equal_to_count)
+
+    with pytest.raises(SystemExit):
+        extract_bun.extract(str(binary), str(out))
+
+    captured = capsys.readouterr()
+    assert "no cli.original.js was written" in captured.err
+    assert "Extracted:" not in captured.out
+    assert not (out / "cli.original.js").exists()
+
+
+def test_module_table_offset_past_the_payload_is_rejected_cleanly(
+        extract_bun, tmp_path, capsys):
+    """modules_offset is attacker-controlled and was the one field parse_payload
+    never bounded, while it bounds all three of its siblings.
+
+    Slicing past the end of a bytes object yields b"" rather than raising, so
+    the bad offset stayed invisible until struct.unpack_from() in extract() hit
+    an empty record and raised struct.error - a traceback, on a file this tool
+    promises to diagnose. Reproduced against the unfixed tool with
+    modules_offset=0xFFFFFF: "struct.error: unpack_from requires a buffer of at
+    least 16 bytes ... (actual buffer size is 0)", exit 1.
+    """
+    payload = bytearray(fixtures.build_payload([("/$bunfs/root/cli", b"x", 1)]))
+    start = len(payload) - len(fixtures.TRAILER) - 32
+    struct.pack_into("<I", payload, start + 8, 0xFFFFFF)   # modules_offset
+    binary = tmp_path / "claude"
+    binary.write_bytes(fixtures.build_elf(bytes(payload)))
+
+    with pytest.raises(SystemExit):
+        extract_bun.extract(str(binary), str(tmp_path / "out"))
+
+    err = capsys.readouterr().err
+    assert "error:" in err
+    assert "runs past the end" in err
+
+
+def test_module_table_ending_one_byte_past_the_payload_is_rejected(
+        extract_bun, capsys):
+    """The boundary of that check: a table whose last byte falls just outside.
+
+    modules_offset is moved forward by 1 from the offset the fixture wrote, so
+    modules_offset + modules_size == len(payload) + 1 - the first value that
+    must be refused. A check written as `>` instead of `>=`, or one comparing
+    only modules_offset to len(payload), accepts this and reads a record that
+    is one byte short.
+    """
+    payload = bytearray(fixtures.build_payload([("/$bunfs/root/cli", b"x", 1)]))
+    start = len(payload) - len(fixtures.TRAILER) - 32
+    modules_offset = struct.unpack_from("<I", payload, start + 8)[0]
+    modules_size = struct.unpack_from("<I", payload, start + 12)[0]
+    struct.pack_into("<I", payload, start + 8, len(payload) - modules_size + 1)
+    assert modules_offset + modules_size <= len(payload)   # the fixture was sane
+
+    with pytest.raises(SystemExit):
+        extract_bun.parse_payload(fixtures._section_bytes(bytes(payload)))
+
+    assert "runs past the end" in capsys.readouterr().err
+
+
+def test_module_table_ending_exactly_at_the_payload_end_is_accepted(
+        extract_bun):
+    """The other side of the same boundary, so the check cannot be tightened
+    into rejecting a legitimate graph whose table runs right up to the end."""
+    payload = bytearray(fixtures.build_payload([("/$bunfs/root/cli", b"x", 1)]))
+    start = len(payload) - len(fixtures.TRAILER) - 32
+    modules_size = struct.unpack_from("<I", payload, start + 12)[0]
+    struct.pack_into("<I", payload, start + 8, len(payload) - modules_size)
+
+    parsed, mod_off, mod_size, entry = extract_bun.parse_payload(
+        fixtures._section_bytes(bytes(payload)))
+
+    assert mod_off + mod_size == len(parsed)
+
+
+def test_asset_name_containing_a_nul_byte_is_rejected_cleanly(
+        extract_bun, tmp_path, capsys):
+    """A NUL survives the basename reduction (it is not '/', '\\\\', '', '.' or
+    '..') and reaches open(), which raises ValueError("embedded null byte").
+
+    Not a traversal - Python refuses the name before any syscall - but it was
+    an uncaught exception, and it fired AFTER the entry module had been
+    written, so the run left a half-populated out-dir with a traceback on
+    stderr. Reproduced against the unfixed tool with the name 'evil\\x00.node'.
+    """
+    payload = fixtures.build_payload([
+        ("/$bunfs/root/cli", b"(function(){})", 1),
+        ("evil\x00.node", b"addon", 10),
+    ])
+    binary = tmp_path / "claude"
+    binary.write_bytes(fixtures.build_elf(payload))
+    out = tmp_path / "out"
+
+    with pytest.raises(SystemExit):
+        extract_bun.extract(str(binary), str(out))
+
+    err = capsys.readouterr().err
+    assert "error:" in err
+    assert "unsafe basename" in err
+    assert not (out / "assets").exists()
+
+
+def test_payload_is_delimited_by_its_length_prefix_not_the_section_size(
+        extract_bun):
+    """A section may be longer than the graph it carries; the u64 prefix is
+    what says where the payload ends.
+
+    Every other fixture makes the section exactly 8 + payload_size bytes, so
+    the slice could take one byte too many or too few and stay invisible. With
+    7 bytes of padding after the payload, a slice of 8+payload_size+1 puts a
+    stray 0xAB after the trailer and the trailer check fails instead.
+    """
+    payload = fixtures.build_payload([("/$bunfs/root/cli", b"x", 1)])
+    section = fixtures._section_bytes(payload, pad=7)
+    assert len(section) == 8 + len(payload) + 7
+
+    parsed, _, _, _ = extract_bun.parse_payload(section)
+
+    assert parsed == payload
+
+
+def test_extraction_ignores_padding_after_the_payload(extract_bun, tmp_path):
+    """The same property through the container path, where the section bytes
+    come from sh_size rather than from a test calling _section_bytes()."""
+    payload = fixtures.build_payload([
+        ("/$bunfs/root/cli", b"(function(){})", 1),
+        ("/$bunfs/root/addon.node", b"native-bytes", 10),
+    ])
+    binary = tmp_path / "claude"
+    binary.write_bytes(fixtures.build_elf(payload, section_pad=16))
+    out = tmp_path / "out"
+
+    extract_bun.extract(str(binary), str(out))
+
+    assert (out / "cli.original.js").read_bytes() == b"(function(){})"
+    assert (out / "assets" / "addon.node").read_bytes() == b"native-bytes"
 
 
 def test_truncated_elf_header_is_rejected_cleanly(extract_bun, capsys):

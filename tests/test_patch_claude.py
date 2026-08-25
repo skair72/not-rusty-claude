@@ -815,6 +815,66 @@ def test_every_reason_for_no_range_is_a_different_sentence(
     assert fragment in why, f"{name}: {why}"
 
 
+def _macho_with_first_command_size(path, first_size, body=b"a NEEDLE b",
+                                   sig=b"S" * 40):
+    """Thin Mach-O: one command CLAIMING `first_size`, then a real
+    LC_CODE_SIGNATURE 8 bytes later.
+
+    The first command's own record is always the 8 bytes it takes to hold a
+    cmd/size pair; only the size FIELD varies, which is the whole point - a
+    load command cannot be smaller than the header that announces it, and the
+    walk advances by whatever that field says. sizeofcmds stays 8 + 16, the
+    real length of the table, so the only thing wrong with a `first_size`
+    below 8 is the field itself."""
+    sig_off = 32 + 24 + len(body)
+    header = (MACHO_MAGIC
+              + struct.pack("<iiI", 0x0100000C, 0, 2)   # arm64, MH_EXECUTE
+              + struct.pack("<III", 2, 24, 0)           # ncmds, sizeofcmds, flags
+              + struct.pack("<I", 0))                   # reserved
+    cmds = (struct.pack("<II", 0x19, first_size)        # LC_SEGMENT_64-ish
+            + struct.pack("<IIII", 0x1D, 16, sig_off, len(sig)))
+    path.write_bytes(header + cmds + body + sig)
+    return path, (sig_off, sig_off + len(sig))
+
+
+def test_a_load_command_one_byte_too_small_to_exist_is_refused(
+        patch_claude, tmp_path):
+    """size 8 is the smallest a load command can legally be - cmd and size and
+    nothing else - so 7 is the boundary this guard exists at, and the suite
+    only ever tested it at 0.
+
+    Weakening it to `size < 7` kept the whole suite green before this test
+    existed, and with it in place this is the only test that fails - measured
+    both ways on a copy of the tree. It changes THIS file from
+    "malformed load command (size 7 at offset 0 of the table)" to
+    "carrying no LC_CODE_SIGNATURE among its 2 load command(s)" - a real
+    LC_CODE_SIGNATURE at 66..106 missed, because `off += 7` lands the walk one
+    byte inside it and reads cmd 0x1D00 / size 4096 out of the misalignment.
+    A missed range is not a safe default: main() then prints "no
+    code-signature range to protect", partition_signature_hits() drops
+    nothing, and hits inside the signature blob are patched like any other
+    bytes - the exact outcome this guard is here to prevent."""
+    binary, span = _macho_with_first_command_size(tmp_path / "claude.bin", 7)
+
+    why = patch_claude.signature_scan(binary)[1]
+
+    assert patch_claude.code_signature_range(binary) is None
+    assert "malformed load command (size 7" in why, why
+    # the signature it must NOT have walked past is really there
+    assert binary.read_bytes()[span[0]:span[1]] == b"S" * 40
+
+
+def test_the_smallest_legal_load_command_is_walked_not_refused(
+        patch_claude, tmp_path):
+    """The other side of the same boundary, and the reason it cannot simply be
+    raised: a command of exactly 8 bytes is legal, and refusing it (`size < 9`)
+    would turn every binary that carries one into "malformed" and lose the
+    signature range just as thoroughly."""
+    binary, span = _macho_with_first_command_size(tmp_path / "claude.bin", 8)
+
+    assert patch_claude.signature_scan(binary) == (span, None)
+
+
 def test_a_file_that_cannot_be_opened_is_a_reason_not_an_exception(
         patch_claude, tmp_path):
     """main() calls this before it has established anything about the path
