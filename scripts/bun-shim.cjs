@@ -1082,16 +1082,21 @@ function wrap_pointWidth(text) {
   return total;
 }
 
-function wrap_breakWord(rows, word, columns) {
-  // An ST-terminated OSC makes everything after it in this word unbreakable -
-  // including text past the link's close. Measured: a linked word plus trailing
-  // text stays on one row, while a following SEPARATE word wraps normally, so
-  // the state is per word rather than per line.
-  // The glue starts AT the ST-terminated link, not at the start of the word:
-  // measured, halfwidth kana before such a link still breaks per character
-  // while everything from the link onward stays on one row. An early return
-  // for the whole word - which is what this did first - glued the prefix too.
-  let glueFrom = -1;
+// Where an ST-terminated OSC 8 link starts gluing a word together, or -1 if
+// none does. Pulled out of wrap_breakWord so the OUTER word-placement loop
+// can ask the same question before deciding whether a word will actually be
+// broken at all - a fully-glued word (glueFrom 0) is appended raw regardless
+// of width, so row-count math that assumes breaking happens is wrong for it.
+//
+// An ST-terminated OSC makes everything after it in this word unbreakable -
+// including text past the link's close. Measured: a linked word plus trailing
+// text stays on one row, while a following SEPARATE word wraps normally, so
+// the state is per word rather than per line.
+// The glue starts AT the ST-terminated link, not at the start of the word:
+// measured, halfwidth kana before such a link still breaks per character
+// while everything from the link onward stays on one row. An early return
+// for the whole word - which is what this did first - glued the prefix too.
+function wrap_glueFrom(word) {
   for (let scan = 0; scan < word.length; ) {
     const esc = wrap_escapeLength(word, scan);
     if (!esc) { scan += String.fromCodePoint(word.codePointAt(scan)).length; continue; }
@@ -1112,13 +1117,15 @@ function wrap_breakWord(rows, word, columns) {
       const nextLen = wrap_escapeLength(word, scan + esc);
       const superseded = nextLen > 0 &&
         word.slice(scan + esc, scan + esc + nextLen).startsWith(wrap_ESC + "]8;;");
-      if (uri !== "" && !superseded) {
-        glueFrom = scan;
-        break;
-      }
+      if (uri !== "" && !superseded) return scan;
     }
     scan += esc;
   }
+  return -1;
+}
+
+function wrap_breakWord(rows, word, columns) {
+  const glueFrom = wrap_glueFrom(word);
   if (glueFrom === 0) {
     rows[rows.length - 1] += word;
     return;
@@ -1263,10 +1270,19 @@ function wrap_wrapLine(rawLine, columns, opts) {
     }
 
     if (opts.hard && wordWidth > columns) {
-      const remaining = columns - taken;
-      const breaksHere = 1 + Math.floor((wordWidth - remaining - 1) / columns);
-      const breaksNext = Math.floor((wordWidth - 1) / columns);
-      if (breaksNext < breaksHere) rows.push("");
+      // A word that glues from its very first character is never actually
+      // BROKEN - wrap_breakWord appends it to the current row as-is, no
+      // matter how little room is left. The row-count math below assumes
+      // breaking happens, so it is answering a question this word does not
+      // ask: measured at width 1, "x" then two spaces then a glued link
+      // stays on ONE row with the second space, and pre-pushing a blank row
+      // here put the link on a row of its own instead.
+      if (wrap_glueFrom(word) !== 0) {
+        const remaining = columns - taken;
+        const breaksHere = 1 + Math.floor((wordWidth - remaining - 1) / columns);
+        const breaksNext = Math.floor((wordWidth - 1) / columns);
+        if (breaksNext < breaksHere) rows.push("");
+      }
       wrap_breakWord(rows, word, columns);
       continue;
     }
