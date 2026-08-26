@@ -1138,15 +1138,18 @@ function wrap_breakWord(rows, word, columns) {
     if (!nothingVisibleAfter) {
       if (taken === columns) { rows.push(""); taken = 0; }
       if (w > columns - taken) {
-        // A held-back escape is emitted BEFORE the break it precedes, in two
-        // cases. Measured at width 1: an SGR followed by a wide character
-        // leaves the SGR on the first row rather than opening with a blank
-        // one. And a link's CLOSE stays on the row the link occupies - held
-        // past the break it would re-open a link that has already ended, on a
-        // row that carries nothing.
-        const closesLink = pending.includes(wrap_ESC + "]8;;" + wrap_BEL) ||
-          pending.includes(wrap_ESC + "]8;;" + wrap_ESC + "\\");
-        if (pending !== "" && (taken === 0 || taken >= columns || closesLink)) {
+        // A held-back escape ENDS the row it is on. Measured at width 3:
+        // "ab<23m><CJK>" puts the escape on row one, "ab<23m", and re-opens
+        // it on row two - it does not lead row two alone.
+        //
+        // The row that is EXACTLY full is the exception, and it needs no
+        // condition here: "abc<23m><CJK>" leaves the escape to lead row two,
+        // and the flush above has already opened that row by the time this
+        // runs. Two earlier special cases - an SGR before a wide character at
+        // width 1, and a link's close staying on the row the link occupies -
+        // were this same rule seen from two narrow angles, and both fall out
+        // of it.
+        if (pending !== "") {
           rows[rows.length - 1] += pending;
           pending = "";
         }
