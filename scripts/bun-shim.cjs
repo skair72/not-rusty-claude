@@ -1188,6 +1188,14 @@ function wrap_trimRow(row) {
     // narrow widths.
     const stripped = body.replace(/ [ \t]*$/, "");
     if (stripped !== body) { body = stripped; continue; }
+    // A trailing tab goes when the row holds no VISIBLE character - escapes do
+    // not count as visible. Measured: "\u001b[9m\t" trims to "\u001b[9m",
+    // while "\u001b[9mx\t" and "a\u001b[9m\t" keep the tab because something
+    // printable precedes it.
+    if (body.endsWith("\t") && wrap_visibleWidth(body) === 0) {
+      body = body.slice(0, -1);
+      continue;
+    }
     cut = body.length;
     break;
   }
