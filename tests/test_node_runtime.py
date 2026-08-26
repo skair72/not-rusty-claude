@@ -183,13 +183,6 @@ def _run(argv, env, cwd=None):
                           timeout=TIMEOUT)
 
 
-@pytest.fixture(scope="session")
-def node_env(node_bin, ws_module, undici_module, built_artifact):
-    """Everything the Node side needs, or a skip naming what is missing."""
-    assert ws_module == undici_module, "ws and undici must share one node_modules"
-    return {"node": node_bin, "modules": ws_module, "artifact": built_artifact}
-
-
 def _both(node_env, bun_bin, tmp_path, args):
     """Run the same CLI command under Bun and under Node + shim.
 

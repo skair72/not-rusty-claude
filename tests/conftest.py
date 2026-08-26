@@ -191,3 +191,10 @@ def built_artifact():
         pytest.skip(f"no artifact at {path} - run `make build`, "
                     f"or set NRC_TEST_ARTIFACT")
     return path
+
+
+@pytest.fixture(scope="session")
+def node_env(node_bin, ws_module, undici_module, built_artifact):
+    """Everything the Node side needs at once, or a skip naming what is missing."""
+    assert ws_module == undici_module, "ws and undici must share one node_modules"
+    return {"node": node_bin, "modules": ws_module, "artifact": built_artifact}

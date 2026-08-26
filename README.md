@@ -145,10 +145,20 @@ make node-run NODE_BIN=/path/to/node24  # node --require scripts/bun-shim.cjs �
 Measured 2026-08-25, Bun 1.3.14 against Node 24.0.0 and 26.7.0: `--version`,
 `--help`, `mcp list` and `config ls` print **byte-identical stdout with equal
 exit codes**; `doctor` differs in one line, the `Path:` naming the interpreter
-actually running. **A real agentic conversation under Node has never been run** —
-that is the command surface only, and where the shim cannot match Bun (`YAML`,
-`wrapAnsi`, `spawn`, …) it throws naming the API rather than guessing. Detail:
+actually running. Where the shim cannot match Bun (`YAML`, `wrapAnsi`, `spawn`, …)
+it throws naming the API rather than guessing. Detail:
 [`docs/findings.md`](docs/findings.md) §11.
+
+The **interactive TUI works too** ✅ — driven through a pty here on 2026-08-26 under
+Node 24.19.0 it painted the welcome banner, took a keystroke at the theme picker,
+rendered the syntax preview and reached the login selector, all of it responsive.
+Two honest limits on that: it was **Linux**, and no *authenticated* conversation has
+been run under Node, so this is the interface working, not the agent characterised.
+⚠️ On **macOS the same command paints nothing at all** and does not respond to Ctrl-C
+— first-hand report, Apple Silicon, 2026-08-26; not reproducible here and cause
+unknown. Use Bun on a Mac. `scripts/node-trace.cjs` is the instrument that will say
+why, and [`docs/runbook.md`](docs/runbook.md) § Diagnosing a Node hang is how to run
+it.
 
 ## macOS
 
@@ -299,6 +309,7 @@ not-rusty-claude/
 ├── scripts/
 │   ├── build.sh                    extract → post-process → print the run command
 │   ├── bun-shim.cjs                globalThis.Bun stand-in, so Node ≥ 24 can run it
+│   ├── node-trace.cjs              diagnostic preload: what blocked, and where
 │   ├── ab-equivalence.sh           the findings §10 A/B (Linux-only: /proc)
 │   ├── mock-messages-api.mjs       loopback-only mock of the Messages API
 │   └── syntax-check.js             fast secondary syntax check (JSC, not Bun)

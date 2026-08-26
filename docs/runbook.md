@@ -245,7 +245,11 @@ before real use.
 **Under Node instead of Bun.** Node **≥ 24** only — the bundle's `using`
 declarations do not parse before it. `make node-deps && make node-run NODE_BIN=<node24>`
 runs the artifact under `node --require scripts/bun-shim.cjs`; the command surface is
-byte-identical to Bun, the agentic path untested ([findings.md](./findings.md) §11).
+byte-identical to Bun ([findings.md](./findings.md) §11). The **interactive TUI also
+works** — driven through a pty here on 2026-08-26 it painted the banner, took a
+keystroke at the theme picker, rendered the syntax preview and reached the login
+selector. That was on **Linux**. On macOS it paints nothing at all; see the
+troubleshooting row below, which ships the instrument that will say why.
 
 **Run it by full path.** Do not create a `claude` shim on `PATH`; it would shadow
 your real installation, and every command in this repo is written to be run by
@@ -388,7 +392,60 @@ Two things to expect:
 | `error: PE (Windows) executable detected` | you pointed the extractor at `claude.exe` | Not supported by design — [status.md](./status.md) § Windows/PE |
 | `error: ELF has no section headers (stripped?)` | the binary was stripped | Get an unstripped build; the shipped one is not stripped |
 | `input is only 0 bytes` from the extractor, with no path given to `build.sh` | auto-discovery picked a stub: an interrupted `claude` auto-update leaves a 0-byte entry in `versions/`, and it sorts **newest** | Fixed as of 2026-08-24 — discovery walks newest-first, skips anything under 1 MiB and names what it skipped. On an older checkout, pass the working binary explicitly |
+| Under **Node on macOS** the TUI paints nothing, sits idle, and Ctrl-C does not exit | **Unknown.** Reported first-hand on Apple Silicon, 2026-08-26. Not reproducible on this Linux host, where the same command drives the TUI through onboarding normally. `Bun.Terminal` is ruled out — startup touches only `semver`, `stringWidth`, `which` and `isStandaloneExecutable` | Use Bun; it works there. To help find the cause, re-run with `scripts/node-trace.cjs` loaded **before** the shim and send the log — see [Diagnosing a Node hang](#diagnosing-a-node-hang) |
 | On exit the TUI does not clear or restore the terminal | **Unknown.** Observed once on macOS (Apple Silicon, 2026-08-24), not reproduced, cause not investigated. The native binary does not behave this way | Nothing to do; cosmetic. Recorded in [status.md](./status.md) § Known unknowns so a second sighting has something to attach to — please report one, with the terminal emulator named |
+
+---
+
+## Diagnosing a Node hang
+
+`scripts/node-trace.cjs` is a diagnostic preload. It writes to `NRC_TRACE`
+(default `/tmp/nrc-node-trace.log`) and never to stdout, because stdout belongs
+to the TUI. Every call it wraps logs both before and after, so **a line with no
+matching `<` is the call that never returned**, and a 500 ms heartbeat runs
+alongside: ticks continuing means the process is idle and waiting; ticks
+stopping means the main thread is blocked. It is unbuffered `fs.writeSync`, so
+the last line survives `kill -9`, and its timer is `unref`'d so it cannot keep a
+finished process alive. `tests/test_node_trace.py` pins all of that.
+
+Load it **before** the shim, and run these three in order — the first that
+misbehaves is the answer:
+
+```bash
+cd /path/to/not-rusty-claude
+export NODE_PATH="$HOME/.cache/not-rusty-claude/node/node_modules"
+
+# A. do the preloads even complete?
+node --require "$PWD/scripts/node-trace.cjs" \
+     --require "$PWD/scripts/bun-shim.cjs" -e 'console.log("preloads ok")'
+
+# B. a non-interactive command: if THIS hangs, it is startup, not the TUI
+NRC_TRACE=/tmp/nrc-b.log DISABLE_AUTOUPDATER=1 \
+  node --require "$PWD/scripts/node-trace.cjs" \
+       --require "$PWD/scripts/bun-shim.cjs" \
+       build/extract/cli.original.cjs mcp list
+
+# C. the TUI. Leave it in the FOREGROUND; do not background it - a backgrounded
+#    TUI gets SIGTTOU and tells you nothing.
+NRC_TRACE=/tmp/nrc-c.log DISABLE_AUTOUPDATER=1 \
+  node --require "$PWD/scripts/node-trace.cjs" \
+       --require "$PWD/scripts/bun-shim.cjs" \
+       build/extract/cli.original.cjs
+```
+
+While C is stuck, from a **second** terminal, macOS's own sampling profiler
+gives the native stack of every thread with no code change at all:
+
+```bash
+sample $(pgrep -n -f cli.original.cjs) 5 -f /tmp/nrc-sample.txt
+pkill -f cli.original.cjs
+```
+
+`/tmp/nrc-c.log` and `/tmp/nrc-sample.txt` together say where it stopped.
+
+For reference, a healthy Linux run reaches first paint at ~1.8 s: `setRawMode`,
+then the 710-byte welcome banner, then a `\e[c` device-attributes query, then
+the theme picker. A log that ends before the banner never got to the renderer.
 
 ---
 
