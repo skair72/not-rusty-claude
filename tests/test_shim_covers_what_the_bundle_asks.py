@@ -35,15 +35,19 @@ SHIM = ROOT / "scripts" / "bun-shim.cjs"
 KNOWN_REFUSED_AND_REFERENCED = {
     "SQL", "TOML.parse", "Transpiler", "YAML.parse", "YAML.stringify",
     "connect", "deepEquals", "file", "generateHeapSnapshot", "listen",
-    "semver.order", "semver.satisfies", "serve", "spawn", "wrapAnsi",
+    "semver.order", "semver.satisfies", "serve", "spawn",
 }
 
-# The subset a running interactive session actually reaches, measured on
-# darwin-arm64 2026-08-26 with scripts/node-trace.cjs watching the object the
-# shim installs: the REPL calls YAML.parse 44 times, then wrapAnsi 5 times, and
-# a React error boundary swallows every throw. That is why the TUI shows
-# nothing and does not crash. These two are what block the interactive path.
-REACHED_ON_THE_INTERACTIVE_PATH = {"YAML.parse", "wrapAnsi"}
+# The subset a running interactive session actually reaches AND is still
+# refused. Measured on darwin-arm64 2026-08-26 with scripts/node-trace.cjs
+# watching the object the shim installs: the REPL called YAML.parse 44 times
+# and wrapAnsi 5 times, and a React error boundary swallowed every throw - the
+# TUI showed nothing and did not crash.
+#
+# wrapAnsi is implemented now, verified byte-equal to Bun over 2,800 cases, so
+# it has left this set. YAML.parse has not: skills and agents whose frontmatter
+# needs it still fail to load.
+REACHED_ON_THE_INTERACTIVE_PATH = {"YAML.parse"}
 
 
 def _bundle_references(artifact):

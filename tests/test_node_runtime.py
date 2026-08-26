@@ -578,12 +578,17 @@ def test_which_reads_the_path_the_process_started_with(node_bin, bun_bin, which_
 # Every Bun API the artifact can reach, and what the shim must do about it.
 # A stub that returned a plausible value instead of throwing is the failure
 # this repo exists to prevent, so the two lists are asserted, not documented.
+#
+# wrapAnsi left this list on 2026-08-26. It is implemented and verified
+# byte-equal to Bun over 2,800 cases (tests/test_wrap_ansi.py), because the
+# renderer cannot draw a frame without it and the refusal was reaching a React
+# error boundary that swallowed the throw - the TUI painted nothing and never
+# said why.
 THROWING = [
     ("YAML.parse", "Bun.YAML.parse('a: 1')"),
     ("YAML.stringify", "Bun.YAML.stringify({})"),
     ("TOML.parse", "Bun.TOML.parse('a = 1')"),
     ("semver.satisfies", "Bun.semver.satisfies('1.2.3', '^1.0.0')"),
-    ("wrapAnsi", "Bun.wrapAnsi('a b c', 3)"),
     ("spawn", "Bun.spawn(['true'])"),
     ("file", "Bun.file('/etc/hostname')"),
     ("serve", "Bun.serve({})"),
