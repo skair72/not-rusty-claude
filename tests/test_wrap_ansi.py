@@ -71,7 +71,7 @@ def test_the_corpus_is_not_quietly_empty(node_bin):
 
 def test_wrap_ansi_matches_bun_on_every_case(answers):
     bun, node = answers["bun"], answers["node"]
-    assert len(bun) == len(node) == 4500, (
+    assert len(bun) == len(node) == 4900, (
         f"corpus size changed: {len(bun)} under Bun, {len(node)} under Node")
 
     mismatches = [i for i, (b, n) in enumerate(zip(bun, node)) if b != n]

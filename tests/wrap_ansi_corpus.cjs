@@ -3,7 +3,7 @@
 // drift, and deliberately escape-free in source - a literal control byte in a
 // repo file is unreviewable.
 //
-// 45 inputs x 10 widths x 10 option combinations = 4,500 cases, covering SGR
+// 49 inputs x 10 widths x 10 option combinations = 4,900 cases, covering SGR
 // colour, OSC 8 hyperlinks, CJK, emoji, combining marks, tabs and embedded
 // newlines. Bun is the oracle; nothing here hardcodes an expected answer.
 
@@ -11,6 +11,12 @@ const ESC = "\u001b";
 const RED = ESC + "[31m", OFF = ESC + "[39m";
 const BOLD = ESC + "[1m", NB = ESC + "[22m";
 const LINK = ESC + "]8;;https://x.example" + ESC + "\\link" + ESC + "]8;;" + ESC + "\\";
+// String.fromCharCode, never typed literally: NBSP (U+00A0) is visually
+// identical to a plain space in a terminal, and a heredoc silently
+// flattened one to the other during this same investigation - a mistake
+// that would be unreviewable as a literal byte in this file too.
+const NBSP = String.fromCharCode(0xa0);
+const MARK = String.fromCharCode(0x301);
 
 const strings = [
   "", " ", "  ", "a", "abc",
@@ -77,6 +83,25 @@ const strings = [
   ESC + "]8;;https://x.example/63" + ESC + "\\" +
     ESC + "]8;;https://x.example/79\u0007" + "\u4e2d\u6587\u5b57",
   "S" + ESC + "]8;;https://x.example/23" + ESC + "\\" + ESC + "]8;;\u0007" + "\ud83d\udc4d",
+
+  // Trailing-trim rewrite, 2026-08-26. A single unified backward walk
+  // replaced three narrower rules that could not reach a shape like this:
+  // two escape groups with a SPACE between them, both trailing.
+  "ab" + " " + BOLD + " " + RED + "	",
+
+  // NBSP is NOT removable in trailing position, unlike a plain space -
+  // measured directly with fromCharCode after a probe script's literal
+  // NBSP was silently flattened to a plain space and inverted the
+  // conclusion. A tab after it survives too: NBSP gives the row nonzero
+  // visible width, so the tab is not "trailing on an otherwise blank row".
+  "ab" + BOLD + NBSP + "	",
+  NBSP + " " + RED + "	",
+
+  // A row holding nothing but a combining mark and a CSI, the shape a hard
+  // break produces when it splits a mark off its base onto its own row.
+  // The mark has to vanish THROUGH the escape, not just when the row is
+  // otherwise escape-free - the gap an earlier version of this rule had.
+  "e" + MARK + ESC + "[H" + "\u4e2d",
 ];
 
 const widths = [0, 1, 2, 3, 4, 5, 6, 10, 20, 80];
