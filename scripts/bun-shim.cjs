@@ -1164,7 +1164,19 @@ function wrap_wrapLine(rawLine, columns, opts) {
     // Bun keeps because it is width 1 and prints. ESC is not stripped either,
     // so a leading escape shelters what follows it.
     if (opts.trim !== false) {
-      rows[rows.length - 1] = rows[rows.length - 1].replace(/^[ \t]+/, "");
+      // Leading ESCAPES do not shelter the whitespace behind them. Measured:
+      // an SGR followed by " \t " loses all three, exactly as the bare form
+      // does, so the strip has to step over the escapes first rather than
+      // anchor at the row's very start.
+      const row = rows[rows.length - 1];
+      let head = 0;
+      for (;;) {
+        const esc = wrap_escapeLength(row, head);
+        if (!esc) break;
+        head += esc;
+      }
+      rows[rows.length - 1] =
+        row.slice(0, head) + row.slice(head).replace(/^[ \t]+/, "");
     }
 
     const wordWidth = wrap_visibleWidth(word);
