@@ -152,8 +152,11 @@ it throws naming the API rather than guessing. Detail:
 The **interactive TUI works too** ✅ — driven through a pty here on 2026-08-26 under
 Node 24.19.0 it painted the welcome banner, took a keystroke at the theme picker,
 rendered the syntax preview and reached the login selector, all of it responsive.
-Two honest limits on that: it was **Linux**, and no *authenticated* conversation has
-been run under Node, so this is the interface working, not the agent characterised.
+Two honest limits, and the second is sharper than it looks: it was **Linux**, and every
+run used a scratch `CLAUDE_CONFIG_DIR`, so what was exercised is **onboarding** — banner,
+pickers, login selector. The **authenticated REPL has never been rendered under Node on
+any platform**; an attempt with a fake key against the loopback mock stops at the login
+selector under Node *and* under Bun. Onboarding working is not the REPL working.
 ⚠️ On **macOS the same command paints nothing at all** and does not respond to Ctrl-C
 — first-hand report, Apple Silicon, 2026-08-26; not reproducible here and cause
 unknown. Use Bun on a Mac. `scripts/node-trace.cjs` is the instrument that will say
