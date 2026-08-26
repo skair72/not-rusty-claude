@@ -1105,19 +1105,12 @@ function wrap_breakWord(rows, word, columns) {
       if (w > free) rows.push("");
     }
 
-    // A zero-width code point that opens a row is DISCARDED if the next code
-    // point immediately breaks again. Measured, and it is the oracle's
-    // behaviour rather than a nicety: at width 1 the ZWJ in a family emoji, a
-    // variation selector, and a combining mark all vanish from the output when
-    // a wide character follows them. They survive when the next character
-    // fits on the row they opened.
-    if (w === 0 && wrap_pointWidth(rows[rows.length - 1]) === 0) {
-      const nextWidth = wrap_nextVisibleWidth(word, i + cp.length);
-      if (nextWidth > columns) {
-        i += cp.length;
-        continue;
-      }
-    }
+    // NOTE: zero-width code points are NOT discarded here. They land on their
+    // own row, and it is TRIMMING that empties that row afterwards - measured
+    // by varying only the options: with trim:false the flag's variation
+    // selector and joiner are visible on their own row, with trim:true the row
+    // is empty. Deleting them in the breaker got the trim:true case right for
+    // the wrong reason and the trim:false case wrong.
 
     rows[rows.length - 1] += pending + cp;
     pending = "";
@@ -1243,6 +1236,13 @@ function wrap_trimRow(row) {
     // printable precedes it.
     if (body.endsWith("\t") && wrap_visibleWidth(body) === 0) {
       body = body.slice(0, -1);
+      continue;
+    }
+    // A row of zero-width code points - joiners, variation selectors,
+    // combining marks - trims to nothing. They print no glyph, so trimming
+    // treats the row as blank. Escapes are kept: they are state, not content.
+    if (body !== "" && wrap_pointWidth(body) === 0 && !/\u001b/.test(body)) {
+      body = "";
       continue;
     }
     cut = body.length;
