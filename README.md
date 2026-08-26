@@ -157,11 +157,12 @@ run used a scratch `CLAUDE_CONFIG_DIR`, so what was exercised is **onboarding** 
 pickers, login selector. The **authenticated REPL has never been rendered under Node on
 any platform**; an attempt with a fake key against the loopback mock stops at the login
 selector under Node *and* under Bun. Onboarding working is not the REPL working.
-⚠️ On **macOS the same command paints nothing at all** and does not respond to Ctrl-C
-— first-hand report, Apple Silicon, 2026-08-26; not reproducible here and cause
-unknown. Use Bun on a Mac. `scripts/node-trace.cjs` is the instrument that will say
-why, and [`docs/runbook.md`](docs/runbook.md) § Diagnosing a Node hang is how to run
-it.
+⚠️ One reported failure is **config-dependent, not platform**: on an Apple Silicon Mac
+the TUI painted nothing and ignored Ctrl-C with the user's real config, yet the same
+machine, binary and Node render normally with a scratch `CLAUDE_CONFIG_DIR` — the same
+write sequence Linux produces, byte for byte. Under `scripts/node-trace.cjs` the process
+is idle, not blocked, with an extra `ChildProcess` and three sockets alive. Narrowing it
+is [`docs/runbook.md`](docs/runbook.md) § Diagnosing a Node hang.
 
 ## macOS
 
