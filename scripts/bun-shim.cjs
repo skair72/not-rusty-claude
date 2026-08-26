@@ -995,6 +995,21 @@ function wrap_visibleWidth(text) {
 // Stage two: walk code points, not clusters. `rows` is mutated in place; the
 // caller has already placed whatever precedes this word.
 
+// Width of the first visible code point at or after `from`, or 0 if there is
+// none. Escapes are skipped; they place no glyph.
+function wrap_nextVisibleWidth(word, from) {
+  let i = from;
+  while (i < word.length) {
+    const esc = wrap_escapeLength(word, i);
+    if (esc) { i += esc; continue; }
+    const cp = String.fromCodePoint(word.codePointAt(i));
+    const w = stringWidth(cp);
+    if (w > 0) return w;
+    i += cp.length;
+  }
+  return 0;
+}
+
 function wrap_breakWord(rows, word, columns) {
   // An ST-terminated OSC makes everything after it in this word unbreakable -
   // including text past the link's close. Measured: a linked word plus trailing
@@ -1040,6 +1055,21 @@ function wrap_breakWord(rows, word, columns) {
       if (taken === columns) { rows.push(""); free = columns; }
       if (w > free) rows.push("");
     }
+
+    // A zero-width code point that opens a row is DISCARDED if the next code
+    // point immediately breaks again. Measured, and it is the oracle's
+    // behaviour rather than a nicety: at width 1 the ZWJ in a family emoji, a
+    // variation selector, and a combining mark all vanish from the output when
+    // a wide character follows them. They survive when the next character
+    // fits on the row they opened.
+    if (w === 0 && wrap_visibleWidth(rows[rows.length - 1]) === 0) {
+      const nextWidth = wrap_nextVisibleWidth(word, i + cp.length);
+      if (nextWidth > columns) {
+        i += cp.length;
+        continue;
+      }
+    }
+
     rows[rows.length - 1] += pending + cp;
     pending = "";
     i += cp.length;
@@ -1156,7 +1186,14 @@ function wrap_trimRow(row) {
       body = body.slice(0, lastEscStart);
       continue;
     }
-    if (body.endsWith(" ")) { body = body.slice(0, -1); continue; }
+    // Trailing mirrors leading: a run that BEGINS with a space goes, tabs
+    // inside it included, while a tab not preceded by a space survives.
+    // Measured on "- \t ", "ab\t", "ab \t", "ab\t ", "ab\t\t", "ab  ",
+    // "ab \t\t", "ab\t \t". Applied per ROW, not per line: stripping the
+    // line first removed the separators that produce an empty final row at
+    // narrow widths.
+    const stripped = body.replace(/ [ \t]*$/, "");
+    if (stripped !== body) { body = stripped; continue; }
     cut = body.length;
     break;
   }
