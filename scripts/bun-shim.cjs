@@ -1115,7 +1115,7 @@ function wrap_breakWord(rows, word, columns) {
         // row that carries nothing.
         const closesLink = pending.includes(wrap_ESC + "]8;;" + wrap_BEL) ||
           pending.includes(wrap_ESC + "]8;;" + wrap_ESC + "\\");
-        if (pending !== "" && (taken === 0 || closesLink)) {
+        if (pending !== "" && (taken === 0 || taken >= columns || closesLink)) {
           rows[rows.length - 1] += pending;
           pending = "";
         }
