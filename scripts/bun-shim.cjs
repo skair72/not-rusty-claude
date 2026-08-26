@@ -1020,21 +1020,6 @@ function wrap_visibleWidth(text) {
 // Stage two: walk code points, not clusters. `rows` is mutated in place; the
 // caller has already placed whatever precedes this word.
 
-// Width of the first visible code point at or after `from`, or 0 if there is
-// none. Escapes are skipped; they place no glyph.
-function wrap_nextVisibleWidth(word, from) {
-  let i = from;
-  while (i < word.length) {
-    const esc = wrap_escapeLength(word, i);
-    if (esc) { i += esc; continue; }
-    const cp = String.fromCodePoint(word.codePointAt(i));
-    const w = stringWidth(cp);
-    if (w > 0) return w;
-    i += cp.length;
-  }
-  return 0;
-}
-
 // Width as the BREAKER counts it: the sum of each code point's own width,
 // which is not the cluster width. Measured, they disagree on every emoji
 // cluster - a rainbow flag is 2 as a cluster but 3 summed, a wave with a skin
