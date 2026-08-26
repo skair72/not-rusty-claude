@@ -22,7 +22,7 @@ const fs = require('fs');
 const path = require('path');
 
 const LOG_PATH = process.env.NRC_TRACE || '/tmp/nrc-node-trace.log';
-const PREVIEW_WRITES = Number(process.env.NRC_TRACE_WRITES || 10);
+const PREVIEW_WRITES = Number(process.env.NRC_TRACE_WRITES || 40);
 const HEARTBEAT_MS = Number(process.env.NRC_TRACE_HEARTBEAT_MS || 500);
 
 let fd;
@@ -159,8 +159,46 @@ const argvOf = (args) => {
   const rest = Array.isArray(args[1]) ? ' ' + show(args[1].join(' '), 200) : '';
   return cmd + rest;
 };
-for (const name of ['execSync', 'spawnSync', 'execFileSync', 'spawn', 'exec', 'execFile']) {
+
+// The synchronous family blocks, so before/after is the whole story.
+for (const name of ['execSync', 'spawnSync', 'execFileSync']) {
   wrap(cp, name, argvOf);
+}
+
+// The asynchronous family does not: `< spawn` only means the CALL returned, and
+// a child that never exits would leave no trace at all. Follow each one to its
+// exit, so a hook or a scan that hangs is visible as a child with no exit line.
+for (const name of ['spawn', 'exec', 'execFile']) {
+  const original = cp[name];
+  if (typeof original !== 'function') {
+    log('skip ' + name + ' (not a function on this runtime)');
+    continue;
+  }
+  cp[name] = function (...args) {
+    const argv = argvOf(args);
+    log('> ' + name + ' ' + argv);
+    let child;
+    try {
+      child = original.apply(this, args);
+    } catch (err) {
+      log('! ' + name + ' threw ' + show(err && err.message, 160));
+      throw err;
+    }
+    const pid = child && child.pid;
+    log('< ' + name + ' pid=' + pid);
+    if (child && typeof child.on === 'function') {
+      const short = argv.slice(0, 60);
+      child.on('exit', (code, signal) => {
+        log('  child pid=' + pid + ' exited code=' + code +
+            (signal ? ' signal=' + signal : '') + '  (' + short + ')');
+      });
+      child.on('error', (err) => {
+        log('  child pid=' + pid + ' error ' + show(err && err.message, 120));
+      });
+    }
+    return child;
+  };
+  Object.defineProperty(cp[name], 'name', { value: name, configurable: true });
 }
 
 // --- worker handshakes and Atomics.wait ---------------------------------------

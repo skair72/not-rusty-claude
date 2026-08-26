@@ -19,6 +19,7 @@ See tests/conftest.py.
 
 import os
 import pathlib
+import re
 import subprocess
 
 import pytest
@@ -185,3 +186,43 @@ def test_an_unwritable_log_does_not_take_the_run_down(node_bin, tmp_path):
 
     assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
     assert proc.stdout == b"ok"
+
+
+def test_a_child_that_never_exits_is_visible_as_one_with_no_exit_line(node_bin, tmp_path):
+    """The async spawn family needs following to its exit, not just its call.
+
+    `< spawn` says the CALL returned - it says nothing about the child. A hook
+    or a scan that hangs would otherwise leave no trace at all, which is the
+    exact failure this instrument was built to catch.
+    """
+    log = tmp_path / "children.log"
+    script = tmp_path / "spawner.js"
+    script.write_text(
+        "const cp = require('child_process');\n"
+        "cp.spawn('sleep', ['0.2']);\n"
+        "cp.spawn('sleep', ['600']);\n")
+
+    proc = subprocess.Popen([node_bin, "--require", str(TRACE), str(script)],
+                            env=_env(tmp_path / "home", log=log),
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        proc.wait(timeout=6)
+        pytest.fail("the spawner exited; the long child was supposed to hold it")
+    except subprocess.TimeoutExpired:
+        pass
+    finally:
+        proc.kill()
+        proc.wait(timeout=30)
+
+    text = log.read_text()
+    pids = dict(re.findall(r"< spawn pid=(\d+)", text) and
+                [(m[1], m[0]) for m in re.findall(r"> spawn sleep (\S+)\n.*?< spawn pid=(\d+)",
+                                                  text, re.S)])
+    assert len(pids) == 2, f"expected two spawns, parsed {pids}:\n{text}"
+    short_pid = next(p for p, arg in pids.items() if arg == "0.2")
+    long_pid = next(p for p, arg in pids.items() if arg == "600")
+
+    assert f"child pid={short_pid} exited" in text, (
+        "the short child's exit was never recorded:\n" + text)
+    assert f"child pid={long_pid} exited" not in text, (
+        "the log claims the hung child exited; it did not:\n" + text)
