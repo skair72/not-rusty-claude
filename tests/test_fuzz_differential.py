@@ -37,21 +37,29 @@ FUZZER = ROOT / "tests" / "fuzz_shim.cjs"
 
 TIMEOUT = 300
 
-# Cases generated per mode. Large enough to reach the tail, small enough that
-# the pair of runs stays a few seconds.
-COUNT = 2000
+# Cases generated per mode, per seed. Measured 2026-08-26: 8,000 cases through
+# both runtimes takes 0.93s, so breadth here is close to free and the earlier
+# 2,000 was timidity rather than a budget.
+COUNT = 8000
 
 # Seeds are listed, not generated, so the suite runs the same inputs on every
-# machine and every day. Adding a seed is how coverage grows.
-SEEDS = [1, 7, 1337]
+# machine and every day - a corpus that changes per run cannot be pinned, and a
+# failure nobody can reproduce is one nobody fixes. Adding a seed is how
+# coverage grows; each one is 8,000 more inputs nobody chose.
+SEEDS = [1, 7, 13, 99, 1337, 20260826, 24301, 424242]
 
-# Measured 2026-08-26 with these seeds and COUNT. wrapAnsi has known
-# divergences from Bun, concentrated at widths 1-4 and involving ST-terminated
-# hyperlinks, ZWJ sequences and combining marks. This number may only go DOWN.
+# Measured 2026-08-26 with these seeds and COUNT, against the WIDENED grammar -
+# the counts are higher than the first pinning because the vocabulary now
+# reaches shapes the old one could not generate, not because anything got
+# worse. wrapAnsi's divergences concentrate at narrow widths and involve
+# ST-terminated hyperlinks, ZWJ sequences and combining marks. May only go DOWN.
 # Raising it to make a run pass would be reintroducing the exact defect class
 # this file exists to catch - fix the divergence instead, or pin the input as a
 # refusal if it cannot be matched.
-MAX_WRAP_DIVERGENCES = {1: 122, 7: 118, 1337: 98}
+MAX_WRAP_DIVERGENCES = {
+    1: 681, 7: 659, 13: 718, 99: 670,
+    1337: 673, 20260826: 702, 24301: 680, 424242: 680,
+}
 
 # YAML must be exact: it has a refusal channel, so anything it cannot match is
 # required to throw rather than answer differently.
@@ -70,11 +78,19 @@ def _run(argv, env_extra):
     return json.loads(proc.stdout.decode("utf-8"))
 
 
+# Four tests ask for the same (mode, seed) answers; generating them once keeps
+# a wider sweep cheap.
+_CACHE = {}
+
+
 def _both(bun_bin, node_bin, mode, seed):
-    env = {"NRC_FUZZ_MODE": mode, "NRC_FUZZ_SEED": str(seed),
-           "NRC_FUZZ_COUNT": str(COUNT)}
-    return (_run([bun_bin, str(FUZZER)], env),
-            _run([node_bin, "--require", str(SHIM), str(FUZZER)], env))
+    key = (mode, seed)
+    if key not in _CACHE:
+        env = {"NRC_FUZZ_MODE": mode, "NRC_FUZZ_SEED": str(seed),
+               "NRC_FUZZ_COUNT": str(COUNT)}
+        _CACHE[key] = (_run([bun_bin, str(FUZZER)], env),
+                       _run([node_bin, "--require", str(SHIM), str(FUZZER)], env))
+    return _CACHE[key]
 
 
 def _describe(entry, bun, shim):

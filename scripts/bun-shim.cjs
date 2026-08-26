@@ -1565,7 +1565,11 @@ function yaml_readBlockScalar(lines, start, header, parentIndent) {
     let previousWasLiteral = false;
     for (const line of body) {
       if (line === "") { folded.push("\n"); previousWasLiteral = false; continue; }
-      const literal = /^\s/.test(line);
+      // Indentation is SPACES, not \s. JavaScript's \s matches NBSP,
+      // ideographic space and friends, so a folded line merely starting
+      // with one of those was mistaken for a more-indented line and kept
+      // literal instead of folded.
+      const literal = line.startsWith(" ");
       if (folded.length) {
         if (literal || previousWasLiteral) folded.push("\n");
         else if (folded[folded.length - 1] !== "\n") folded.push(" ");
@@ -1752,13 +1756,24 @@ function yamlParse(input) {
   // guessing which one the caller wanted is exactly the wrong move.
   const markers = lines.filter((l) => l.trim() === "---" || l.trim().startsWith("--- ")).length;
   if (markers > 1) yaml_refuse("multiple documents in one string");
-  if (lines.length && (lines[0].trim() === "---" || lines[0].trim().startsWith("--- "))) {
+  // The marker need not be the first LINE - comments and blank lines may sit
+  // above it. Looking only at line 0 left `# comment` then `---` unrecognised,
+  // and the marker then fell through and was read as a bare scalar "---".
+  let markerAt = 0;
+  while (markerAt < lines.length &&
+         (yaml_isBlank(lines[markerAt]) ||
+          yaml_stripComment(lines[markerAt]).trim() === "")) {
+    markerAt++;
+  }
+  if (markerAt < lines.length &&
+      (lines[markerAt].trim() === "---" || lines[markerAt].trim().startsWith("--- "))) {
     // Content may sit on the marker line itself: `--- scalar` is a document
     // whose value is "scalar", not an empty one. Dropping the whole line
     // returned null for a document that has content, which is config silently
     // missing rather than config loudly refused.
-    const inline = lines[0].trim().slice(3).trim();
-    lines = inline === "" ? lines.slice(1) : [inline].concat(lines.slice(1));
+    const inline = lines[markerAt].trim().slice(3).trim();
+    const after = lines.slice(markerAt + 1);
+    lines = inline === "" ? after : [inline].concat(after);
   }
 
   const meaningful = lines.filter((l) => !yaml_isBlank(l) && yaml_stripComment(l).trim() !== "");

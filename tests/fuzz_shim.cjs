@@ -39,19 +39,48 @@ const BEL = "\u0007";
 // --- wrapAnsi inputs ---------------------------------------------------------
 
 const SGR = [
+  // Single-parameter forms: these are the ones that carry across a row break.
   ESC + "[31m", ESC + "[39m", ESC + "[1m", ESC + "[22m", ESC + "[4m",
-  ESC + "[24m", ESC + "[41m", ESC + "[49m", ESC + "[0m",
+  ESC + "[24m", ESC + "[41m", ESC + "[49m", ESC + "[0m", ESC + "[m",
+  ESC + "[7m", ESC + "[27m", ESC + "[9m", ESC + "[29m", ESC + "[53m",
+  ESC + "[55m", ESC + "[2m", ESC + "[3m", ESC + "[23m", ESC + "[90m",
+  ESC + "[97m", ESC + "[100m", ESC + "[107m",
+  // Multi-parameter: 256-colour, truecolor and combined forms. A themed TUI
+  // emits these constantly, and the first corpus contained not one of them -
+  // which is how a carry model that fabricated a nonexistent code survived a
+  // "byte-identical over 2,800 cases" claim.
   ESC + "[38;5;208m", ESC + "[48;5;20m", ESC + "[38;2;215;119;87m",
-  ESC + "[1;31m", ESC + "[0;32;1m", ESC + "[m", ESC + "[7m", ESC + "[27m",
+  ESC + "[48;2;0;0;0m", ESC + "[1;31m", ESC + "[0;32;1m", ESC + "[4;38;5;9m",
+  ESC + "[1;4;7m", ESC + "[39;49m", ESC + "[0;0m",
+  // Non-SGR CSI: zero width, but not colour. They must not be mistaken for
+  // carry candidates just because they are escapes.
+  ESC + "[2K", ESC + "[1A", ESC + "[?25l", ESC + "[6n", ESC + "[H",
 ];
 
 const WORDS = [
   "a", "ab", "abc", "word", "longer", "hyphen-ated", "x", "the", "quick",
-  "日本", "日本語", "café", "👍", "👨‍👩‍👧",
-  "é", "tab\there", "under_score", "CAPS", "1234",
+  "supercalifragilistic", "a-very-long-unbroken-token-here",
+  // East Asian wide characters: two columns each, so they land differently
+  // against every break rule than ASCII does.
+  "\u65e5\u672c", "\u65e5\u672c\u8a9e", "\ud55c\uad6d\uc5b4",
+  "\u4e2d\u6587\u5b57", "\uff71\uff72\uff73",
+  // Emoji and clusters. The inner word-breaker works on code points while
+  // measurement works on clusters, so these break differently from how they
+  // measure - which is exactly where the model has been wrong.
+  "\ud83d\udc4d", "\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67",
+  "\ud83c\uddfa\ud83c\uddf8", "1\ufe0f\u20e3", "\ud83d\udc4b\ud83c\udffd",
+  "\ud83c\udff3\ufe0f\u200d\ud83c\udf08", "\ud83d\ude00",
+  // Combining marks: zero width, attaching to what precedes them.
+  "caf\u00e9", "\u00e9", "e\u0301", "a\u0300\u0301\u0302",
+  // Formatting characters that are not escapes and not spaces.
+  "tab\ttab", "\u00a0nbsp", "zero\u200bwidth", "bidi\u202e",
+  "under_score", "CAPS", "1234", ".", "-", "--", "a.b", "'quoted'",
 ];
 
-const SEPARATORS = [" ", "  ", "   ", "\n", "\r", "\r\n", "\t"];
+const SEPARATORS = [
+  " ", "  ", "   ", "    ", "\n", "\n\n", "\r", "\r\n", "\t", " \t ",
+  "\u00a0", " \n ", "\n ", " \n",
+];
 
 function wrapInput(random, pick) {
   const parts = [];
@@ -69,7 +98,10 @@ function wrapInput(random, pick) {
   return parts.join("");
 }
 
-const WIDTHS = [0, 1, 2, 3, 4, 5, 7, 10, 16, 40];
+// Narrow widths are where the break rules interact hardest; the wide ones are
+// what a real terminal uses. Both belong: a rule that only holds at width 80
+// is a rule that has not been tested.
+const WIDTHS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 20, 40, 80, 120];
 const OPTIONS = [
   undefined, {}, { hard: true }, { hard: false }, { trim: false },
   { trim: true }, { wordWrap: false }, { hard: true, trim: false },
@@ -79,20 +111,29 @@ const OPTIONS = [
 // --- YAML inputs -------------------------------------------------------------
 
 const SCALARS = [
-  "1", "-1", "0x10", "-0x10", "0o17", "1.5", ".5", "+.5", "1e3", "-0",
-  "true", "TRUE", "false", "yes", "no", "on", "off", "null", "~", "Null",
-  ".inf", "-.inf", ".nan", "text", "two words", "with-dash", "a#b", "a #b",
-  "'quoted'", '"double"', "'it''s"+"'", "12:30", "2026-08-26", "1_000",
-  "[1, 2]", "{a: 1}", "{a:1}", "[]", "{}", "", "don't", 'say "hi"',
-  "trailing   ", "  leading", "-", "x:", ":x", "a: b", "@at", "0b101",
-];
+  "1", "-1", "0x10", "-0x10", "+0x10", "0o17", "-0o17", "1.5", ".5", "+.5",
+  "1e3", "1E3", "1e-3", "-0", "0", "00", "007", "1_000", "0b101", "1.",
+  ".inf", "-.inf", ".nan", ".INF", "12345678901234567890",
+  "true", "TRUE", "True", "false", "yes", "no", "on", "off", "null", "~",
+  "Null", "NULL", "text", "two words", "with-dash", "a#b", "a #b", "a # b",
+  "'quoted'", '"double"', "'it''s'", '"a\\nb"', "''", '""',
+  "12:30", "2026-08-26", "don't", 'say "hi"', "trailing   ", "  leading",
+  "-", "--", "-x", "x:", ":x", "a: b", "@at", "%pct", "`tick",
+  "[1, 2]", "{a: 1}", "{a:1}", "[]", "{}", "",
+]
 
 const KEYS = [
   "name", "description", "tools", "allowed-tools", "model", "a", "b",
   '"quoted key"', "'single'", "key_under", "UPPER", "a b", "1", "true",
-];
+  "null", "0", "a-b", "a.b", "x", "argument-hint", "disable-model-invocation",
+]
 
 const BLOCK_HEADERS = ["|", ">", "|-", ">-", "|+", ">+"];
+
+const FLOW_VALUES = [
+  "[1, 2]", "{a: 1}", "{a:1}", "[]", "{}", "[a, b]", "{x: y, z: 1}",
+  "[[1], [2]]", "{a: {b: 1}}", "[{a: 1}]", "[ 1 , 2 ]", "{ x : 1 }",
+];
 
 function yamlInput(random, pick) {
   const lines = [];
@@ -117,11 +158,15 @@ function yamlInput(random, pick) {
       for (let k = 0; k < items; k++) {
         lines.push("  " + (random() < 0.2 ? "  " : "") + pick(WORDS));
       }
+    } else if (roll < 0.96) {
+      lines.push(key + ": " + pick(FLOW_VALUES));
     } else {
       lines.push("# " + pick(WORDS));
     }
   }
-  if (random() < 0.1) lines.unshift("---");
+  if (random() < 0.08) lines.unshift("---");
+  if (random() < 0.05) lines.push("");
+  if (random() < 0.05) lines.unshift("# leading comment");
   return lines.join("\n");
 }
 
