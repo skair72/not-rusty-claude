@@ -958,14 +958,25 @@ function wrap_escapeLength(text, i) {
 
 // --- escape state -----------------------------------------------------------
 
+// Swept code by code against the oracle rather than reasoned from the SGR
+// spec, because the oracle's table is not the spec's. Measured at width 1,
+// where row one ends mid-style and whatever trails it IS the closer:
+//
+//   6  (rapid blink) closes with 25, the same as 5 - we closed nothing
+//   53 (overline)    closes with NOTHING - we closed with 55
+//   38 and 48        close with NOTHING - we closed with 39 and 49
+//
+// 38 and 48 are the PREFIXES of an extended colour ("38;5;n"), so a bare 38
+// selects no colour and there is nothing to close. The ranges below stop at
+// 37 and 47 for that reason. 53 looks like a plain gap in the oracle's table.
 const wrap_CLOSERS = new Map([
-  [1, 22], [2, 22], [3, 23], [4, 24], [5, 25], [7, 27], [8, 28], [9, 29], [53, 55],
+  [1, 22], [2, 22], [3, 23], [4, 24], [5, 25], [6, 25], [7, 27], [8, 28], [9, 29],
 ]);
 
 function wrap_closerFor(code) {
   if (wrap_CLOSERS.has(code)) return wrap_CLOSERS.get(code);
-  if ((code >= 30 && code <= 38) || (code >= 90 && code <= 97)) return 39;
-  if ((code >= 40 && code <= 48) || (code >= 100 && code <= 107)) return 49;
+  if ((code >= 30 && code <= 37) || (code >= 90 && code <= 97)) return 39;
+  if ((code >= 40 && code <= 47) || (code >= 100 && code <= 107)) return 49;
   return null;
 }
 
