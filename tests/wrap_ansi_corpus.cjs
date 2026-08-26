@@ -3,7 +3,7 @@
 // drift, and deliberately escape-free in source - a literal control byte in a
 // repo file is unreviewable.
 //
-// 43 inputs x 10 widths x 10 option combinations = 4,300 cases, covering SGR
+// 45 inputs x 10 widths x 10 option combinations = 4,500 cases, covering SGR
 // colour, OSC 8 hyperlinks, CJK, emoji, combining marks, tabs and embedded
 // newlines. Bun is the oracle; nothing here hardcodes an expected answer.
 
@@ -63,6 +63,20 @@ const strings = [
   ESC + "]8;;" + ESC + "\\" + ESC + "]8;;\u0007wo",
   ESC + "]8;;" + ESC + "\\" + ESC + "]8;;\u0007" + "\u672c",
   "." + ESC + "]8;;" + ESC + "\\" + ESC + "]8;;https://x.example/23\u0007f",
+
+  // Also 2026-08-26. An ST-terminated OSC 8 opener IMMEDIATELY followed by
+  // another OSC 8: the second supersedes the first before it reaches any
+  // text, so the first covers nothing and glues nothing. The oracle breaks
+  // these per character; the glue rule held them on one row.
+  //
+  // Like the three above, the generated grammar never emits this adjacency -
+  // it appeared only after minimisation DELETED the text between the two
+  // sequences, which is a shape no real input had. Measured: zero of 2,735
+  // pooled failures change either way. So the ratchet cannot see it, and this
+  // corpus is the only thing that holds it.
+  ESC + "]8;;https://x.example/63" + ESC + "\\" +
+    ESC + "]8;;https://x.example/79\u0007" + "\u4e2d\u6587\u5b57",
+  "S" + ESC + "]8;;https://x.example/23" + ESC + "\\" + ESC + "]8;;\u0007" + "\ud83d\udc4d",
 ];
 
 const widths = [0, 1, 2, 3, 4, 5, 6, 10, 20, 80];

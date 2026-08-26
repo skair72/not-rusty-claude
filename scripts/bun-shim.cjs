@@ -1080,7 +1080,16 @@ function wrap_breakWord(rows, word, columns) {
     // because the close happened to be ST-terminated.
     if (text.startsWith(wrap_ESC + "]8;;") && text.endsWith(wrap_ESC + "\\")) {
       const uri = text.slice(5, -2);
-      if (uri !== "") {
+      // ...and only if the link actually COVERS something. An OSC 8 that is
+      // immediately followed by another OSC 8 is superseded before it reaches
+      // any text, so it holds nothing together. Minimised from real failures:
+      // "<st-open><bel-open>CJK" breaks per character under the oracle, and we
+      // glued the whole line onto one row because an ST-terminated opener was
+      // present somewhere.
+      const nextLen = wrap_escapeLength(word, scan + esc);
+      const superseded = nextLen > 0 &&
+        word.slice(scan + esc, scan + esc + nextLen).startsWith(wrap_ESC + "]8;;");
+      if (uri !== "" && !superseded) {
         glueFrom = scan;
         break;
       }

@@ -167,7 +167,7 @@ both, and a React error boundary swallowed every throw. Refusing loudly only hel
 something can hear it.
 
 Both are implemented now, measured against Bun as oracle rather than written from memory
-— `wrapAnsi` byte-equal over 4,300 cases, `YAML.parse` matching on 141 of 178 and
+— `wrapAnsi` byte-equal over 4,500 cases, `YAML.parse` matching on 141 of 178 and
 refusing 18 by name, with **zero** inputs accepted and parsed differently. A first
 version of both passed a smaller corpus and still carried thirteen real defects, found
 by review: the corpora were extended until they covered the shapes that had hidden them
