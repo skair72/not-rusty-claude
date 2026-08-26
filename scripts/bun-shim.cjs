@@ -1010,6 +1010,25 @@ function wrap_nextVisibleWidth(word, from) {
   return 0;
 }
 
+// Width as the BREAKER counts it: the sum of each code point's own width,
+// which is not the cluster width. Measured, they disagree on every emoji
+// cluster - a rainbow flag is 2 as a cluster but 3 summed, a wave with a skin
+// tone is 2 versus 4. Stage one places whole words by cluster width; stage two
+// walks code points and must count them the same way it walks them, or a row
+// that looks full to one stage looks roomy to the other.
+function wrap_pointWidth(text) {
+  let total = 0;
+  let i = 0;
+  while (i < text.length) {
+    const esc = wrap_escapeLength(text, i);
+    if (esc) { i += esc; continue; }
+    const cp = String.fromCodePoint(text.codePointAt(i));
+    total += stringWidth(cp);
+    i += cp.length;
+  }
+  return total;
+}
+
 function wrap_breakWord(rows, word, columns) {
   // An ST-terminated OSC makes everything after it in this word unbreakable -
   // including text past the link's close. Measured: a linked word plus trailing
@@ -1054,12 +1073,12 @@ function wrap_breakWord(rows, word, columns) {
     }
     const cp = String.fromCodePoint(word.codePointAt(i));
     const w = stringWidth(cp);
-    const taken = wrap_visibleWidth(rows[rows.length - 1]);
+    const taken = wrap_pointWidth(rows[rows.length - 1]);
 
     // A zero-width code point with nothing visible after it stays where it is:
     // measured, a trailing tab ends the row it is on rather than opening one.
     const rest = word.slice(i + cp.length);
-    const nothingVisibleAfter = w === 0 && wrap_visibleWidth(rest) === 0;
+    const nothingVisibleAfter = w === 0 && wrap_pointWidth(rest) === 0;
 
     // Two INDEPENDENT reasons to break, and both can fire for one code point.
     // A row that is exactly full yields to whatever comes next; a glyph too
@@ -1078,7 +1097,7 @@ function wrap_breakWord(rows, word, columns) {
     // variation selector, and a combining mark all vanish from the output when
     // a wide character follows them. They survive when the next character
     // fits on the row they opened.
-    if (w === 0 && wrap_visibleWidth(rows[rows.length - 1]) === 0) {
+    if (w === 0 && wrap_pointWidth(rows[rows.length - 1]) === 0) {
       const nextWidth = wrap_nextVisibleWidth(word, i + cp.length);
       if (nextWidth > columns) {
         i += cp.length;
