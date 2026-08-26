@@ -585,7 +585,10 @@ def test_which_reads_the_path_the_process_started_with(node_bin, bun_bin, which_
 # error boundary that swallowed the throw - the TUI painted nothing and never
 # said why.
 THROWING = [
-    ("YAML.parse", "Bun.YAML.parse('a: 1')"),
+    # YAML.parse answers ordinary frontmatter now; what it still refuses is
+    # the constructs it could not verify against Bun. An anchor is one, so the
+    # entry keeps its place in this list rather than leaving it.
+    ("YAML.parse", "Bun.YAML.parse('a: &x 1')"),
     ("YAML.stringify", "Bun.YAML.stringify({})"),
     ("TOML.parse", "Bun.TOML.parse('a = 1')"),
     ("semver.satisfies", "Bun.semver.satisfies('1.2.3', '^1.0.0')"),

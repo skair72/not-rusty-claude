@@ -38,15 +38,17 @@ KNOWN_REFUSED_AND_REFERENCED = {
     "semver.order", "semver.satisfies", "serve", "spawn",
 }
 
-# The subset a running interactive session actually reaches AND is still
-# refused. Measured on darwin-arm64 2026-08-26 with scripts/node-trace.cjs
-# watching the object the shim installs: the REPL called YAML.parse 44 times
-# and wrapAnsi 5 times, and a React error boundary swallowed every throw - the
-# TUI showed nothing and did not crash.
+# What a running interactive session reaches and can still be refused by.
+# Measured on darwin-arm64 2026-08-26 with scripts/node-trace.cjs watching the
+# object the shim installs: the REPL called YAML.parse 44 times and wrapAnsi 5
+# times, and a React error boundary swallowed every throw - the TUI showed
+# nothing and did not crash.
 #
-# wrapAnsi is implemented now, verified byte-equal to Bun over 2,800 cases, so
-# it has left this set. YAML.parse has not: skills and agents whose frontmatter
-# needs it still fail to load.
+# Both are implemented now. wrapAnsi answers unconditionally, byte-equal to Bun
+# over 2,800 cases, so it is gone from here entirely. YAML.parse answers the
+# subset frontmatter uses and still refuses anchors, tags, complex keys,
+# multi-document input, tab indentation and explicit block scalar indents - so
+# it stays, because a frontmatter file using one of those will still fail.
 REACHED_ON_THE_INTERACTIVE_PATH = {"YAML.parse"}
 
 

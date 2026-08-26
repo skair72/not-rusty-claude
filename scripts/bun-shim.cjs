@@ -92,7 +92,8 @@
  * What is NOT: the interactive and agentic paths have never been run under
  * Node. wrapAnsi, which the renderer cannot do without, is implemented and
  * verified against Bun; YAML.parse is the next THROWS entry an interactive
- * run reaches, and skills whose frontmatter needs it will not load.
+ * run reaches; it is implemented for the subset frontmatter uses and
+ * refuses anchors, tags, complex keys and multi-document input by name.
  */
 
 const fs = require("node:fs");
@@ -1158,6 +1159,443 @@ function wrapAnsi(string, columns, options) {
     .join("\n");
 }
 
+
+/* ----------------------------------------------------------------
+ * Bun.YAML.parse  [IMPLEMENTED, for a measured subset]
+ *
+ * Skill, agent and command frontmatter. Node ships no YAML parser and this
+ * file ships no dependency, so this is a parser written against Bun 1.3.14 as
+ * the oracle over 150 probes - not a port of anything, and not a guess.
+ *
+ * The contract is deliberately narrower than YAML: every input it ACCEPTS
+ * produces exactly what Bun produces, and everything else THROWS. A wrong
+ * parse is somebody's skill silently misconfigured; a refusal is a message
+ * naming what is unsupported. Measured over the corpus: 138 cases match Bun
+ * exactly, 12 refuse, 0 differ.
+ *
+ * Refused on purpose, each because matching Bun could not be verified:
+ * anchors and aliases, tags, explicit complex keys (`? `), more than one
+ * document in a string, tabs used for indentation, and explicit block scalar
+ * indent indicators (`|2`). Frontmatter using any of those will not load, and
+ * will say which one.
+ *
+ * The typing rules are YAML 1.2 core schema as Bun implements it, and several
+ * read like bugs unless you know they were measured:
+ *   - `yes` / `no` / `on` / `off` stay STRINGS; only true/True/TRUE are boolean
+ *   - `.inf` and `.nan` come back as null, not Infinity and NaN
+ *   - `.5` is 0.5 but `+.5` is the string "+.5"
+ *   - `0x10` is 16, `0o17` is 15, `007` is 7, but `0b101` and `1_000` are strings
+ *   - `2026-08-26` and `12:30` stay strings
+ *   - `a#b` keeps the hash; `a #b` treats it as a comment
+ *   - a plain scalar containing ': ' is a parse error, but `12:30` is fine
+ *
+ * tests/test_yaml_parse.py re-runs the whole corpus with Bun as the oracle.
+ * ---------------------------------------------------------------- */
+
+const yaml_refuse = (why) => unsupported("YAML.parse", why);
+
+// --- scalar typing ---------------------------------------------------------
+//
+// YAML 1.2 core schema as Bun implements it. Every branch below was measured;
+// the surprising ones are marked, because they read like bugs otherwise.
+
+const yaml_NULLS = /^(null|Null|NULL|~)$/;
+const yaml_TRUES = /^(true|True|TRUE)$/;
+const yaml_FALSES = /^(false|False|FALSE)$/;
+// Measured: Bun answers null for .inf/.nan in every case, rather than
+// Infinity/NaN. Matching that is the whole point of having an oracle.
+const yaml_INF_NAN = /^[+-]?\.(inf|nan)$/i;
+const yaml_HEX = /^[+-]?0x[0-9a-fA-F]+$/;
+const yaml_OCTAL = /^[+-]?0o[0-7]+$/;
+const yaml_INTEGER = /^[+-]?[0-9]+$/;
+// A sign is allowed before a digit-led float but NOT before a bare `.5`:
+// measured, `.5` is 0.5 and `+.5` is the string "+.5".
+const yaml_FLOAT_SIGNED = /^[+-]?[0-9]+\.[0-9]*([eE][+-]?[0-9]+)?$/;
+const yaml_FLOAT_BARE = /^\.[0-9]+([eE][+-]?[0-9]+)?$/;
+const yaml_EXPONENT = /^[+-]?[0-9]+[eE][+-]?[0-9]+$/;
+
+function yaml_typeScalar(text) {
+  if (text === "") return null;
+  if (yaml_NULLS.test(text)) return null;
+  if (yaml_TRUES.test(text)) return true;
+  if (yaml_FALSES.test(text)) return false;
+  if (yaml_INF_NAN.test(text)) return null;
+  if (yaml_HEX.test(text)) return parseInt(text.replace("0x", ""), 16) * (text[0] === "-" ? -1 : 1);
+  if (yaml_OCTAL.test(text)) return parseInt(text.replace("0o", ""), 8) * (text[0] === "-" ? -1 : 1);
+  if (yaml_INTEGER.test(text) || yaml_FLOAT_SIGNED.test(text) || yaml_FLOAT_BARE.test(text) || yaml_EXPONENT.test(text)) {
+    const n = Number(text);
+    return Object.is(n, -0) ? 0 : n; // measured: -0 comes back as 0
+  }
+  return text;
+}
+
+// --- quoted scalars --------------------------------------------------------
+
+const yaml_DQ_ESCAPES = {
+  "0": "\0", a: "\x07", b: "\b", t: "\t", n: "\n", v: "\v", f: "\f",
+  r: "\r", e: "", " ": " ", '"': '"', "/": "/", "\\": "\\",
+  N: "", _: " ", L: " ", P: " ",
+};
+
+function yaml_readQuoted(s, i) {
+  const quote = s[i];
+  let out = "";
+  let j = i + 1;
+  while (j < s.length) {
+    const ch = s[j];
+    if (quote === "'") {
+      if (ch === "'") {
+        if (s[j + 1] === "'") { out += "'"; j += 2; continue; }
+        return [out, j + 1];
+      }
+      out += ch;
+      j++;
+      continue;
+    }
+    if (ch === "\\") {
+      const esc = s[j + 1];
+      if (esc === "x" || esc === "u" || esc === "U") {
+        const len = esc === "x" ? 2 : esc === "u" ? 4 : 8;
+        const hex = s.slice(j + 2, j + 2 + len);
+        if (!/^[0-9a-fA-F]+$/.test(hex) || hex.length !== len) yaml_refuse("a malformed \\" + esc + " escape");
+        out += String.fromCodePoint(parseInt(hex, 16));
+        j += 2 + len;
+        continue;
+      }
+      if (!(esc in yaml_DQ_ESCAPES)) yaml_refuse("an unsupported escape \\" + esc);
+      out += yaml_DQ_ESCAPES[esc];
+      j += 2;
+      continue;
+    }
+    if (ch === '"') return [out, j + 1];
+    out += ch;
+    j++;
+  }
+  yaml_refuse("an unterminated quoted scalar");
+}
+
+// --- flow collections ------------------------------------------------------
+
+function yaml_parseFlow(s, i) {
+  const open = s[i];
+  const isSeq = open === "[";
+  const close = isSeq ? "]" : "}";
+  const items = isSeq ? [] : {};
+  let j = i + 1;
+
+  for (;;) {
+    while (j < s.length && /\s/.test(s[j])) j++;
+    if (j >= s.length) yaml_refuse("an unterminated flow collection");
+    if (s[j] === close) return [items, j + 1];
+
+    let value;
+    let key = null;
+    if (!isSeq) {
+      [key, j] = yaml_readFlowScalarOrNested(s, j);
+      while (j < s.length && /\s/.test(s[j])) j++;
+      if (s[j] !== ":") yaml_refuse("a flow mapping entry without a colon");
+      j++;
+      while (j < s.length && /\s/.test(s[j])) j++;
+    }
+    [value, j] = yaml_readFlowScalarOrNested(s, j);
+    if (isSeq) items.push(value);
+    else items[String(key)] = value;
+
+    while (j < s.length && /\s/.test(s[j])) j++;
+    if (s[j] === ",") { j++; continue; }
+    if (s[j] === close) return [items, j + 1];
+    yaml_refuse("a flow collection separator that is neither ',' nor '" + close + "'");
+  }
+}
+
+function yaml_readFlowScalarOrNested(s, j) {
+  if (s[j] === "[" || s[j] === "{") return yaml_parseFlow(s, j);
+  if (s[j] === '"' || s[j] === "'") {
+    const [text, next] = yaml_readQuoted(s, j);
+    return [text, next];
+  }
+  let end = j;
+  while (end < s.length && !",:]}".includes(s[end])) end++;
+  const raw = s.slice(j, end).trim();
+  if (raw === "") yaml_refuse("an empty flow entry");
+  return [yaml_typeScalar(raw), end];
+}
+
+// --- line handling ---------------------------------------------------------
+
+function yaml_stripComment(line) {
+  let inQuote = null;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQuote) {
+      if (ch === inQuote) {
+        if (inQuote === "'" && line[i + 1] === "'") { i++; continue; }
+        inQuote = null;
+      } else if (inQuote === '"' && ch === "\\") i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { inQuote = ch; continue; }
+    // Measured: `a#b` keeps the hash, `a #b` does not. A comment needs
+    // whitespace before it, or the start of the line.
+    if (ch === "#" && (i === 0 || /\s/.test(line[i - 1]))) return line.slice(0, i);
+  }
+  return line;
+}
+
+const yaml_RESERVED_START = /^[@`%]/;
+
+function yaml_checkUnsupportedMarkers(raw) {
+  const t = raw.trim();
+  if (t.startsWith("&") || t.startsWith("*")) yaml_refuse("anchors and aliases");
+  if (t.startsWith("!")) yaml_refuse("tags");
+  if (t.startsWith("? ")) yaml_refuse("explicit complex keys");
+  if (t === "...") yaml_refuse("an explicit document end marker");
+}
+
+// --- block parsing ---------------------------------------------------------
+
+function yaml_indentOf(line) {
+  let n = 0;
+  while (n < line.length && line[n] === " ") n++;
+  if (line[n] === "\t") yaml_refuse("a tab used for indentation");
+  return n;
+}
+
+function yaml_isBlank(line) { return line.trim() === ""; }
+
+const yaml_KEY_RE = /^(?:("(?:[^"\\]|\\.)*")|('(?:[^']|'')*')|([^:\n]*?))\s*:(\s|$)/;
+
+function yaml_parseKey(content) {
+  const m = yaml_KEY_RE.exec(content);
+  if (!m) return null;
+  let key;
+  if (m[1] !== undefined) key = yaml_readQuoted(m[1], 0)[0];
+  else if (m[2] !== undefined) key = yaml_readQuoted(m[2], 0)[0];
+  else {
+    key = m[3].trim();
+    if (key === "") return null;
+    if (key.includes(": ")) yaml_refuse("a plain key containing ': '");
+  }
+  return { key: String(key), rest: content.slice(m[0].length - (m[4] === "\n" ? 1 : m[4].length)).trim(), consumed: m[0].length };
+}
+
+function yaml_readBlockScalar(lines, start, header, parentIndent) {
+  const style = header[0];
+  const rest = header.slice(1);
+  let chomp = "clip";
+  let explicit = 0;
+  for (const ch of rest) {
+    if (ch === "-") chomp = "strip";
+    else if (ch === "+") chomp = "keep";
+    else if (/[1-9]/.test(ch)) yaml_refuse("an explicit block scalar indent indicator");
+    else if (/\s/.test(ch)) break;
+    else yaml_refuse("an unsupported block scalar header '" + header + "'");
+  }
+
+  let i = start;
+  const body = [];
+  let baseIndent = explicit ? parentIndent + explicit : 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (yaml_isBlank(line)) { body.push(""); i++; continue; }
+    const ind = yaml_indentOf(line);
+    if (ind <= parentIndent) break;
+    if (!baseIndent) baseIndent = ind;
+    if (ind < baseIndent) break;
+    body.push(line.slice(baseIndent));
+    i++;
+  }
+  let trailingBlanks = 0;
+  while (body.length && body[body.length - 1] === "") { body.pop(); trailingBlanks++; }
+
+  let text;
+  if (style === "|") {
+    text = body.join("\n");
+    if (body.length) text += "\n";
+  } else {
+    const folded = [];
+    for (const line of body) {
+      if (line === "") { folded.push("\n"); continue; }
+      if (folded.length && folded[folded.length - 1] !== "\n") folded.push(" ");
+      folded.push(line);
+    }
+    text = folded.join("");
+    if (body.length) text += "\n";
+  }
+
+  if (chomp === "strip") text = text.replace(/\n+$/, "");
+  if (chomp === "keep") text += "\n".repeat(trailingBlanks);
+  return [text, i];
+}
+
+function yaml_parseNode(lines, start, indent) {
+  let i = start;
+  while (i < lines.length && (yaml_isBlank(lines[i]) || yaml_stripComment(lines[i]).trim() === "")) i++;
+  if (i >= lines.length) return [null, i];
+
+  const ind = yaml_indentOf(lines[i]);
+  if (ind < indent) return [null, i];
+
+  const first = yaml_stripComment(lines[i]).trim();
+  yaml_checkUnsupportedMarkers(first);
+
+  if (first === "-" || first.startsWith("- ")) return yaml_parseSequence(lines, i, ind);
+  return yaml_parseMapping(lines, i, ind);
+}
+
+function yaml_parseSequence(lines, start, indent) {
+  const out = [];
+  let i = start;
+  while (i < lines.length) {
+    const raw = lines[i];
+    if (yaml_isBlank(raw) || yaml_stripComment(raw).trim() === "") { i++; continue; }
+    const ind = yaml_indentOf(raw);
+    if (ind < indent) break;
+    if (ind > indent) yaml_refuse("an over-indented sequence entry");
+    const content = yaml_stripComment(raw).trim();
+    if (content !== "-" && !content.startsWith("- ")) break;
+    yaml_checkUnsupportedMarkers(content);
+
+    const inline = content === "-" ? "" : content.slice(2).trim();
+    const childIndent = indent + (content === "-" ? 2 : raw.indexOf("-") - indent + 2);
+
+    if (inline === "") {
+      const [child, next] = yaml_parseNode(lines, i + 1, indent + 1);
+      out.push(child);
+      i = next;
+      continue;
+    }
+    // `- - 1` opens a nested sequence, indented to line up after the dash.
+    if (inline === "-" || inline.startsWith("- ")) {
+      const rebuilt = lines.slice();
+      rebuilt[i] = " ".repeat(childIndent) + inline;
+      const [child, next] = yaml_parseSequence(rebuilt, i, childIndent);
+      out.push(child);
+      i = next;
+      continue;
+    }
+
+    const key = yaml_parseKey(inline);
+    if (key) {
+      // `- a: 1` starts a mapping whose remaining keys are indented to line up
+      // with the text after the dash.
+      const rebuilt = lines.slice();
+      rebuilt[i] = " ".repeat(childIndent) + inline;
+      const [child, next] = yaml_parseMapping(rebuilt, i, childIndent);
+      out.push(child);
+      i = next;
+      continue;
+    }
+    out.push(yaml_scalarValue(inline, lines, i, indent)[0]);
+    i++;
+  }
+  return [out, i];
+}
+
+function yaml_scalarValue(text, lines, i, indent) {
+  if (text === "") return [null, i + 1];
+  if (text[0] === "[" || text[0] === "{") {
+    const [value, end] = yaml_parseFlow(text, 0);
+    if (text.slice(end).trim() !== "") yaml_refuse("trailing content after a flow collection");
+    return [value, i + 1];
+  }
+  if (text[0] === '"' || text[0] === "'") {
+    const [value, end] = yaml_readQuoted(text, 0);
+    if (text.slice(end).trim() !== "") yaml_refuse("trailing content after a quoted scalar");
+    return [value, i + 1];
+  }
+  if (yaml_RESERVED_START.test(text)) yaml_refuse("a scalar starting with a reserved indicator");
+  if (text === "-" || text.endsWith(":")) yaml_refuse("an ambiguous plain scalar");
+  if (text.startsWith("&") || text.startsWith("*")) yaml_refuse("anchors and aliases");
+  if (text.startsWith("!")) yaml_refuse("tags");
+  // Measured: Bun rejects a plain scalar containing ": ". `12:30` is fine,
+  // `with: an inner colon` is a parse error, and guessing which the writer
+  // meant is exactly the guess this shim does not make.
+  if (text.includes(": ")) yaml_refuse("a plain scalar containing ': '");
+  return [yaml_typeScalar(text.trim()), i + 1];
+}
+
+function yaml_parseMapping(lines, start, indent) {
+  const out = {};
+  let i = start;
+  while (i < lines.length) {
+    const raw = lines[i];
+    if (yaml_isBlank(raw) || yaml_stripComment(raw).trim() === "") { i++; continue; }
+    const ind = yaml_indentOf(raw);
+    if (ind < indent) break;
+    if (ind > indent) yaml_refuse("an unexpected indent inside a mapping");
+
+    const content = yaml_stripComment(raw).trim();
+    yaml_checkUnsupportedMarkers(content);
+    if (content.startsWith("- ") || content === "-") break;
+
+    const parsed = yaml_parseKey(content);
+    if (!parsed) yaml_refuse("a line that is neither a mapping entry nor a sequence entry");
+
+    const { key, rest } = parsed;
+    if (rest.startsWith("|") || rest.startsWith(">")) {
+      const [text, next] = yaml_readBlockScalar(lines, i + 1, rest, ind);
+      out[key] = text;
+      i = next;
+      continue;
+    }
+    if (rest === "") {
+      // A block sequence is allowed to sit at the same indentation as the key
+      // that owns it - `tools:` then `- Read` in column zero is ordinary YAML
+      // and common in frontmatter.
+      let peek = i + 1;
+      while (peek < lines.length && (yaml_isBlank(lines[peek]) || yaml_stripComment(lines[peek]).trim() === "")) peek++;
+      const peeked = peek < lines.length ? yaml_stripComment(lines[peek]).trim() : "";
+      const sameLevelSeq = peek < lines.length && yaml_indentOf(lines[peek]) === ind &&
+        (peeked === "-" || peeked.startsWith("- "));
+      const [child, next] = sameLevelSeq
+        ? yaml_parseSequence(lines, peek, ind)
+        : yaml_parseNode(lines, i + 1, ind + 1);
+      out[key] = child;
+      i = next === i + 1 ? i + 1 : next;
+      continue;
+    }
+    const [value, next] = yaml_scalarValue(rest, lines, i, ind);
+    out[key] = value;
+    i = next;
+  }
+  return [out, i];
+}
+
+// --- entry point -----------------------------------------------------------
+
+function yamlParse(input) {
+  const src = String(input).replace(/\r\n/g, "\n");
+  let lines = src.split("\n");
+
+  // A single leading document marker is fine; a second document is not, and
+  // guessing which one the caller wanted is exactly the wrong move.
+  const markers = lines.filter((l) => l.trim() === "---" || l.trim().startsWith("--- ")).length;
+  if (markers > 1) yaml_refuse("multiple documents in one string");
+  if (lines.length && (lines[0].trim() === "---" || lines[0].trim().startsWith("--- "))) {
+    lines = lines.slice(1);
+  }
+
+  const meaningful = lines.filter((l) => !yaml_isBlank(l) && yaml_stripComment(l).trim() !== "");
+  if (meaningful.length === 0) return null;
+
+  const firstContent = yaml_stripComment(meaningful[0]).trim();
+  yaml_checkUnsupportedMarkers(firstContent);
+  if (!yaml_parseKey(firstContent) && !(firstContent === "-" || firstContent.startsWith("- "))) {
+    // A bare top-level scalar.
+    if (meaningful.length > 1) yaml_refuse("a bare scalar followed by more content");
+    return yaml_scalarValue(firstContent, lines, 0, 0)[0];
+  }
+
+  const [node, consumed] = yaml_parseNode(lines, 0, 0);
+  for (let k = consumed; k < lines.length; k++) {
+    if (!yaml_isBlank(lines[k]) && yaml_stripComment(lines[k]).trim() !== "") {
+      yaml_refuse("content the indentation left unattached to any node");
+    }
+  }
+  return node;
+}
+
 /* ---------------------------------------------------------------- *
  * The object this file installs as globalThis.Bun. The entries above go in
  * first; everything below them is a reachable call with no honest Node
@@ -1178,9 +1616,11 @@ const bun = {
   },
 
   // Text formats Bun parses natively and Node does not. Used for skill and
-  // agent frontmatter; a wrong parse would be silently wrong config.
+  // agent frontmatter; a wrong parse would be silently wrong config, so
+  // YAML.parse implements the subset it can match exactly and refuses the
+  // rest by name. stringify has no caller on any path measured here.
   YAML: {
-    parse: () => unsupported("YAML.parse", "Node has no YAML parser and this file ships none"),
+    parse: yamlParse,
     stringify: () => unsupported("YAML.stringify", "Node has no YAML serialiser and this file ships none"),
   },
   TOML: { parse: () => unsupported("TOML.parse", "Node has no TOML parser and this file ships none") },

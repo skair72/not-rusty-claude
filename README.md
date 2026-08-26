@@ -145,7 +145,7 @@ make node-run NODE_BIN=/path/to/node24  # node --require scripts/bun-shim.cjs �
 Measured 2026-08-25, Bun 1.3.14 against Node 24.0.0 and 26.7.0: `--version`,
 `--help`, `mcp list` and `config ls` print **byte-identical stdout with equal
 exit codes**; `doctor` differs in one line, the `Path:` naming the interpreter
-actually running. Where the shim cannot match Bun (`YAML`, `wrapAnsi`, `spawn`, …)
+actually running. Where the shim cannot match Bun (`spawn`, `file`, `SQL`, …)
 it throws naming the API rather than guessing. Detail:
 [`docs/findings.md`](docs/findings.md) §11.
 
@@ -157,12 +157,21 @@ run used a scratch `CLAUDE_CONFIG_DIR`, so what was exercised is **onboarding** 
 pickers, login selector. The **authenticated REPL has never been rendered under Node on
 any platform**; an attempt with a fake key against the loopback mock stops at the login
 selector under Node *and* under Bun. Onboarding working is not the REPL working.
-⚠️ One reported failure is **config-dependent, not platform**: on an Apple Silicon Mac
-the TUI painted nothing and ignored Ctrl-C with the user's real config, yet the same
-machine, binary and Node render normally with a scratch `CLAUDE_CONFIG_DIR` — the same
-write sequence Linux produces, byte for byte. Under `scripts/node-trace.cjs` the process
-is idle, not blocked, with an extra `ChildProcess` and three sockets alive. Narrowing it
-is [`docs/runbook.md`](docs/runbook.md) § Diagnosing a Node hang.
+The **authenticated REPL** was a different story, and finding out why took a day. On an
+Apple Silicon Mac it painted nothing, ignored Ctrl-C, and looked idle rather than stuck —
+while the same machine, binary and Node rendered onboarding perfectly with a scratch
+`CLAUDE_CONFIG_DIR`. Seven explanations were raised and killed by evidence (native
+addons, `Bun.Terminal`, a fullscreen renderer, a keychain freeze, MCP servers, a missing
+`ripgrep`, an eight-version bundle gap) before `scripts/node-trace.cjs` watched the
+object the shim installs and named it in one line: the REPL calls **`Bun.YAML.parse`**
+and **`Bun.wrapAnsi`**, the shim refused both, and a React error boundary swallowed
+every throw. Refusing loudly only helps if something can hear it.
+
+Both are implemented now, each verified against Bun as oracle rather than written from
+memory — `wrapAnsi` byte-equal over 2,800 cases, `YAML.parse` matching on 138 of 150 and
+refusing the other 12 by name. ✅ Verified on Linux; **not yet re-run on the machine that
+reported it**. If a TUI still will not paint, `scripts/node-trace.cjs` is the instrument
+and [`docs/runbook.md`](docs/runbook.md) § Diagnosing a Node hang is how to point it.
 
 ## macOS
 

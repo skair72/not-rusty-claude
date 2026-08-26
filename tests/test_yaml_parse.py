@@ -1,0 +1,146 @@
+"""Bun.YAML.parse under Node, against Bun as the oracle.
+
+Node ships no YAML parser and this repo ships no dependencies, so the shim
+carries one. That makes the failure mode worse than usual: a subtly wrong parse
+is somebody's skill or agent silently misconfigured, with no error anywhere.
+
+So the contract is narrower than YAML and the test enforces both halves of it:
+
+  - every input the shim ACCEPTS must produce exactly what Bun produces. Not
+    "close" - equal. Zero tolerance, because there is no safe wrong answer.
+  - every input it cannot match must THROW, naming what is unsupported. The
+    set of those is pinned, so support cannot quietly shrink and a refusal
+    cannot quietly become a guess.
+
+Bun is the oracle; no expected value is written down here.
+"""
+
+import json
+import pathlib
+import subprocess
+
+import pytest
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+SHIM = ROOT / "scripts" / "bun-shim.cjs"
+PROBE = ROOT / "tests" / "yaml_parse_probe.cjs"
+CORPUS = ROOT / "tests" / "yaml_parse_corpus.cjs"
+
+TIMEOUT = 120
+
+# Measured 2026-08-26 against Bun 1.3.14. Each of these is something Bun parses
+# and the shim declines, because matching it exactly could not be verified.
+# Shrink this list by implementing one - never by loosening a check.
+PINNED_REFUSALS = {
+    "---\na: 1\n---\nb: 2",          # more than one document in a string
+    "a: &anchor 1\nb: *anchor",      # anchors and aliases
+    "a: &x {b: 1}\nc: *x",           # anchors and aliases
+    "&a x",                          # anchors and aliases
+    "a: !!str 1",                    # tags
+    "a: !!int '3'",                  # tags
+    "a: !custom 1",                  # tags
+    "? complex\n: key",              # explicit complex keys
+    "? [a, b]\n: c",                 # explicit complex keys
+    "a: 1\n\tb: 2",                  # a tab used for indentation
+    "a:\n- 1\n  - 2",                # an over-indented sequence entry
+    "s: |2\n   explicit indent",     # explicit block scalar indent indicator
+}
+
+
+def _run(argv):
+    proc = subprocess.run(argv, capture_output=True, timeout=TIMEOUT,
+                          cwd=str(ROOT / "tests"))
+    assert proc.returncode == 0, (
+        f"{argv[0]} exited {proc.returncode}:\n"
+        f"{proc.stderr.decode('utf-8', 'replace')[-2000:]}")
+    return json.loads(proc.stdout.decode("utf-8"))
+
+
+@pytest.fixture(scope="module")
+def cases():
+    import re
+    text = CORPUS.read_text()
+    body = text[text.index("module.exports =") + len("module.exports ="):].rstrip().rstrip(";")
+    parsed = json.loads(body)
+    assert len(parsed) >= 150, f"corpus shrank to {len(parsed)} cases"
+    return parsed
+
+
+@pytest.fixture(scope="module")
+def answers(bun_bin, node_bin):
+    return {
+        "bun": _run([bun_bin, str(PROBE)]),
+        "node": _run([node_bin, "--require", str(SHIM), str(PROBE)]),
+    }
+
+
+def test_nothing_is_parsed_differently_from_bun(answers, cases):
+    """The half with no safe failure mode: a wrong parse, silently accepted."""
+    wrong = []
+    for src, bun, node in zip(cases, answers["bun"], answers["node"]):
+        if "err" in node:
+            continue  # refusing is the other half of the contract
+        if "err" in bun:
+            wrong.append((src, "Bun threw", node.get("ok")))
+        elif bun["ok"] != node["ok"]:
+            wrong.append((src, bun["ok"], node["ok"]))
+
+    assert not wrong, (
+        f"{len(wrong)} inputs parse differently from Bun. Each one is a config "
+        "silently read wrong:\n" + "\n".join(
+            f"  {src!r}\n    Bun  {want!r}\n    shim {got!r}" for src, want, got in wrong[:6]))
+
+
+def test_the_refusals_are_exactly_the_pinned_set(answers, cases):
+    """Support cannot shrink quietly, and a refusal cannot become a guess."""
+    refused = {
+        src for src, bun, node in zip(cases, answers["bun"], answers["node"])
+        if "err" in node and "err" not in bun
+    }
+
+    newly_refused = refused - PINNED_REFUSALS
+    newly_accepted = PINNED_REFUSALS - refused
+    assert not newly_refused, (
+        "the shim now refuses inputs Bun parses and that were previously "
+        f"supported: {sorted(newly_refused)}")
+    assert not newly_accepted, (
+        "these were pinned as refused but are now answered - if that is real "
+        f"support, verify it against Bun and drop the pin: {sorted(newly_accepted)}")
+
+
+def test_a_refusal_names_the_api_and_the_reason(node_bin):
+    """A silent throw would put us back where this started."""
+    proc = subprocess.run(
+        [node_bin, "--require", str(SHIM), "-e",
+         "try { Bun.YAML.parse('a: &x 1'); } "
+         "catch (e) { process.stdout.write(e.message); }"],
+        capture_output=True, timeout=60)
+    message = proc.stdout.decode("utf-8")
+    assert "YAML.parse" in message, f"the error does not name the api: {message!r}"
+    assert "anchors" in message, f"the error does not name the reason: {message!r}"
+
+
+def test_the_frontmatter_shapes_the_bundle_uses_all_parse(answers, cases):
+    """Guard the centre, not just the edges.
+
+    These are the shapes skill and agent frontmatter actually takes. A
+    regression here would be invisible in the counts above but would break
+    every skill on the machine.
+    """
+    required = [
+        "name: foo",
+        "name: foo\ndescription: does a thing",
+        "allowed-tools: Read, Write, Bash",
+        "tools:\n  - Read\n  - Write",
+        "tools:\n- Read\n- Write",
+        "nested:\n  a: 1\n  b: 2",
+        "s: |\n  line one\n  line two",
+        "a: 1 # trailing comment",
+    ]
+    index = {src: i for i, src in enumerate(cases)}
+    for src in required:
+        assert src in index, f"corpus no longer covers {src!r}"
+        node = answers["node"][index[src]]
+        assert "err" not in node, (
+            f"a core frontmatter shape is refused: {src!r} -> {node['err']}")
+        assert node["ok"] == answers["bun"][index[src]]["ok"]
