@@ -1015,13 +1015,29 @@ function wrap_breakWord(rows, word, columns) {
   // including text past the link's close. Measured: a linked word plus trailing
   // text stays on one row, while a following SEPARATE word wraps normally, so
   // the state is per word rather than per line.
-  const stIndex = word.indexOf(wrap_ESC + "]");
-  if (stIndex >= 0) {
-    const esc = wrap_escapeLength(word, stIndex);
-    if (word.slice(stIndex, stIndex + esc).endsWith(wrap_ESC + "\\")) {
-      rows[rows.length - 1] += word;
-      return;
+  // The glue starts AT the ST-terminated link, not at the start of the word:
+  // measured, halfwidth kana before such a link still breaks per character
+  // while everything from the link onward stays on one row. An early return
+  // for the whole word - which is what this did first - glued the prefix too.
+  let glueFrom = -1;
+  for (let scan = 0; scan < word.length; ) {
+    const esc = wrap_escapeLength(word, scan);
+    if (!esc) { scan += String.fromCodePoint(word.codePointAt(scan)).length; continue; }
+    const text = word.slice(scan, scan + esc);
+    if (text.startsWith(wrap_ESC + "]") && text.endsWith(wrap_ESC + "\\")) {
+      glueFrom = scan;
+      break;
     }
+    scan += esc;
+  }
+  if (glueFrom === 0) {
+    rows[rows.length - 1] += word;
+    return;
+  }
+  if (glueFrom > 0) {
+    wrap_breakWord(rows, word.slice(0, glueFrom), columns);
+    rows[rows.length - 1] += word.slice(glueFrom);
+    return;
   }
 
   let i = 0;
