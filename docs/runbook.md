@@ -244,7 +244,8 @@ before real use.
 
 **Under Node instead of Bun.** Node **≥ 24** only — the bundle's `using`
 declarations do not parse before it. `make node-deps && make node-run NODE_BIN=<node24>`
-runs the artifact under `node --require scripts/bun-shim.cjs`; the command surface is
+runs the artifact under `node --require ./scripts/bun-shim.cjs` (the `./` is
+load-bearing - a bare path is a package specifier); the command surface is
 byte-identical to Bun, the agentic path untested ([findings.md](./findings.md) §11).
 
 **Run it by full path.** Do not create a `claude` shim on `PATH`; it would shadow
