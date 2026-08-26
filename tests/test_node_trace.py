@@ -226,3 +226,38 @@ def test_a_child_that_never_exits_is_visible_as_one_with_no_exit_line(node_bin, 
         "the short child's exit was never recorded:\n" + text)
     assert f"child pid={long_pid} exited" not in text, (
         "the log claims the hung child exited; it did not:\n" + text)
+
+
+def test_a_refused_bun_api_names_itself_even_when_something_swallows_it(node_bin, tmp_path):
+    """The failure mode no other probe in this file can see.
+
+    A shim that refuses an api throws; a throw inside a React render is caught
+    by an error boundary. Nothing paints, nothing is logged, and the process
+    idles looking healthy. The trace has to name the api anyway - so it watches
+    the object the shim installs, and records the throw before the catch.
+    """
+    log = tmp_path / "bun.log"
+    fake_shim = tmp_path / "fake-shim.cjs"
+    fake_shim.write_text(
+        "Object.defineProperty(globalThis, 'Bun', { value: {\n"
+        "  stringWidth: (s) => s.length,\n"
+        "  YAML: { parse: () => { throw new Error('YAML is not implemented'); } },\n"
+        "}, writable: true, configurable: true });\n")
+    script = tmp_path / "user.js"
+    script.write_text(
+        "globalThis.Bun.stringWidth('ab');\n"
+        "try { globalThis.Bun.YAML.parse('x: 1'); } catch (e) { /* swallowed */ }\n")
+
+    proc = subprocess.run(
+        [node_bin, "--require", str(TRACE), "--require", str(fake_shim), str(script)],
+        env=_env(tmp_path / "home", log=log), capture_output=True, timeout=30)
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+
+    text = log.read_text()
+    assert "shim installed globalThis.Bun" in text
+    assert "Bun.stringWidth read" in text
+    # the throw is the point: the script caught it, the log must still have it
+    assert "!! Bun.YAML.parse THREW" in text, (
+        "a swallowed refusal left no trace:\n" + text)
+    assert "YAML is not implemented" in text
+    assert "Bun surface touched:" in text and "YAML.parse" in text

@@ -201,6 +201,79 @@ for (const name of ['spawn', 'exec', 'execFile']) {
   Object.defineProperty(cp[name], 'name', { value: name, configurable: true });
 }
 
+// --- what the bundle asks of globalThis.Bun ------------------------------------
+//
+// The shim is loaded AFTER this file and installs its object with
+// Object.defineProperty, which replaces any property this file could have put
+// there first. So intercept the definition itself, and hand the bundle a proxy
+// that records what it reaches for.
+//
+// This matters because a shim that REFUSES an api throws, and a throw inside a
+// React render is caught by an error boundary: nothing paints, nothing is
+// logged, and the process sits idle looking healthy. That is invisible to
+// every other probe here.
+
+const bunSeen = new Map();
+
+function noteBunAccess(path) {
+  const n = (bunSeen.get(path) || 0) + 1;
+  bunSeen.set(path, n);
+  if (n === 1) log('Bun.' + path + ' read');
+}
+
+// Wrap a function so a throw is logged with the api that produced it - the
+// shim's refusals name themselves, so the message is the answer.
+function watchFn(fn, path) {
+  return function (...args) {
+    try {
+      return fn.apply(this, args);
+    } catch (err) {
+      log('!! Bun.' + path + ' THREW ' + show(err && err.message, 300));
+      throw err;
+    }
+  };
+}
+
+function watchBun(target, prefix) {
+  const cache = new Map();
+  return new Proxy(target, {
+    get(obj, key, recv) {
+      if (typeof key !== 'string') return Reflect.get(obj, key, recv);
+      const path = prefix ? prefix + '.' + key : key;
+      noteBunAccess(path);
+      if (cache.has(key)) return cache.get(key);
+      let value;
+      try {
+        value = Reflect.get(obj, key, recv);
+      } catch (err) {
+        log('!! Bun.' + path + ' getter THREW ' + show(err && err.message, 300));
+        throw err;
+      }
+      let wrapped = value;
+      if (typeof value === 'function') wrapped = watchFn(value, path);
+      else if (value && typeof value === 'object' && !prefix) wrapped = watchBun(value, path);
+      cache.set(key, wrapped);
+      return wrapped;
+    },
+  });
+}
+
+const realDefineProperty = Object.defineProperty;
+Object.defineProperty = function (obj, key, descriptor) {
+  if (obj === globalThis && key === 'Bun' && descriptor && 'value' in descriptor) {
+    log('shim installed globalThis.Bun (' +
+        Object.keys(descriptor.value || {}).length + ' own keys); watching it');
+    descriptor = Object.assign({}, descriptor, { value: watchBun(descriptor.value, '') });
+  }
+  return realDefineProperty(obj, key, descriptor);
+};
+
+process.prependListener('exit', () => {
+  if (!bunSeen.size) { log('Bun surface: nothing was ever read'); return; }
+  const parts = [...bunSeen].sort((a, b) => b[1] - a[1]).map(([k, n]) => k + '(' + n + ')');
+  log('Bun surface touched: ' + parts.join(' '));
+});
+
 // --- worker handshakes and Atomics.wait ---------------------------------------
 //
 // A blocking Atomics.wait or a synchronous worker handshake stops the main
