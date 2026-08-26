@@ -324,7 +324,7 @@ def test_the_gap_list_describes_the_artifact_that_was_just_built(tmp_path):
 def test_an_unshimmable_binary_still_lists_the_image_processing_gap(tmp_path):
     """The other half, and the reason the list cannot simply be corrected once
     and hardcoded: this entry module has no gate to rewrite, so the artifact
-    really does still have the gap findings.md 11 describes."""
+    really does still have the gap findings.md 10 describes."""
     native = _synthetic_binary(tmp_path / "native", entry=GOOD_ENTRY)
 
     result = _build(tmp_path / "out", native)

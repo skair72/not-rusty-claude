@@ -1116,25 +1116,39 @@ request, meaning the CLI abandoned the SSE stream for the non-streaming fallback
 Measured 2026-08-25, `linux-x64` 2.1.231 artifact, Bun 1.3.14 as the oracle.
 `scripts/bun-shim.cjs` loads via `node --require`; `make node-run` wires it up.
 
-**The parse boundary is Node 24, and it is hard.** The bundle has **35** `using`
-declarations — ES explicit resource management. `node --check` exits 1 on 22.23.2
-and 23.11.1 (`SyntaxError: Unexpected identifier`) and 0 on 24.0.0, 24.19.0,
+**The parse boundary is Node 24, and it is hard.** The bundle has **33** `using`
+declarations — ES explicit resource management. (A grep says 35; each match was
+classified by breaking the keyword and re-parsing, and the two that still parse
+are prose in the `NotebookEdit` help string.) `node --check` exits 1 on 22.23.2
+and 23.11.1 (`SyntaxError: Unexpected identifier`), 0 on 24.0.0, 24.19.0,
 25.0.0, 25.9.0 and 26.7.0; V8 13.6 arrives with the major, not with a patch.
 
-**Of 12 non-builtin bare specifiers, Node needs two.** `ws` and `undici` are Bun
-builtins the bundle really imports; `make node-deps` puts them in
-`~/.cache/not-rusty-claude/node/node_modules`, never in this checkout, never
-globally. `bun:ffi` and `bun:jsc` need nothing — each call site is inside a
-`try`/`catch`, `bun:ffi`'s also behind a `!== "macos"` return. The rest
-(`react`, `node-fetch`, `ajv/*`) are dead or optional paths that fail under Bun.
+**Of five non-builtin bare specifiers, Node needs two to start.** Real
+`require`/`import` calls, string content excluded by re-parsing each one (a
+textual scan says 17): `ws`, `undici`, `bun:ffi`, `bun:jsc`, `node-fetch` — Bun
+provides all five, Node none. `make node-deps` puts the two that loading needs
+in `~/.cache/not-rusty-claude/node/node_modules`, never in this checkout, never
+globally — on npm's registry integrity, not a pinned sha256 like `make setup`,
+hence `--ignore-scripts`. `bun:ffi` and `bun:jsc` sit inside a `try`/`catch`
+(`bun:ffi`'s also behind a `!== "macos"` return); ⚠️ `node-fetch` does not — an
+SDK fallback no tested command reaches, `ERR_MODULE_NOT_FOUND` under Node.
 
-**The `Bun` global: 45 references, 25 distinct APIs.** The shim implements
-**seven** — `stringWidth`, `stripANSI`, `hash`, `which`, `semver.order`,
-`deepEquals`, `gc` — each pinned by a differential test against Bun in
-`tests/test_node_runtime.py`. Twelve throw, naming the API (`YAML`, `spawn`,
-`file`, `serve`, …); **six** stay deliberately *undefined* (`Terminal`,
+**The `Bun` global: 44 property references in code, 24 distinct** (every
+occurrence re-parsed: that drops two a grep counts from inside strings and adds
+the `globalThis.Bun.which` it misses). The shim covers **25** names — the extra,
+`Bun.stdin`, occurs only in a doc string. It implements **seven** —
+`stringWidth`, `stripANSI`, `hash`, `which`, `semver.order`, `deepEquals`, `gc`
+— each pinned by a differential test against Bun in
+`tests/test_node_runtime.py`. Eleven throw, naming the API (`YAML`, `spawn`,
+`file`, `serve`, …); **seven** stay deliberately *undefined* (`Terminal`,
 `WebView`, `JSONL`, `version`, `isStandaloneExecutable`, `stdin`) because the
-bundle feature-detects them — a plausible-looking stub is the §10 failure mode.
+bundle feature-detects them — a plausible-looking stub is the §10 failure mode
+— and `Bun.ant`, for the opposite reason: it is not feature-detected, it is
+patched into the Bun inside the shipped binary, and `typeof Bun.ant` is
+`"undefined"` in stock Bun 1.3.14. Defining it was the one place the shim
+claimed a surface the oracle lacks; all three call sites are bare
+`Bun.ant.x(…)` inside `try`/`catch`, so leaving it out throws the same
+`TypeError` Bun throws, at the same place.
 
 **What was compared, and what was not.** Same artifact, throwaway `HOME` and
 `CLAUDE_CONFIG_DIR` per side, Bun 1.3.14 against Node 24.0.0 and 26.7.0:

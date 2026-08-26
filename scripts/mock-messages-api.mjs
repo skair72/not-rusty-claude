@@ -4,7 +4,7 @@
 // API, just capable enough to drive one full agentic turn of the extracted
 // Claude Code artifact.
 //
-// WHY THIS EXISTS: docs/findings.md section 11 and docs/verification-2026-08-22.md
+// WHY THIS EXISTS: docs/findings.md section 10 and docs/verification-2026-08-22.md
 // carry end-to-end measurements ("as shipped, Read on a 3000x3000 PNG returns
 // 'Unable to resize image ...'") that were taken through a mock living in /tmp.
 // That mock is gone, so those numbers stopped being reproducible and one of
@@ -84,7 +84,7 @@ const PRESETS = {
     name: "Grep",
     // -n so the hit carries a line number, which is what makes a real match
     // distinguishable from the empty "No matches found" that the globally
-    // flipped isStandaloneExecutable produces (findings.md section 11).
+    // flipped isStandaloneExecutable produces (findings.md section 10).
     // `scripts/ab-equivalence.sh --case grep` drives both answers out of the
     // same binary: hay/a.txt:1:NEEDLE-12345 on the shipped and scoped-shim
     // sides, "No matches found" on the globally flipped one.

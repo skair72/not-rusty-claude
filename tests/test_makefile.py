@@ -70,13 +70,18 @@ def _phony_targets():
 def _make(*args, **kwargs):
     """`make -C <repo> <args>`. env= adds to (not replaces) the environment,
     which is how the setup tests point TMPDIR at a directory they can assert
-    on afterwards."""
+    on afterwards. A value of None REMOVES a variable instead, which is how the
+    node-deps tests get out from under the ones `make test` exports."""
     extra = kwargs.pop("env", None)
     assert not kwargs, kwargs
     env = None
     if extra:
         env = dict(os.environ)
-        env.update(extra)
+        for key, value in extra.items():
+            if value is None:
+                env.pop(key, None)
+            else:
+                env[key] = value
     return subprocess.run(
         ["make", "-C", str(ROOT), *args],
         capture_output=True, text=True, timeout=120, env=env,
@@ -354,3 +359,202 @@ def test_every_supported_platform_has_a_pinned_bun_checksum(tmp_path):
         assert re.match(r"^[0-9a-f]{64}$", pinned.group(1)), \
             "no pinned bun sha256 for PLATFORM=%s (got %r)" % (
                 platform, pinned.group(1))
+
+
+# --- `make node-deps`, i.e. the one target that writes outside this repo ---
+#
+# It runs npm in $(NODE_DIR) to fill $(NODE_MODULES). npm does not treat the
+# cwd as the install root: it walks UP until it finds a package.json or a
+# node_modules and installs THERE, so on a host whose $HOME has either (a stray
+# `npm i` leaves a bare node_modules behind) ws and undici landed in $HOME and
+# $(NODE_MODULES) was never created - measured, and the target still printed
+# success. The recipe now writes a throwaway package.json into $(NODE_DIR) to
+# pin the root, and verifies afterwards that the modules really arrived.
+#
+# The npm here is a stand-in that reproduces that walk-up rule, so these tests
+# need no network and no real npm, and install nothing anywhere real.
+
+FAKE_NPM = """#!/bin/sh
+if [ -n "${NPM_ARGV_FILE:-}" ]; then echo "$@" > "$NPM_ARGV_FILE"; fi
+root=$(pwd)
+d=$root
+while [ "$d" != "/" ]; do
+  if [ -f "$d/package.json" ] || [ -d "$d/node_modules" ]; then root=$d; break; fi
+  d=$(dirname "$d")
+done
+if [ "${FAKE_NPM_INSTALL:-1}" = 1 ]; then
+  for m in ws undici; do
+    mkdir -p "$root/node_modules/$m"
+    echo '{"name":"'"$m"'","version":"0.0.0"}' > "$root/node_modules/$m/package.json"
+  done
+fi
+echo "added 2 packages"
+"""
+
+
+def _fake_bin(tmp_path, name, body):
+    """A directory holding one executable `name`, to be prepended to PATH."""
+    d = tmp_path / ("bin-" + name)
+    d.mkdir(exist_ok=True)
+    p = d / name
+    p.write_text(body)
+    p.chmod(0o755)
+    return d
+
+
+# `make test` exports NRC_TEST_NODE_MODULES (and four siblings) so conftest.py
+# can find this host's real ws/undici - see the `test` recipe. node-deps reads
+# that same variable and short-circuits on it, so a suite launched through
+# `make test` used to hand these tests a node-deps that reported "already in
+# ~/.cache/not-rusty-claude/..." and installed nothing into the throwaway HOME
+# they were about to assert on. Four tests passed under bare pytest and failed
+# under the documented entry point. The tests were the wrong side: what they
+# are about is the recipe's DEFAULT path, so they have to say so rather than
+# inherit whatever launched them.
+NODE_DEPS_INHERITED = ("NRC_TEST_NODE_MODULES", "NRC_TEST_NODE", "NRC_TEST_ELF",
+                       "NRC_TEST_MACHO", "BUN_BIN")
+
+
+def _node_deps(tmp_path, home, *extra, **kwargs):
+    """`make node-deps` with a fake npm first on PATH and HOME=<home>.
+
+    Explicitly out from under the environment `make test` exports, so the row
+    these tests measure is the same one whether the suite was started by
+    `make test` or by pytest directly.
+    """
+    env = dict.fromkeys(NODE_DEPS_INHERITED)
+    env.update({"HOME": str(home), "NPM_ARGV_FILE": str(tmp_path / "npm-argv"),
+                "PATH": "%s:%s" % (_fake_bin(tmp_path, "npm", FAKE_NPM),
+                                   os.environ["PATH"])})
+    env.update(kwargs.pop("env", {}))
+    assert not kwargs, kwargs
+    return _make("node-deps", *extra, env=env)
+
+
+@requires_make
+@pytest.mark.parametrize("ancestor", ["package.json", "node_modules"])
+def test_node_deps_installs_into_the_cache_and_not_into_home(tmp_path, ancestor):
+    """The install must be confined to $(NODE_MODULES) even when $HOME is the
+    kind of directory npm would rather install into."""
+    home = tmp_path / "home"
+    home.mkdir()
+    if ancestor == "package.json":
+        (home / "package.json").write_text('{"name":"my-home","private":true}')
+    else:
+        (home / "node_modules").mkdir()
+
+    proc = _node_deps(tmp_path, home)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    cache = home / ".cache" / "not-rusty-claude" / "node" / "node_modules"
+    assert (cache / "ws" / "package.json").is_file(), \
+        "ws did not land in the cache dir:\n" + proc.stdout
+    assert (cache / "undici" / "package.json").is_file()
+    escaped = sorted(p.name for p in (home / "node_modules").iterdir()) \
+        if (home / "node_modules").is_dir() else []
+    assert escaped == [], "the install escaped into $HOME/node_modules: %s" % escaped
+
+
+@requires_make
+def test_node_deps_installs_with_scripts_disabled(tmp_path):
+    """These two tarballs run no lifecycle scripts today (checked), but the
+    fetch is registry-integrity only - no pinned sha256 like `make setup` - so
+    a substituted tarball must not get to execute at install time either."""
+    home = tmp_path / "home"
+    home.mkdir()
+    proc = _node_deps(tmp_path, home)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    argv = (tmp_path / "npm-argv").read_text().split()
+    assert "--ignore-scripts" in argv, "npm was invoked as: %s" % argv
+
+
+@requires_make
+def test_node_deps_fails_loudly_when_the_modules_do_not_arrive(tmp_path):
+    """The silent-success half of the same bug: npm exiting 0 is not evidence
+    that anything was installed where this repo said it would be."""
+    home = tmp_path / "home"
+    home.mkdir()
+    proc = _node_deps(tmp_path, home, env={"FAKE_NPM_INSTALL": "0"})
+
+    assert proc.returncode != 0, "node-deps reported success installing nothing:\n" + proc.stdout
+    assert "installed somewhere else" in proc.stderr, proc.stderr
+
+
+@requires_make
+def test_node_deps_accepts_a_prepared_node_modules_instead_of_running_npm(tmp_path):
+    """NRC_TEST_NODE_MODULES is what `make test` honours; node-deps and
+    node-run honour it too, which is the only route a host with the modules but
+    without npm has. The fake npm fails here, so calling it at all fails the
+    test."""
+    home = tmp_path / "home"
+    home.mkdir()
+    mods = tmp_path / "prepared"
+    for m in ("ws", "undici"):
+        (mods / m).mkdir(parents=True)
+        (mods / m / "package.json").write_text('{"name":"%s"}' % m)
+
+    proc = _node_deps(tmp_path, home, env={"FAKE_NPM_INSTALL": "0",
+                                           "NRC_TEST_NODE_MODULES": str(mods)})
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert str(mods) in proc.stdout, proc.stdout
+    assert not (tmp_path / "npm-argv").exists(), "npm was run despite the modules being there"
+
+
+@requires_make
+def test_node_deps_tests_do_not_inherit_the_variables_make_test_exports(tmp_path, monkeypatch):
+    """The same suite must answer the same way through `make test` as through
+    pytest.
+
+    `make test` exports NRC_TEST_NODE_MODULES pointing at this host's real
+    ws/undici, and `make node-deps` short-circuits on exactly that variable. So
+    four tests above - which assert on a throwaway HOME - passed under bare
+    pytest and failed under the documented entry point, on nothing but how the
+    run was started. This reproduces that launch environment deliberately: the
+    variable is set here, and the default-path row must still hold.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    for m in ("ws", "undici"):
+        (elsewhere / m).mkdir(parents=True)
+        (elsewhere / m / "package.json").write_text('{"name":"%s"}' % m)
+    monkeypatch.setenv("NRC_TEST_NODE_MODULES", str(elsewhere))
+
+    proc = _node_deps(tmp_path, home)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    cache = home / ".cache" / "not-rusty-claude" / "node" / "node_modules"
+    assert (cache / "ws" / "package.json").is_file(), (
+        "node-deps followed an inherited NRC_TEST_NODE_MODULES instead of its "
+        "own default, so this test measured the launcher, not the recipe:\n"
+        + proc.stdout)
+    assert str(elsewhere) not in proc.stdout, proc.stdout
+
+
+@requires_make
+def test_node_run_puts_the_resolved_node_modules_on_node_path(tmp_path):
+    """And the same directory has to reach the run itself: node-run used to
+    hardcode $(NODE_MODULES) as NODE_PATH, so a prepared directory got the
+    artifact as far as `Cannot find module 'ws'`. The node here is a stand-in
+    that answers the version gate and then prints its NODE_PATH."""
+    home = tmp_path / "home"
+    home.mkdir()
+    mods = tmp_path / "prepared"
+    for m in ("ws", "undici"):
+        (mods / m).mkdir(parents=True)
+        (mods / m / "package.json").write_text('{"name":"%s"}' % m)
+    out_dir = tmp_path / "out"
+    (out_dir / "extract").mkdir(parents=True)
+    (out_dir / "extract" / "cli.original.cjs").write_text("")
+    fake_node = _fake_bin(tmp_path, "node",
+                          '#!/bin/sh\n'
+                          'case "$1" in -p) echo 24.0.0;; '
+                          '*) echo "NODE_PATH=$NODE_PATH";; esac\n') / "node"
+
+    proc = _make("node-run", "OUT_DIR=%s" % out_dir, "NODE_BIN=%s" % fake_node,
+                 env={"HOME": str(home), "NRC_TEST_NODE_MODULES": str(mods)})
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "NODE_PATH=%s" % mods in proc.stdout, proc.stdout

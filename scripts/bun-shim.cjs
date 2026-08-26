@@ -5,7 +5,7 @@
  *
  *   node --require scripts/bun-shim.cjs build/extract/cli.original.cjs --version
  *
- * Node >= 24 only. The bundle uses ES explicit resource management - 35 `using`
+ * Node >= 24 only. The bundle uses ES explicit resource management - 33 `using`
  * declarations in the 2.1.231 artifact - and that is a PARSE error before Node
  * 24. Measured 2026-08-25 on that artifact: `node --check` fails on 22.23.2 and
  * 23.11.1 with "SyntaxError: Unexpected identifier", and passes on 24.0.0 and
@@ -16,6 +16,65 @@
  * error naming the API. Nothing returns a plausible-looking value it cannot
  * stand behind: this repo exists because a silently wrong answer once made Grep
  * report "No matches found" for a string that was there.
+ *
+ * THE CONTRACT, STATED HONESTLY. Not "this shim matches Bun". It is: on
+ * well-formed input it answers what Bun answers, and on input it cannot
+ * match it refuses out loud - with the two documented exceptions below,
+ * where it quietly answers something else instead. The first cannot be
+ * matched at all from outside Bun; the second could be imitated only by
+ * statting a different string from the one it would then hand back. Both are
+ * measured, both are pinned case by case by
+ * test_known_divergences_are_exactly_what_was_measured, which fails if
+ * EITHER side moves, and neither is reachable from the artifact's own call
+ * sites. A refusal is measured too: each guard refuses every spelling Bun
+ * reads as the unsupported setting, not just the literal one. stringWidth
+ * additionally APPROXIMATES on pathological combining sequences; that
+ * residual is described at the function and bounded by the suite.
+ *
+ * DOCUMENTED DIVERGENCE 1 - stringWidth's CSI terminator is representation-
+ * dependent. Bun carries two CSI scanners and picks between them by how JSC is
+ * storing the string, not by what is in it: a Latin-1 string ends a CSI only on
+ * 0x40..0x7E, a 16-bit one ends it on any code point >= 0x40 except 0x7F. The
+ * same characters therefore get two answers depending on what else is in the
+ * string. Measured, Bun 1.3.14 (shim's answer second):
+ *     "A" ESC "[" CJK "B"                   Bun 2, shim 1
+ *     "A" ESC "[" U+00FF "B" CJK            Bun 4, shim 3
+ *     "A" ESC "[" U+00E9 "B"                Bun 1, shim 1   (Latin-1: agrees)
+ * Direction: Bun's 16-bit terminator set is a superset of the Latin-1 one, so
+ * Bun stops eating no later than the shim does. The shim's answer is never too
+ * big, only too small - a box drawn a column or two narrow, never wrong data.
+ * NOT FIXABLE from outside Bun, and this is not a guess: `new
+ * TextDecoder("utf-16le").decode(...)` builds a string that is `===` to the
+ * literal one above and Bun answers 2 for it and 1 for the literal. Two
+ * strings that compare equal, two answers - so no function of the argument's
+ * value can produce both, and JS offers no way to ask JSC which representation
+ * it chose. Reaching it needs a truncated or malformed CSI in a string JSC is
+ * holding as 16-bit; a well-formed SGR sequence never trips it. Do NOT read
+ * that as "needs a code point >= U+0100" - the content does not decide it, the
+ * PROVENANCE does. Measured: `"A" ESC "[" U+00E9 "B"` is Latin-1 throughout and
+ * agrees (1/1) as a source literal, but the `===`-identical string coming out
+ * of TextDecoder, Buffer.toString("utf8") or fs.readFileSync(p,"utf8") reads
+ * Bun 2 / shim 1. Anything decoded from bytes can be 16-bit whatever its code
+ * points, so text read from a file is exposed and a literal is not.
+ * Measured on the artifact: of the 840 distinct strings the CLI passes to
+ * stringWidth across --version, --help, mcp list, config ls and doctor, NONE
+ * contains an ESC "[" at all.
+ *
+ * DOCUMENTED DIVERGENCE 2 - which() and a NUL in the command name. Bun hands
+ * the name to the OS as a NUL-terminated C string, so the NUL truncates it at
+ * the syscall while the JS string Bun returns keeps everything after it:
+ * which("<dir>/exe1\0zzz") is "<dir>/exe1\0zzz" when <dir>/exe1 is executable.
+ * Node's fs rejects any path argument containing a NUL outright, so the stat
+ * throws and the shim answers null. Direction: the shim under-reports - null
+ * means "not installed", which is the answer a caller can fall back from,
+ * where Bun's is a path that Node could not then execute anyway. This one is
+ * not representation-dependent and could be emulated - stat the text before
+ * the NUL, return the text with it - but that means deliberately statting a
+ * different string from the one handed back, so it is documented rather than
+ * imitated. Unreachable from the artifact: both Bun.which call sites take a
+ * command name, and neither argv nor the environment can carry a NUL (they are
+ * C strings too); measured across the five commands above, the artifact asks
+ * for exactly two names, "git" and "rg".
  *
  * Three kinds of entry, marked on each one:
  *   IMPLEMENTED  differentially tested against Bun 1.3.14; the test that pins
@@ -58,6 +117,15 @@ class BunShimUnsupportedError extends Error {
 }
 const unsupported = (api, why) => { throw new BunShimUnsupportedError(api, why); };
 
+// Bun coerces a non-string argument with ToString. Measured on Bun 1.3.14:
+// stripANSI/stringWidth/hash/which all take an object's toString (not its
+// valueOf), and all four throw a TypeError on a symbol. JS String() would
+// answer "Symbol(s)" instead of throwing, so symbols are rejected explicitly.
+function toStringArg(v) {
+  if (typeof v === "symbol") throw new TypeError("Cannot convert a symbol to a string");
+  return String(v);
+}
+
 /* ---------------------------------------------------------------- *
  * Bun.stringWidth  [IMPLEMENTED, with a stated residual]
  *
@@ -87,9 +155,10 @@ const unsupported = (api, why) => { throw new BunShimUnsupportedError(api, why);
  * Bun 1.3.14, identically on Node 24.0.0, 24.19.0, 25.0.0, 25.9.0 and 26.7.0:
  *   - the 840 distinct calls the real CLI makes across --version, --help,
  *     mcp list, config ls and doctor:                       0 mismatches
- *   - 18 realistic lines (help text, box drawing, CJK, emoji,
+ *   - every one of the 1,114,112 code points, one at a time: 0 mismatches
+ *   - 24 realistic lines (help text, box drawing, CJK, emoji,
  *     colour codes) in tests/bun_shim_probe.cjs:            0 mismatches
- *   - 3,907 adversarial concatenations of the awkward atoms: 287 mismatches
+ *   - 4,235 adversarial concatenations of the awkward atoms: 236 mismatches
  * The survivors are things like a lone variation selector after a TAB. They
  * are layout errors - a border off by a column - never wrong data, which is
  * why this entry is allowed to approximate at all.
@@ -146,10 +215,14 @@ function skipCsiAndOsc(s) {
         i = j; continue;
       }
       if (next === 0x5d) {            // ESC ] ... BEL or ST
+        // ST has two spellings and Bun accepts both here, measured on 1.3.14:
+        // ESC \ and the one-character C1 U+009C. Missing the C1 one made the
+        // rest of the line vanish - stringWidth(ESC "]0;t" U+009C "TAIL") is 4
+        // in Bun and was 0 here. stripANSI below already knew this.
         let j = i + 2;
         while (j < n) {
           const c = s.charCodeAt(j);
-          if (c === 0x07) { j++; break; }
+          if (c === 0x07 || c === 0x9c) { j++; break; }
           if (c === 0x1b && s.charCodeAt(j + 1) === 0x5c) { j += 2; break; }
           j++;
         }
@@ -162,7 +235,6 @@ function skipCsiAndOsc(s) {
 }
 
 function clusterWidth(cluster) {
-  if (RGI_EMOJI.test(cluster)) return 2;
   let sum = 0, count = 0, keycap = false, variationSelector = false;
   for (const ch of cluster) {
     const cp = ch.codePointAt(0);
@@ -172,22 +244,61 @@ function clusterWidth(cluster) {
     sum += codePointWidth(cp);
   }
   if (keycap) return 2;
+  // Only for real clusters. A SINGLE code point must come from WIDTHS, which is
+  // Bun's own answer: \p{RGI_Emoji} is ICU's, and ICU moves. Measured over all
+  // 1,114,112 single code points - asking RGI_Emoji first put 7 of them (Node
+  // 24.0.0) and 14 (Node 26.7.0) one column wider than Bun; deferring it here
+  // makes every single code point match Bun on both, and changes nothing on the
+  // probe's realistic or adversarial corpora.
+  if (count > 1 && RGI_EMOJI.test(cluster)) return 2;
   if (variationSelector && count > 1 && sum < 1) return 1;
   return sum;
 }
 
+// How Bun READS the two options - measured on Bun 1.3.14, 32 spellings each
+// (tests/bun_shim_probe.cjs asks the oracle the same 32),
+// and the two do not agree with each other:
+//   countAnsiEscapeCodes  plain ToBoolean. 1, "no", "0", {}, [] and even
+//                         `new Boolean(false)` (an object, therefore truthy)
+//                         all turn it ON; only false/undefined/null/0/-0/NaN/
+//                         0n/"" leave it off.
+//   ambiguousIsNarrow     ToBoolean with undefined, null AND "" pulled back to
+//                         the default, so it goes WIDE only for `false` and for
+//                         a zero-or-NaN number or bigint. "" is the one that
+//                         rules out plain ToBoolean: Bun keeps NARROW for it.
+// Both guards used to be spelled `=== false` / `=== true`, which fired on the
+// literal boolean and on nothing else - so every other spelling of the same
+// intent got answered from the default table instead of refused. Refusing is
+// not "matching Bun" on these inputs; the option is still unsupported. It is
+// the difference between a wrong number and a named error.
+function bunReadsAmbiguousAsWide(v) {
+  if (v === false) return true;
+  if (typeof v === "number") return v === 0 || v !== v;   // 0, -0 and NaN
+  if (typeof v === "bigint") return v === 0n;             // 0n and -0n
+  return false;   // undefined, null, "" and everything else: Bun stays narrow
+}
+
 function stringWidth(input, options) {
-  if (arguments.length === 0 || input === undefined) return 0;
-  const s = typeof input === "string" ? input : String(input);
+  if (arguments.length === 0 || input === undefined) return 0;  // measured: Bun answers 0
+  const s = typeof input === "string" ? input : toStringArg(input);
+  // Measured: an empty string is 0 and Bun never touches `options` for it - a
+  // throwing getter does not fire. So this has to come before the guards.
+  if (s === "") return 0;
   if (options !== undefined && options !== null) {
-    if (options.ambiguousIsNarrow === false) {
+    // countAnsiEscapeCodes first: that is the order Bun reads them in, measured
+    // with two counting getters, and it decides which one a throwing getter
+    // reports.
+    if (options.countAnsiEscapeCodes) {
+      unsupported("stringWidth({countAnsiEscapeCodes:true})",
+        "not measured; the bundle never asks for it. Bun turns this on for any " +
+        "truthy value, so any truthy value is refused");
+    }
+    if (bunReadsAmbiguousAsWide(options.ambiguousIsNarrow)) {
       unsupported("stringWidth({ambiguousIsNarrow:false})",
         "only the default (narrow) table was measured against Bun; guessing at " +
-        "ambiguous-width characters is a silent layout error");
-    }
-    if (options.countAnsiEscapeCodes === true) {
-      unsupported("stringWidth({countAnsiEscapeCodes:true})",
-        "not measured; the bundle never asks for it");
+        "ambiguous-width characters is a silent layout error. Bun switches to " +
+        "the wide table for `false` and for a zero-or-NaN number or bigint, so " +
+        "each of those is refused");
     }
   }
   let total = 0;
@@ -204,6 +315,11 @@ function stringWidth(input, options) {
  * P/X/^/_ or 0x90/0x98/0x9E/0x9F up to ST), and a bare ESC plus one unit -
  * two units when the byte after ESC is one of the nine designators below,
  * measured one at a time. Unterminated sequences eat the rest of the string.
+ *
+ * There is no undefined case: measured, Bun.stripANSI() and
+ * Bun.stripANSI(undefined) both answer the STRING "undefined". stripANSI
+ * coerces its argument where stringWidth short-circuits undefined to 0 - the
+ * two really do differ, and returning "" here was a value Bun never returns.
  * ---------------------------------------------------------------- */
 const ESC_TAKES_ONE_MORE = new Set([0x20, 0x23, 0x25, 0x28, 0x29, 0x2a, 0x2b, 0x2e, 0x2f]);
 function skipCsiTail(s, j) {
@@ -221,8 +337,10 @@ function skipToStringTerminator(s, j, allowBell) {
   return j;
 }
 function stripANSI(input) {
-  if (arguments.length === 0 || input === undefined) return "";
-  const s = typeof input === "string" ? input : String(input);
+  // No undefined special case: measured, Bun.stripANSI() and
+  // Bun.stripANSI(undefined) both return the STRING "undefined" - stripANSI
+  // coerces where stringWidth short-circuits to 0.
+  const s = typeof input === "string" ? input : toStringArg(input);
   let out = "", i = 0;
   const n = s.length;
   while (i < n) {
@@ -257,6 +375,19 @@ function stripANSI(input) {
  *
  * NOT faithful: Bun.hash.crc32 and the eleven other named algorithms are not
  * provided - they are separate functions and the bundle does not call them.
+ *
+ * REFUSED, not guessed: a non-string, non-binary input (Bun stringifies it -
+ * Bun.hash(12345) === Bun.hash("12345"), measured) and every Number seed
+ * outside [0, 2^51). Bun's Number seed is not a function of the value alone:
+ * measured on Bun 1.3.14, an integer >= 2^51 seeds with 0 (boundary measured
+ * exactly: 2^51-1 is used, 2^51 is not), a non-integer and NaN and Infinity
+ * seed with 0, and a NEGATIVE integer seeds with 0 when the engine happens to
+ * box it as a double but with its two's complement when it boxes it as an
+ * int32 - the same value, two answers, in one Bun process (measured:
+ * hash("abc", -1) differs depending on whether -1 arrives from an array of
+ * doubles or as a plain argument). Nothing here can reproduce that, so those
+ * seeds throw. Verified on 601 distinct seeds in [0, 2^51): 0 mismatches. Pass a
+ * BigInt for anything larger; BigInt seeds wrap mod 2^64 and are exact.
  * ---------------------------------------------------------------- */
 const U64 = (1n << 64n) - 1n;
 const WY0 = 0xa0761d6478bd642fn, WY1 = 0xe7037ed1a0b428dbn,
@@ -306,17 +437,23 @@ function wyhash(bytes, seed) {
   return wyMix(((prod & U64) ^ WY0 ^ BigInt(len)) & U64, ((prod >> 64n) & U64) ^ WY1);
 }
 const UTF8 = new TextEncoder();
+const HASH_SEED_LIMIT = 2251799813685248; // 2^51, measured boundary
 function hash(input, seed) {
   let bytes;
   if (typeof input === "string") bytes = UTF8.encode(input);
   else if (ArrayBuffer.isView(input)) bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
   else if (input instanceof ArrayBuffer) bytes = new Uint8Array(input);
-  else unsupported("hash(" + typeof input + ")", "only strings and binary views were measured");
+  else unsupported("hash(" + typeof input + ")",
+    "Bun stringifies this input; hashing the wrong bytes writes the wrong hash " +
+    "into a file, so pass the string you mean");
   let s = 0n;
   if (seed !== undefined) {
     if (typeof seed === "bigint") s = seed & U64;
-    else if (typeof seed === "number" && Number.isInteger(seed)) s = BigInt(seed) & U64;
-    else unsupported("hash(_, seed)", "seed must be an integer or bigint");
+    else if (typeof seed === "number" && Number.isInteger(seed) && seed >= 0 && seed < HASH_SEED_LIMIT) s = BigInt(seed);
+    else unsupported("hash(_, seed)",
+      "only a bigint, or a Number integer in [0, 2^51), reproduces Bun. Outside " +
+      "that range Bun's own answer depends on how the value is boxed, or is " +
+      "silently the unseeded hash - see the note above this function");
   }
   return wyhash(bytes, s);
 }
@@ -325,13 +462,37 @@ function hash(input, seed) {
  * Bun.which  [IMPLEMENTED]
  *
  * Stands in for: locating helper executables (editors, git, node...). Measured
- * contract, Bun 1.3.14: a name containing a separator resolves against
- * options.cwd (else process.cwd()); anything else is looked up in options.PATH
- * (else process.env.PATH), empty entries skipped, and PATH entries are NOT
- * resolved against options.cwd. The hit must be a regular file with the
- * execute bit. Anything not found, a directory, or a non-executable file gives
- * null - including an empty or undefined name.
+ * contract, Bun 1.3.14, and every clause here was checked against it:
+ *
+ *   - the argument is ToString'd (a symbol throws); no argument at all throws
+ *     "which: expected 1 argument, got 0".
+ *   - a name containing "/" is not looked up: an absolute one is used as
+ *     spelled, otherwise it is glued to options.cwd (else process.cwd()) with
+ *     exactly one leading "./" removed. NOTHING is normalized - Bun answered
+ *     "<dir>/cwd/./myexe" for "././myexe", "<dir>/cwd//myexe" for ".//myexe",
+ *     and null for "a/../myexe" because it stats that path literally and "a"
+ *     does not exist. nodePath.resolve() used to collapse all three.
+ *   - otherwise each options.PATH (else PATH) entry is glued on as
+ *     entry + "/" + name, again raw: a trailing slash in the entry really does
+ *     come back as "<dir>/bin//exe1", and a relative entry comes back relative
+ *     ("./myexe" for PATH ".").
+ *   - options.PATH and options.cwd are ToString'd when present, so an array
+ *     PATH works (Bun found the binary through one); options itself is ignored
+ *     unless it is an object.
+ *   - the hit must be a regular file with the execute bit. Not found, a
+ *     directory, or a non-executable file gives null.
+ *
+ * The PATH is the one the PROCESS STARTED WITH, not the current
+ * process.env.PATH. Measured: Bun launched with PATH=/usr/sbin still answers
+ * /usr/sbin/adduser after `process.env.PATH = "/usr/bin"`, and answers null
+ * after `delete process.env.PATH`; launched with no PATH at all (env -i) it
+ * answers null for "sh" - there is no built-in fallback search path. So the
+ * snapshot below is taken at load, which under `node --require` is before any
+ * bundle code can touch the environment. Reading process.env.PATH live was the
+ * bug: a daemon or hook that clears it mid-run got null, which is
+ * indistinguishable from "the binary is not installed".
  * ---------------------------------------------------------------- */
+const LAUNCH_PATH = process.env.PATH;
 function isExecutableFile(p) {
   try {
     if (!fs.statSync(p).isFile()) return false;
@@ -339,45 +500,153 @@ function isExecutableFile(p) {
     return true;
   } catch { return false; }
 }
+function joinCwd(cwd, name) {
+  const rest = name.startsWith("./") ? name.slice(2) : name;
+  return cwd.endsWith("/") ? cwd + rest : cwd + "/" + rest;
+}
 function which(command, options) {
-  if (typeof command !== "string" || command === "") return null;
-  const cwd = options && typeof options.cwd === "string" ? options.cwd : process.cwd();
-  if (command.includes(nodePath.sep) || command.includes("/")) {
-    const abs = nodePath.resolve(cwd, command);
-    return isExecutableFile(abs) ? abs : null;
+  if (arguments.length === 0) throw new Error("which: expected 1 argument, got 0");
+  const name = toStringArg(command);
+  const opts = options !== null && (typeof options === "object" || typeof options === "function")
+    ? options : undefined;
+  if (name.includes("/")) {
+    const cwd = opts && opts.cwd !== undefined ? toStringArg(opts.cwd) : process.cwd();
+    const candidate = name.startsWith("/") ? name : joinCwd(cwd, name);
+    return isExecutableFile(candidate) ? candidate : null;
   }
-  const raw = options && typeof options.PATH === "string" ? options.PATH : process.env.PATH;
+  const raw = opts && opts.PATH !== undefined ? toStringArg(opts.PATH) : LAUNCH_PATH;
   if (!raw) return null;
   for (const dir of raw.split(nodePath.delimiter)) {
     if (dir === "") continue;
-    const candidate = nodePath.resolve(dir, command);
+    const candidate = dir + "/" + name;
     if (isExecutableFile(candidate)) return candidate;
   }
   return null;
 }
 
 /* ---------------------------------------------------------------- *
- * Bun.semver.order  [IMPLEMENTED]   Bun.semver.satisfies  [THROWS]
+ * Bun.semver.order  [IMPLEMENTED for the grammar below, THROWS outside it]
+ * Bun.semver.satisfies  [THROWS]
  *
  * order stands in for the bundle's version comparisons (is this CLI newer than
- * that one). Plain SemVer 2.0.0 precedence: numeric major/minor/patch, then
+ * that one). SemVer 2.0.0 precedence: numeric major/minor/patch, then
  * prerelease, where having one loses to having none, numeric identifiers
  * compare numerically and lose to alphanumeric ones, and build metadata is
- * ignored. Bun throws on a string it cannot parse and so does this. Verified
- * against Bun 1.3.14 - see tests/test_node_runtime.py.
+ * ignored.
  *
  * satisfies is a whole range grammar (^ ~ || hyphen x-ranges, and prerelease
  * rules that differ between implementations). Approximating it would silently
  * enable or disable features, so it throws instead.
+ *
+ * ARITY. Fewer than two arguments is `Expected two arguments` - Bun's own
+ * message, thrown before either argument is looked at: measured, even
+ * order(Symbol()) says that rather than complaining about the symbol. This
+ * entry used to answer `Invalid SemVer: undefined`, which blames the input for
+ * a mistake in the call, the same defect deepEquals had.
+ *
+ * COERCION. Bun ToStrings both arguments before parsing either - measured,
+ * order("garbage", Symbol()) is the symbol TypeError, not Invalid SemVer for
+ * "garbage". order(1, 2) is -1, a {toString(){return "1.0.0"}} object works
+ * (toString, not valueOf: an object with both is read through toString),
+ * ["1.0.0"] works and ["1","0","0"] does not - it stringifies to "1,0,0" - and
+ * a symbol is the same TypeError the other four coercing entries throw.
+ *
+ * THE SPACE TERMINATOR. Once the version has started a plain U+0020 ends it,
+ * and everything after it is ignored. Measured against "1.2.3": "1.2.3 x",
+ * "1.2.3  x", "1.2.3 1.2.4", "1.2.3 \t" and "1.2.3 (Claude Code)" are all 0,
+ * and "1.2.3-a b" compares as "1.2.3-a". That shape is not academic - it is
+ * this artifact's own --version output, `2.1.231 (Claude Code)`, on which this
+ * entry used to throw. Other trailing whitespace is NOT a terminator:
+ * "1.2.3\t", "1.2.3\n", "1.2.3\r", "1.2.3\v" and "1.2.3\f" each throw under
+ * Bun, and a version read from a file or from command output carries exactly
+ * that trailing newline, so a .trim() here would answer 0 where Bun refuses to
+ * answer at all. Leading whitespace IS skipped, all six characters of it -
+ * space, tab, newline, vertical tab, form feed and carriage return.
+ *
+ * PARTIAL VERSIONS. Bun answers "1" and "1.2", and a missing component sorts
+ * ABOVE every concrete one: measured, "1" is above "1.9999.9999", above "1.2"
+ * and equal to "1"; "1.2" is above "1.2.3"; "0" is above "0.0.0"; and "1" is
+ * below "2". That is the comparison implemented below - a missing component is
+ * not zero.
+ *
+ * WHAT IS REFUSED, AND WHY. Bun's parser is a RANGE parser, and outside the
+ * grammar above its answers stop being an order at all. Measured on Bun
+ * 1.3.14:
+ *   - a string containing ANY code point above U+007F compares 0 against every
+ *     version. "1.2.3\u00a0" is 0 against "0.0.0" and 0 against "2.0.0" at the
+ *     same time, while those two are not equal to each other; "1.2.3 \u00a0x"
+ *     is too, so even a tail the terminator is supposed to discard poisons it.
+ *     Every code point in U+0080..U+20FF was tried - all 8320 degenerate. This
+ *     is what looks from the outside like "Bun swallows U+00A0 mid-version": it
+ *     does not swallow anything, it stops comparing.
+ *   - "^1.2.3" is ABOVE "2.0.0", and so is "^0.0.1": a caret makes the whole
+ *     thing maximal. "=1.2.3" is 0. "~1.2.3" and ">=1.2.3" throw.
+ *   - a wildcard is maximal: "x", "*", "1.x" - and a string of nothing but
+ *     spaces - all sort above every real version.
+ *   - a trailing tail that is not space-separated is PARSED, not ignored:
+ *     "1.2.3junk" is below "1.2.3" (an implicit prerelease), "1.2.3x" and
+ *     "1.2.3xx" are 0, "1.2.3xy" is below, and "1.2.30x" is 1.2.30.
+ *   - "1.2-rc" is accepted while "1-rc" throws.
+ * None of that is an order, so each of them throws here instead.
+ *
+ * NUMBERS. The components are compared as BigInt, not Number: Bun orders
+ * 9007199254740993 above 9007199254740992 (measured, both as a major and as a
+ * numeric prerelease identifier) where Number() collapses them to equal. Bun
+ * agrees with BigInt on every pair drawn from 0..2^64-1 that was tried (121
+ * release pairs, 81 prerelease pairs, 0 mismatches). At 2^64 and beyond it
+ * stops making sense - order("18446744073709551616.0.0", "1.0.0") is -1, and a
+ * 20-digit prerelease identifier compares ABOVE a 23-digit one - so a
+ * component that big is refused here rather than answered.
  * ---------------------------------------------------------------- */
-const SEMVER_RE = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?$/;
-function parseSemver(v) {
-  const m = typeof v === "string" ? SEMVER_RE.exec(v.trim()) : null;
-  if (!m) throw new Error("[nrc-bun-shim] Invalid SemVer: " + String(v));
-  return {
-    parts: [Number(m[1]), Number(m[2]), Number(m[3])],
-    pre: m[4] === undefined ? null : m[4].split("."),
-  };
+const SEMVER_FULL = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/;
+const SEMVER_PARTIAL = /^v?(\d+)(?:\.(\d+))?$/;
+const SEMVER_LEADING_WS = /^[ \t\n\v\f\r]+/;
+const SEMVER_NON_ASCII = /[^\u0000-\u007f]/;
+const U64_LIMIT = 1n << 64n;
+function semverNumber(digits) {
+  const n = BigInt(digits);
+  if (n >= U64_LIMIT) {
+    unsupported("semver.order",
+      "the numeric identifier " + digits + " does not fit in 64 bits, and Bun's " +
+      "own ordering there is not reproducible (it puts 2^64 below 1)");
+  }
+  return n;
+}
+// A missing component - the "0.0" of "1" - is null, and null sorts ABOVE every
+// number. Measured: "1" is above "1.9999.9999" and "0" is above "0.0.0".
+function semverComponent(x, y) {
+  if (x === null) return y === null ? 0 : 1;
+  if (y === null) return -1;
+  return x === y ? 0 : (x < y ? -1 : 1);
+}
+function parseSemver(s) {
+  if (SEMVER_NON_ASCII.test(s)) {
+    unsupported("semver.order",
+      "the input contains a code point above U+007F, and Bun does not order " +
+      "those - measured, such a string compares 0 against every version, " +
+      "0.0.0 and 2.0.0 at the same time");
+  }
+  // Leading whitespace is skipped; after that the first plain space ends the
+  // version and the rest of the string is discarded.
+  const trimmed = s.replace(SEMVER_LEADING_WS, "");
+  const space = trimmed.indexOf(" ");
+  const body = space === -1 ? trimmed : trimmed.slice(0, space);
+  const full = SEMVER_FULL.exec(body);
+  if (full) {
+    return {
+      parts: [semverNumber(full[1]), semverNumber(full[2]), semverNumber(full[3])],
+      pre: full[4] === undefined ? null : full[4].split("."),
+    };
+  }
+  const partial = SEMVER_PARTIAL.exec(body);
+  if (partial) {
+    return {
+      parts: [semverNumber(partial[1]),
+        partial[2] === undefined ? null : semverNumber(partial[2]), null],
+      pre: null,
+    };
+  }
+  throw new Error("[nrc-bun-shim] Invalid SemVer: " + s);
 }
 function comparePrerelease(a, b) {
   if (a === null && b === null) return 0;
@@ -388,15 +657,29 @@ function comparePrerelease(a, b) {
     if (x === undefined) return -1;
     if (y === undefined) return 1;
     const xn = /^\d+$/.test(x), yn = /^\d+$/.test(y);
-    if (xn && yn) { const d = Number(x) - Number(y); if (d !== 0) return d < 0 ? -1 : 1; continue; }
+    if (xn && yn) {
+      const nx = semverNumber(x), ny = semverNumber(y);
+      if (nx !== ny) return nx < ny ? -1 : 1;
+      continue;
+    }
     if (xn !== yn) return xn ? -1 : 1;
     if (x !== y) return x < y ? -1 : 1;
   }
   return 0;
 }
 function semverOrder(a, b) {
-  const x = parseSemver(a), y = parseSemver(b);
-  for (let i = 0; i < 3; i++) if (x.parts[i] !== y.parts[i]) return x.parts[i] < y.parts[i] ? -1 : 1;
+  // Arity, not value, and checked before either argument is touched: measured,
+  // Bun answers this for order(), order("1.2.3") and order(Symbol()) alike.
+  if (arguments.length < 2) throw new Error("Expected two arguments");
+  // BOTH arguments are stringified before EITHER is parsed - measured, a bad
+  // first argument does not shield a symbol in the second.
+  const sa = typeof a === "string" ? a : toStringArg(a);
+  const sb = typeof b === "string" ? b : toStringArg(b);
+  const x = parseSemver(sa), y = parseSemver(sb);
+  for (let i = 0; i < 3; i++) {
+    const c = semverComponent(x.parts[i], y.parts[i]);
+    if (c !== 0) return c;
+  }
   return comparePrerelease(x.pre, y.pre);
 }
 
@@ -405,15 +688,54 @@ function semverOrder(a, b) {
  *
  * Stands in for: comparing a settings object against the one already loaded.
  * Bun's default (non-strict) mode is looser than util.isDeepStrictEqual in
- * ways that matter - measured on Bun 1.3.14: {a:undefined} equals {}, a class
- * instance equals a plain object with the same fields, NaN equals NaN, and 0
- * does not equal -0. isDeepStrictEqual answers the opposite on the first two,
- * so it is not used.
+ * ways that matter - measured on Bun 1.3.14: {a:undefined} equals {}, [1,
+ * undefined] equals [1], a class instance equals a plain object with the same
+ * fields, NaN equals NaN, and 0 does not equal -0. isDeepStrictEqual answers
+ * the opposite on the first three, so it is not used.
+ *
+ * Fewer than two arguments is a TypeError, message and all - Bun's arity
+ * check, not a value comparison against undefined.
  *
  * This covers exactly what those call sites pass: null, booleans, numbers,
- * strings, arrays and plain objects. Dates, Maps, Sets, RegExps, typed arrays,
- * class instances and cycles all THROW rather than get an approximate answer,
- * and the third (strict) argument is not accepted.
+ * strings, arrays and plain objects whose own properties are all enumerable
+ * data properties - which is every object JSON.parse can build. Dates, Maps,
+ * Sets, RegExps, typed arrays, class instances and cycles all THROW rather
+ * than get an approximate answer, and the third (strict) argument is not
+ * accepted.
+ *
+ * WHY THE OWN-PROPERTY SHAPE IS CHECKED, AND NOT GUESSED AT. Bun does not run
+ * one algorithm over objects. JSC picks between a fast walk of the object's
+ * structure and a generic walk of its property-name list, and the two do not
+ * agree - so the answer depends on how the object is REPRESENTED, not only on
+ * what it holds. All measured on Bun 1.3.14:
+ *
+ *   - a non-enumerable property on the right-hand side is read straight
+ *     through: deepEquals({a:1}, ne) is TRUE where ne has a non-enumerable
+ *     a:1, while deepEquals(ne, {a:1}) is false. Reversing the arguments
+ *     changes the answer.
+ *   - and that rule does not survive contact with anything else. Over an
+ *     exhaustive corpus of 2,401 two-key pairs - each key absent, or present
+ *     with one of three values, enumerable or not - "walk the left object's
+ *     enumerable keys and read the right one through [[Get]]" is exact on all
+ *     784 pairs whose LEFT object has no non-enumerable property, and wrong on
+ *     60 of the other 1,617. The rival walk - a property-name list indexed
+ *     straight through, so which of the right object's extra keys get checked
+ *     depends on how many keys the left one had - is exact on all 1,089 pairs
+ *     where BOTH sides carry a non-enumerable property, and wrong on 32 of the
+ *     other 1,312. There is no one rule, because there is no one algorithm.
+ *   - the same split shows up without any non-enumerable property at all.
+ *     deepEquals({x:1}, {y:undefined, x:1}) is true; add an identical
+ *     integer-index key to BOTH sides - {x:1,0:7} against {y:undefined,x:1,0:7}
+ *     - and the same comparison is false. So is the getter-bearing version.
+ *     An index key or an accessor moves JSC off the fast walk, and the slow
+ *     one answers by the order the keys were inserted.
+ *
+ * None of that is reproducible from JavaScript, so this entry refuses the
+ * shapes that reach it: any own property that is not an enumerable data
+ * property, and an integer-index key in the same comparison as an
+ * undefined-valued property. JSON.parse produces neither, which is why the
+ * call sites are unaffected; what the refusal replaces is a confident boolean
+ * that was measurably the wrong one.
  * ---------------------------------------------------------------- */
 function isPlainObject(v) {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
@@ -423,6 +745,31 @@ function isPlainObject(v) {
 function definedKeys(o) {
   return Object.keys(o).filter((k) => o[k] !== undefined);
 }
+// An array-index key in JSC's sense: the canonical spelling of a number below
+// 2^32-1. "01" and "1e2" are ordinary string keys and do not count.
+const INDEX_KEY = /^(?:0|[1-9][0-9]{0,9})$/;
+const isIndexKey = (k) => INDEX_KEY.test(k) && Number(k) < 4294967295;
+// The two facts about an object's own properties that Bun's answer turns on.
+// Refuses here rather than returning them when the shape is one where Bun
+// stops being reproducible; see the block comment above.
+function objectShape(o) {
+  const names = Object.getOwnPropertyNames(o);
+  let index = false, undef = false;
+  for (let i = 0; i < names.length; i++) {
+    const d = Object.getOwnPropertyDescriptor(o, names[i]);
+    if (!d.enumerable || !("value" in d)) {
+      unsupported("deepEquals",
+        "the property " + JSON.stringify(names[i]) + " is " +
+        (d.enumerable ? "an accessor" : "not enumerable") + ", which JSON.parse " +
+        "never produces and which moves Bun onto a different comparison " +
+        "algorithm - measured, one that answers differently depending on which " +
+        "argument holds it");
+    }
+    if (d.value === undefined) undef = true;
+    if (isIndexKey(names[i])) index = true;
+  }
+  return { index, undef };
+}
 // null | boolean | number | string | undefined | array | object; anything else
 // is a shape these call sites never pass and this function will not guess at.
 function jsonKind(v) {
@@ -430,7 +777,18 @@ function jsonKind(v) {
   const t = typeof v;
   if (t === "boolean" || t === "number" || t === "string" || t === "undefined") return t;
   if (Array.isArray(v)) return "array";
-  if (isPlainObject(v)) return "object";
+  if (isPlainObject(v)) {
+    // Object.keys below cannot see symbol keys, but Bun compares them:
+    // measured, Bun.deepEquals({[Symbol.for("s")]: 1}, {}) is false and
+    // {[s]:1} vs {[s]:2} is false, where ignoring them answers true both
+    // times. A symbol key is not a JSON value, so it takes the same exit as
+    // every other non-JSON shape instead of a confident wrong boolean.
+    if (Object.getOwnPropertySymbols(v).length > 0) {
+      unsupported("deepEquals", "an object with symbol keys is not a JSON value, " +
+        "and Bun does compare those keys");
+    }
+    return "object";
+  }
   unsupported("deepEquals", "only JSON values are supported, not " +
     (t === "object" ? "class instances, Map, Set, Date, RegExp or typed arrays" : t));
 }
@@ -444,9 +802,29 @@ function deepEqualsJson(a, b, depth) {
   }
   if (ka !== "array" && ka !== "object") return a === b;
   if (ka === "array") {
-    if (a.length !== b.length) return false;
-    for (let i = 0; i < a.length; i++) if (!deepEqualsJson(a[i], b[i], depth + 1)) return false;
+    // "An undefined property is an absent property" applies to INDICES too, not
+    // just to keys - measured on Bun 1.3.14, and the rule is positional rather
+    // than a filter: [1, undefined] equals [1] and [1, 2] equals
+    // [1, 2, undefined, undefined], while [undefined, 1] does NOT equal [1] and
+    // [1, undefined, 2] does not equal [1, 2]. A hole reads as undefined, so
+    // new Array(2) equals [] and [1, , 3] equals [1, undefined, 3] but not
+    // [1, 3]. Comparing up to the LONGER length, with out-of-range as
+    // undefined, is exactly that rule; a length check first is not.
+    //
+    // Non-index own properties are ignored: measured, [1] with .x = 2 equals
+    // [1] and equals [1] with .x = 3. Only indices are compared below.
+    const n = a.length > b.length ? a.length : b.length;
+    for (let i = 0; i < n; i++) if (!deepEqualsJson(a[i], b[i], depth + 1)) return false;
     return true;
+  }
+  const shapeA = objectShape(a), shapeB = objectShape(b);
+  if ((shapeA.index || shapeB.index) && (shapeA.undef || shapeB.undef)) {
+    unsupported("deepEquals",
+      "one side carries an integer-index key and one carries a property whose " +
+      "value is undefined. Measured, that combination takes Bun off its fast " +
+      "comparison and onto one that answers by key insertion order: {x:1,0:7} " +
+      "and {y:undefined,x:1,0:7} are NOT equal, while the same pair without the " +
+      "0 key is");
   }
   const keysA = definedKeys(a), keysB = definedKeys(b);
   if (keysA.length !== keysB.length) return false;
@@ -457,6 +835,11 @@ function deepEqualsJson(a, b, depth) {
   return true;
 }
 function deepEquals(a, b, strict) {
+  // Arity, not value: measured, Bun throws this exact TypeError for
+  // deepEquals(), deepEquals({}) and even deepEquals(undefined). Answering
+  // `true` to a zero-argument call - which this did - is the plausible wrong
+  // value the rule at the top of this file exists to prevent.
+  if (arguments.length < 2) throw new TypeError("Expected 2 values to compare");
   if (strict !== undefined) unsupported("deepEquals(_, _, strict)", "only the default loose mode was measured");
   return deepEqualsJson(a, b, 0);
 }
@@ -532,11 +915,6 @@ const bun = {
   // "requires the native binary"; these keep that true and say which piece.
   SQL: function () { unsupported("SQL", "the gateway needs Bun's native SQL client"); },
   Transpiler: function () { unsupported("Transpiler", "no JS transpiler stand-in"); },
-  ant: {
-    getPeerUid: () => unsupported("ant.getPeerUid", "no SO_PEERCRED binding"),
-    getPeerPid: () => unsupported("ant.getPeerPid", "no SO_PEERCRED binding"),
-    setDumpable: () => unsupported("ant.setDumpable", "no prctl binding; the process stays dumpable"),
-  },
 };
 
 /* ---------------------------------------------------------------- *
@@ -556,6 +934,16 @@ const bun = {
  *                             runtime probe is `typeof Bun.version`, and
  *                             process.versions.bun is genuinely absent here
  *   Bun.stdin                 appears only inside a documentation string
+ *   Bun.ant                   the odd one out: it is not feature-detected, it
+ *                             is patched into the Bun that ships inside the
+ *                             binary. Measured: typeof Bun.ant is "undefined"
+ *                             in stock Bun 1.3.14, so a stub here would be the
+ *                             one place this file claims a surface the ORACLE
+ *                             does not have. All three call sites
+ *                             (getPeerUid/getPeerPid/setDumpable) are bare
+ *                             `Bun.ant.x(...)` inside try/catch, so leaving it
+ *                             undefined throws the same TypeError Bun throws,
+ *                             at the same place.
  *
  * Known inaccuracy that cannot be fixed from here: code testing `typeof Bun`
  * alone sees "object" and concludes it is on Bun. That flag reaches telemetry

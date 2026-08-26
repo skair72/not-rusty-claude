@@ -242,8 +242,9 @@ doctor:
 	else \
 	  printf '    %-22s %s\n' 'node' 'not found - set NODE_BIN='; \
 	fi; \
-	if [ -f '$(NODE_MODULES)/ws/package.json' ] && [ -f '$(NODE_MODULES)/undici/package.json' ]; then \
-	  printf '    %-22s %s\n' 'ws + undici' '$(NODE_MODULES)'; \
+	mods="$${NRC_TEST_NODE_MODULES:-$(NODE_MODULES)}"; \
+	if [ -f "$$mods/ws/package.json" ] && [ -f "$$mods/undici/package.json" ]; then \
+	  printf '    %-22s %s\n' 'ws + undici' "$$mods"; \
 	else \
 	  printf '    %-22s %s\n' 'ws + undici' 'missing - run: make node-deps'; \
 	fi; \
@@ -408,36 +409,51 @@ smoke:
 	  '$(BUN_BIN)' "$$art" mcp list; \
 	echo '==> smoke OK (exit 0). Your real ~/.claude was not touched.'
 
-# ws and undici only. Measured on the 2.1.231 artifact: 12 bare specifiers are
-# not Node builtins, and exactly three of those are Bun builtins Node lacks -
-# ws, undici and bun:ffi. bun:ffi needs nothing here: its one call site is
-# behind a macOS check AND inside a try/catch. The other nine (react, ajv/*,
-# playwright-core...) are dead or optional paths that fail under Bun too.
+# ws and undici only. Measured on the 2.1.231 artifact: five non-builtin bare
+# specifiers are real code rather than string content - ws, undici, bun:ffi,
+# bun:jsc and node-fetch - and Bun provides all five while Node provides none.
+# Only ws and undici are needed to load the bundle: bun:ffi and bun:jsc are each
+# inside a try/catch (bun:ffi's also behind a macOS check), and node-fetch is an
+# SDK fetch fallback no command tested here reaches - it would throw if it did.
+#
+# The throwaway package.json below pins npm's install root. Without it npm walks
+# UP from $(NODE_DIR) and installs into the first ancestor holding a package.json
+# or a node_modules - usually $HOME. It lands in the cache dir, not the checkout.
 #
 # npm does the integrity checking here, which is a weaker guarantee than the
 # pinned sha256 above for bun: the registry vouches for its own tarballs.
+# --ignore-scripts means a substituted tarball cannot run code at install time.
 # Versions are pinned so the fetch is at least reproducible; both were the
 # current release when measured on 2026-08-25.
 node-deps:
 	@set -eu; \
-	if [ -f '$(NODE_MODULES)/ws/package.json' ] && [ -f '$(NODE_MODULES)/undici/package.json' ]; then \
-	  echo '==> ws and undici already in $(NODE_MODULES)'; \
+	mods="$${NRC_TEST_NODE_MODULES:-$(NODE_MODULES)}"; \
+	if [ -f "$$mods/ws/package.json" ] && [ -f "$$mods/undici/package.json" ]; then \
+	  echo "==> ws and undici already in $$mods"; \
+	elif [ "$$mods" != '$(NODE_MODULES)' ]; then \
+	  echo "error: NRC_TEST_NODE_MODULES=$$mods has no ws and undici. Put them there, or unset it and let this target install them." >&2; \
+	  exit 1; \
 	else \
 	  command -v npm >/dev/null 2>&1 || { \
-	    echo 'error: npm not found. Install Node >= $(MIN_NODE_MAJOR) (npm ships with it), or put ws and undici in a node_modules yourself and pass NRC_TEST_NODE_MODULES=<dir> to make test.' >&2; \
+	    echo 'error: npm not found. Install Node >= $(MIN_NODE_MAJOR) (npm ships with it), or put ws and undici in a node_modules yourself and pass NRC_TEST_NODE_MODULES=<dir> - node-deps, node-run and test all read it.' >&2; \
 	    exit 1; }; \
 	  mkdir -p '$(NODE_DIR)'; \
+	  printf '%s\n' '{"name":"nrc-node-deps","version":"0.0.0","private":true}' > '$(NODE_DIR)/package.json'; \
 	  echo '==> npm install ws@$(NODE_WS_VERSION) undici@$(NODE_UNDICI_VERSION) -> $(NODE_MODULES)'; \
-	  cd '$(NODE_DIR)' && npm install --no-save --no-audit --no-fund --loglevel=error \
+	  cd '$(NODE_DIR)' && npm install --no-save --ignore-scripts --no-audit --no-fund --loglevel=error \
 	    'ws@$(NODE_WS_VERSION)' 'undici@$(NODE_UNDICI_VERSION)'; \
+	  [ -f '$(NODE_MODULES)/ws/package.json' ] && [ -f '$(NODE_MODULES)/undici/package.json' ] || { \
+	    echo 'error: npm exited 0 but $(NODE_MODULES) has no ws and undici - it installed somewhere else.' >&2; \
+	    exit 1; }; \
 	fi; \
-	echo '    nothing was installed globally, and this checkout has no package.json.'
+	echo '    nothing was installed globally, and nothing was written into this checkout.'
 
 # The Node counterpart of `smoke`. Same command, same throwaway config dir, so
 # the two are directly comparable by eye; tests/test_node_runtime.py is what
 # compares them byte for byte.
 node-run: node-deps
 	@set -eu; \
+	mods="$${NRC_TEST_NODE_MODULES:-$(NODE_MODULES)}"; \
 	art='$(OUT_DIR)/extract/cli.original.cjs'; \
 	[ -f "$$art" ] || { echo "error: no artifact at $$art - run: make build" >&2; exit 1; }; \
 	node='$(NODE_BIN)'; \
@@ -449,7 +465,7 @@ node-run: node-deps
 	cfg="$$(mktemp -d "$${TMPDIR:-/tmp}/nrc-node.XXXXXX")"; \
 	trap 'rm -rf "$$cfg"' EXIT INT TERM; \
 	echo "==> $$node --require scripts/bun-shim.cjs $$art $(NODE_ARGS)"; \
-	DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$$cfg" NODE_PATH='$(NODE_MODULES)' \
+	DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$$cfg" NODE_PATH="$$mods" \
 	  python3 -c 'import subprocess,sys; sys.exit(subprocess.run(sys.argv[1:], timeout=300).returncode)' \
 	  "$$node" --require '$(ROOT)/scripts/bun-shim.cjs' "$$art" $(NODE_ARGS); \
 	echo '==> node-run OK (exit 0). Your real ~/.claude was not touched.'
@@ -471,6 +487,12 @@ node-run: node-deps
 # Linux it is the ELF one, so `make binary` feeds `make test` without the user
 # having to know either env var. An env var that is already set always wins,
 # and conftest.py's own defaults are tried before the download.
+#
+# The recipe EXPORTS what it resolved (NRC_TEST_ELF, NRC_TEST_MACHO, BUN_BIN,
+# NRC_TEST_NODE, NRC_TEST_NODE_MODULES) so conftest.py sees the same choices
+# this table just printed. `node-deps` reads the last of those too, so a test
+# that shells back out to make must clear them first - see NODE_DEPS_INHERITED
+# in tests/test_makefile.py - or it measures its launcher, not the recipe.
 test:
 	@set -eu; \
 	cd '$(ROOT)'; \

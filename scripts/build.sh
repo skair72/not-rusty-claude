@@ -16,7 +16,7 @@
 #             ANY non-empty value builds WITHOUT the scoped
 #             isStandaloneExecutable image shim, i.e. exactly what this repo
 #             shipped before it existed. It is the "as shipped" half of the A/B
-#             in docs/findings.md 11; passed straight through to
+#             in docs/findings.md 10; passed straight through to
 #             postprocess.py, which applies the SAME any-non-empty rule. The
 #             two must agree: under a "1"-only rule, NRC_NO_IMAGE_SHIM=false
 #             would shim the artifact here and be announced as an opt-out
@@ -173,7 +173,7 @@ SHIM_WHY="$(sed -n 's/^image shim not applied *: *//p' "$POST_LOG")"
 rm -f "$POST_LOG"
 # ...and remember it, because the closing summary's list of gaps is only true
 # for one of the two builds. Printing the unshimmed list after a shimmed build
-# is worse than printing nothing: it sends the reader to findings.md 11 looking
+# is worse than printing nothing: it sends the reader to findings.md 10 looking
 # for the fix to a problem this artifact no longer has. Both strings are now
 # asserted in tests/test_build_script.py: without those assertions, deleting
 # either one left the suite green while every build went on making a false
@@ -221,5 +221,5 @@ echo
 warn "keep DISABLE_AUTOUPDATER=1: without it, 'claude update' would install a"
 warn "  DIFFERENT, npm-based Claude Code on your machine. Rebuild instead."
 warn "not identical to the native binary ($GAPS):"
-warn "  those gaps are THIS build's; docs/findings.md section 11 explains them."
+warn "  those gaps are THIS build's; docs/findings.md section 10 explains them."
 warn "nothing was installed on PATH - run the command above by full path."
