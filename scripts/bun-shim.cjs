@@ -1107,11 +1107,15 @@ function wrap_breakWord(rows, word, columns) {
     if (!nothingVisibleAfter) {
       if (taken === columns) { rows.push(""); taken = 0; }
       if (w > columns - taken) {
-        // A held-back escape is emitted BEFORE the break it precedes, when the
-        // break happens on an empty row. Measured at width 1: an SGR followed
-        // by a wide character leaves the SGR on the first row and the glyph on
-        // the next, rather than opening with an empty row.
-        if (pending !== "" && taken === 0) {
+        // A held-back escape is emitted BEFORE the break it precedes, in two
+        // cases. Measured at width 1: an SGR followed by a wide character
+        // leaves the SGR on the first row rather than opening with a blank
+        // one. And a link's CLOSE stays on the row the link occupies - held
+        // past the break it would re-open a link that has already ended, on a
+        // row that carries nothing.
+        const closesLink = pending.includes(wrap_ESC + "]8;;" + wrap_BEL) ||
+          pending.includes(wrap_ESC + "]8;;" + wrap_ESC + "\\");
+        if (pending !== "" && (taken === 0 || closesLink)) {
           rows[rows.length - 1] += pending;
           pending = "";
         }
