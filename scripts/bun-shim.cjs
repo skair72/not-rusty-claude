@@ -1221,15 +1221,24 @@ function wrap_wrapLine(rawLine, columns, opts) {
       // an SGR followed by " \t " loses all three, exactly as the bare form
       // does, so the strip has to step over the escapes first rather than
       // anchor at the row's very start.
+      // ...but a NON-SGR CSI in that leading run shelters a tab, and only a
+      // tab. Swept escape by escape: with no escape, with any SGR, and with
+      // either OSC 8 form, " \t ab" trims to "ab". With \u001b[H, \u001b[6n,
+      // \u001b[2K or \u001b[?25l it trims to "\tab" - the spaces still go and
+      // the tab stays. The other five whitespace shapes are identical across
+      // all ten escapes, so the CSI is the whole of the difference.
       const row = rows[rows.length - 1];
       let head = 0;
+      let sheltersTab = false;
       for (;;) {
         const esc = wrap_escapeLength(row, head);
         if (!esc) break;
+        const text = row.slice(head, head + esc);
+        if (text.startsWith(wrap_ESC + "[") && !text.endsWith("m")) sheltersTab = true;
         head += esc;
       }
-      rows[rows.length - 1] =
-        row.slice(0, head) + row.slice(head).replace(/^[ \t]+/, "");
+      rows[rows.length - 1] = row.slice(0, head) +
+        row.slice(head).replace(sheltersTab ? /^ +/ : /^[ \t]+/, "");
     }
 
     const wordWidth = wrap_visibleWidth(word);
