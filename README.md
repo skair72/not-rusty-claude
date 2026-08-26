@@ -169,9 +169,13 @@ every throw. Refusing loudly only helps if something can hear it.
 
 Both are implemented now, each verified against Bun as oracle rather than written from
 memory — `wrapAnsi` byte-equal over 2,800 cases, `YAML.parse` matching on 138 of 150 and
-refusing the other 12 by name. ✅ Verified on Linux; **not yet re-run on the machine that
-reported it**. If a TUI still will not paint, `scripts/node-trace.cjs` is the instrument
-and [`docs/runbook.md`](docs/runbook.md) § Diagnosing a Node hang is how to point it.
+refusing the other 12 by name. ✅ **Confirmed on the machine that reported it**: Apple
+Silicon, Node 24.19.0, the reporter's own authenticated `~/.claude`, 2026-08-26 — the
+same command that painted nothing now runs the REPL. One limit stands: frontmatter using
+an anchor, a tag, a complex key or multiple documents still refuses, by name rather than
+by silent misparse. If a TUI will not paint, `scripts/node-trace.cjs` prints `THREW`
+with the API and the reason ([`docs/runbook.md`](docs/runbook.md) § Diagnosing a Node
+hang).
 
 ## macOS
 
@@ -343,32 +347,32 @@ only as quoted command output labelled with the binary and date that produced
 it.** These counts *move*, in both directions, as test files are added and removed —
 which is exactly why. Every row was re-measured here on 2026-08-26
 by forcing it with the variables named beside it; `--collect-only` reports the
-same total, **265**, in all six configurations, because what the host has
+same total, **269**, in all six configurations, because what the host has
 changes the skips, never the collection.
 
 | host has | result | how the row was forced |
 | --- | --- | --- |
-| both binaries, Bun, Node 24 | **265 passed** | `NRC_TEST_NODE=…/v24.0.0/bin/node` (this host's own `node` is 22.23.2) |
-| …no Mach-O | 260 passed, 5 skipped | `NRC_TEST_MACHO=/nonexistent/macho` |
-| …no ELF | 260 passed, 5 skipped | `NRC_TEST_ELF=/nonexistent/elf` |
-| …neither binary | 255 passed, 10 skipped | both of those two variables at once |
-| …and no Bun | 216 passed, 49 skipped | …plus `BUN_BIN=/nonexistent/bun` and a `HOME` with no Bun under it |
-| none of them, Node 22 | 190 passed, 75 skipped | …and drop `NRC_TEST_NODE` — the command below |
+| both binaries, Bun, Node 24 | **269 passed** | `NRC_TEST_NODE=…/v24.0.0/bin/node` (this host's own `node` is 22.23.2) |
+| …no Mach-O | 264 passed, 5 skipped | `NRC_TEST_MACHO=/nonexistent/macho` |
+| …no ELF | 264 passed, 5 skipped | `NRC_TEST_ELF=/nonexistent/elf` |
+| …neither binary | 259 passed, 10 skipped | both of those two variables at once |
+| …and no Bun | 217 passed, 52 skipped | …plus `BUN_BIN=/nonexistent/bun` and a `HOME` with no Bun under it |
+| none of them, Node 22 | 190 passed, 79 skipped | …and drop `NRC_TEST_NODE` — the command below |
 
-Every row adds up to 265, and the skips decompose: **5** tests need the Mach-O
-binary, **5** the ELF one, **3** more only a Bun (5 + 5 + 3 = 13), and **62**
-need Node ≥ 24 — of which **34** also use Bun as their oracle and **6** also
+Every row adds up to 269, and the skips decompose: **5** tests need the Mach-O
+binary, **5** the ELF one, **3** more only a Bun (5 + 5 + 3 = 13), and **66**
+need Node ≥ 24 — of which **37** also use Bun as their oracle and **6** also
 want `ws`+`undici`, which the moved `HOME` of the fifth row takes with it. Only
 **2** of those six want the modules without wanting Bun as well, which is what
-makes the last two rows differ by the amount they do: 13 + 34 + 2 = 49, and
-13 + 62 = 75. The per-fixture figures are counted from `--fixtures-per-test`
+makes the last two rows differ by the amount they do: 13 + 37 + 2 = 52, and
+13 + 66 = 79. The per-fixture figures are counted from `--fixtures-per-test`
 rather than inferred from the totals, and all three of the measured
 configurations above check out against them.
 
 **The Apple Silicon run is not reconcilable to this table, and should not be.**
 It reported **257 passed, 6 skipped, 0 failed, 263 collected** — a true
 measurement of the tree as it stood on 2026-08-24, whose test set is not
-today's. No arithmetic connects 263 to 265 and none is offered. What the Mac run
+today's. No arithmetic connects 263 to 269 and none is offered. What the Mac run
 established is in [§ macOS](#macos); its totals belong to the tree it ran on.
 
 The last two rows need care twice over. `BUN_BIN` is a *first* choice, not an
