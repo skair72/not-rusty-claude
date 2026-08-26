@@ -1030,6 +1030,26 @@ function wrap_nextVisibleWidth(word, from) {
 // tone is 2 versus 4. Stage one places whole words by cluster width; stage two
 // walks code points and must count them the same way it walks them, or a row
 // that looks full to one stage looks roomy to the other.
+// A combining mark measures ZERO when the engine walks code points, whatever
+// the width table says about the mark on its own. The table is not wrong:
+// asked in isolation, Bun answers 2 for the enclosing keycap U+20E3, and we
+// match it. But the walk does not charge the row for it.
+//
+// Measured: "1<VS16><KEYCAP>xy" fits on ONE row at width 3 - four visible
+// columns in three - while "<CJK>xy" does not, so the keycap's two columns
+// cost the row nothing and the ideograph's two cost it everything. That is why
+// "1<VS16><KEYCAP>" survives whole at width 1 where the rainbow flag splits:
+// the flag's second half is a BASE reached through a joiner, not a mark.
+//
+// Only Mn and Me are marks here. Skin-tone modifiers are Sk, and measured,
+// they do cost their width - thumbs-up and its modifier land on separate rows
+// at width 1. A rule that zeroed every cluster continuation would merge them.
+const wrap_COMBINING_MARK = /^[\p{Mn}\p{Me}]$/u;
+
+function wrap_pointCellWidth(cp) {
+  return wrap_COMBINING_MARK.test(cp) ? 0 : stringWidth(cp);
+}
+
 function wrap_pointWidth(text) {
   let total = 0;
   let i = 0;
@@ -1037,7 +1057,7 @@ function wrap_pointWidth(text) {
     const esc = wrap_escapeLength(text, i);
     if (esc) { i += esc; continue; }
     const cp = String.fromCodePoint(text.codePointAt(i));
-    total += stringWidth(cp);
+    total += wrap_pointCellWidth(cp);
     i += cp.length;
   }
   return total;
@@ -1087,7 +1107,7 @@ function wrap_breakWord(rows, word, columns) {
       continue;
     }
     const cp = String.fromCodePoint(word.codePointAt(i));
-    const w = stringWidth(cp);
+    const w = wrap_pointCellWidth(cp);
     // A running counter, NOT a re-measurement. Whatever stage one placed on
     // this row was measured by cluster; every code point stage two adds is
     // measured on its own. Re-measuring the row string picks one rule for both
