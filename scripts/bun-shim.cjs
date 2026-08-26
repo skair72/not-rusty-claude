@@ -892,366 +892,334 @@ function gc() {
  * That failure cost a day of investigation across two machines before a trace
  * named it, which is why this is implemented rather than refused.
  *
- * Every rule below was measured against Bun 1.3.14, not assumed: 4,000 cases
- * over 40 inputs (ANSI SGR including 256-colour and truecolor, OSC 8
- * hyperlinks in both terminator forms, CJK, emoji, combining marks, tabs,
- * carriage returns, embedded newlines), 10 widths and 10 option combinations.
- * tests/test_wrap_ansi.py re-runs that corpus with Bun as the oracle, and
- * tests/test_fuzz_differential.py adds generated inputs nobody chose.
+ * It is built on TWO STAGES, because that is what the oracle does and a single
+ * unified tokenizer cannot express it (measured in the notes below):
  *
- * ⚠️ NOT byte-equal everywhere. The generative differential still reports
- * divergences at narrow widths, mostly involving ST-terminated hyperlinks and
- * zero-width sequences; they are pinned there as a count that may only fall.
- * Unlike YAML.parse below, this function cannot refuse - a throw inside a
- * render is swallowed by an error boundary and the TUI dies silently - so its
- * contract is enforceable only by comparison.
+ *   1. WORD PLACEMENT measures whole words with the grapheme-aware
+ *      stringWidth above. A ZWJ emoji family is width 2 and survives whole at
+ *      columns 2, even though it is five code points.
+ *   2. BREAKING an over-long word walks CODE POINTS with a per-code-point
+ *      width. That same family becomes one member per row. Two different width
+ *      machineries, deliberately.
+ *   3. ESCAPE STATE is re-emitted at join time, per input line: every row is
+ *      opened with what was in force and closed at its end, and state does not
+ *      cross a newline in the input.
  *
- * The four rules that are not obvious, each of which the corpus forced:
- *   - width <= 0 returns the input untouched
- *   - ONE escape code carries across a row break - the last seen, closing
- *     codes included - not a set of active ones
- *   - a full row and an over-wide glyph are separate breaks that can both
- *     fire for the same character
- *   - an escape at a break belongs to the row that follows it
+ * The first implementation used one cluster tokenizer for both stages. That
+ * mismatch - not any single missing rule - is what produced defect after
+ * defect: thirteen found by review, then more by the generative differential,
+ * each "fixed" by a patch that the next case invalidated.
+ *
+ * ⚠️ NOT byte-equal to Bun everywhere. tests/test_fuzz_differential.py pins the
+ * remaining gap as a count that may only fall, and reports it per seed.
+ * Unlike YAML.parse below, this function cannot refuse, so its contract is
+ * enforceable only by comparison - never by a check in the code.
  * ---------------------------------------------------------------- */
 
-const WRAP_ESC = "\u001b";
+const wrap_ESC = "\u001b";
+const wrap_BEL = "\u0007";
 
-// --- tokenising ------------------------------------------------------------
-//
-// A line becomes a flat list of tokens. Escape sequences carry no width and
-// must never be split; everything else is a grapheme cluster with a width.
+// --- scanning ---------------------------------------------------------------
 
-
-function tokenize(line) {
-  const tokens = [];
-  let i = 0;
-  let plainStart = 0;
-
-  const flushPlain = (end) => {
-    if (end <= plainStart) return;
-    for (const { segment } of GRAPHEMES.segment(line.slice(plainStart, end))) {
-      tokens.push({ ansi: false, text: segment, w: stringWidth(segment) });
-    }
-  };
-
-  while (i < line.length) {
-    if (line[i] !== WRAP_ESC) { i++; continue; }
-    flushPlain(i);
-    const start = i;
-    i++;
-    if (line[i] === "[") {
-      i++;
-      while (i < line.length && line.charCodeAt(i) >= 0x20 && line.charCodeAt(i) <= 0x3f) i++;
-      if (i < line.length) i++; // final byte
-    } else if (line[i] === "]") {
-      i++;
-      while (i < line.length) {
-        if (line[i] === "") { i++; break; }
-        if (line[i] === WRAP_ESC && line[i + 1] === "\\") { i += 2; break; }
-        i++;
-      }
-    } else {
-      i++;
-    }
-    tokens.push({ ansi: true, text: line.slice(start, i), w: 0 });
-    plainStart = i;
+// Length of the escape sequence starting at i, or 0 if there is none.
+function wrap_escapeLength(text, i) {
+  if (text[i] !== wrap_ESC) return 0;
+  const next = text[i + 1];
+  if (next === "[") {
+    let j = i + 2;
+    while (j < text.length && text.charCodeAt(j) >= 0x20 && text.charCodeAt(j) <= 0x3f) j++;
+    return j < text.length ? j - i + 1 : text.length - i;
   }
-  flushPlain(line.length);
-  return tokens;
+  if (next === "]") {
+    let j = i + 2;
+    while (j < text.length) {
+      if (text[j] === wrap_BEL) return j - i + 1;
+      if (text[j] === wrap_ESC && text[j + 1] === "\\") return j - i + 2;
+      j++;
+    }
+    return text.length - i;
+  }
+  return next === undefined ? 1 : 2;
 }
 
-// --- escape state ----------------------------------------------------------
-//
-// Each row must open the codes still in force when it starts and close them
-// when it ends, or colour bleeds across the break.
+// --- escape state -----------------------------------------------------------
 
-const CLOSING = new Map([
+const wrap_CLOSERS = new Map([
   [1, 22], [2, 22], [3, 23], [4, 24], [5, 25], [7, 27], [8, 28], [9, 29], [53, 55],
 ]);
 
-function closerFor(n) {
-  if (CLOSING.has(n)) return CLOSING.get(n);
-  if ((n >= 30 && n <= 38) || (n >= 90 && n <= 97)) return 39;
-  if ((n >= 40 && n <= 48) || (n >= 100 && n <= 107)) return 49;
+function wrap_closerFor(code) {
+  if (wrap_CLOSERS.has(code)) return wrap_CLOSERS.get(code);
+  if ((code >= 30 && code <= 38) || (code >= 90 && code <= 97)) return 39;
+  if ((code >= 40 && code <= 48) || (code >= 100 && code <= 107)) return 49;
   return null;
 }
 
-function applyEscape(state, text) {
-  if (text.startsWith(WRAP_ESC + "]8;")) {
-    // OSC 8 hyperlink: the closing form carries an empty URI.
-    const body = text.slice(4);
-    const uri = body.split(";").slice(1).join(";").replace(/(\u0007|\u001b\\)$/, "");
-    state.link = uri ? WRAP_ESC + "]8;;" + uri + "\u0007" : null;
-    return;
-  }
-  if (!text.startsWith(WRAP_ESC + "[") || !text.endsWith("m")) return;
+// --- the word splitter ------------------------------------------------------
+//
+// A "word" is a run between single spaces. Escapes belong to the word they
+// precede; the space itself is a separator, not part of either side.
 
-  // Measured: Bun carries ONE code across a row break - the last SINGLE
-  // parameter it saw - and re-emits it at the head of every following row.
-  // That includes a closing code: after a lone 22 the rows that follow open
-  // with 22, which a set-of-active-codes model gets wrong.
-  //
-  // A MULTI-parameter sequence carries nothing at all. 256-colour, truecolor
-  // and combined codes are all multi-parameter and all ordinary in a themed
-  // TUI, and Bun leaves the rows after one of them bare. Taking the last
-  // parameter instead - as this did until it was measured properly - emitted
-  // an SGR code that does not exist: 38;5;208 became a carry of 208.
-  const params = text.slice(2, -1).split(";");
-  if (params.length > 1) {
-    // A multi-parameter sequence contributes nothing AND clears nothing: after
-    // \u001b[4m\u001b[1;31m the rows still re-open with 4m. Measured - an
-    // earlier version cleared the carry here, which lost the underline. The
-    // sequence itself stays in the text either way; this is only about what is
-    // re-emitted at the head of the next row.
-    return;
-  }
-  const n = Number(params[0] === "" ? 0 : params[0]);
-  if (Number.isNaN(n)) return;
-  state.code = (n === 0 || n === 39) ? undefined : n;
-}
-
-function openers(state) {
-  return (state.code === undefined ? "" : WRAP_ESC + "[" + state.code + "m") + (state.link || "");
-}
-
-function closers(state) {
-  let out = "";
-  if (state.code !== undefined) {
-    const c = closerFor(state.code);
-    if (c !== null && c !== state.code) out += WRAP_ESC + "[" + c + "m";
-  }
-  if (state.link) out += WRAP_ESC + "]8;;\u0007";
-  return out;
-}
-
-// --- the wrap itself -------------------------------------------------------
-
-function rowWidth(tokens) {
-  let n = 0;
-  for (const t of tokens) n += t.w;
-  return n;
-}
-
-function trimStartTokens(tokens) {
-  let i = 0;
-  while (i < tokens.length && !tokens[i].ansi && tokens[i].text === " ") i++;
-  return tokens.slice(0, i).filter((t) => t.ansi).concat(tokens.slice(i));
-}
-
-function trimEndTokens(tokens) {
-  // Measured: "world <esc>[31m" trims to "world<esc>[31m" - the escape does not
-  // shelter the space before it. So step back over any trailing escapes first,
-  // trim the spaces behind them, then re-attach the escapes.
-  let end = tokens.length;
-  while (end > 0 && tokens[end - 1].ansi) end--;
-  const tail = tokens.slice(end);
-  let i = end;
-  while (i > 0 && !tokens[i - 1].ansi && tokens[i - 1].text === " ") i--;
-  return tokens.slice(0, i)
-    .concat(tokens.slice(i, end).filter((t) => t.ansi))
-    .concat(tail);
-}
-
-function wrapLine(line, columns, opts) {
-  if (opts.trim !== false && line.trim() === "") return "";
-
-  const tokens = tokenize(line);
-
-  // Split into words on visible single spaces, keeping escapes attached to the
-  // word that follows them.
+function wrap_splitWords(line) {
   const words = [];
-  let current = [];
-  for (const t of tokens) {
-    if (!t.ansi && t.text === " ") { words.push(current); current = []; }
-    else current.push(t);
+  let current = "";
+  let i = 0;
+  while (i < line.length) {
+    const esc = wrap_escapeLength(line, i);
+    if (esc) { current += line.slice(i, i + esc); i += esc; continue; }
+    if (line[i] === " ") { words.push(current); current = ""; i++; continue; }
+    const cp = String.fromCodePoint(line.codePointAt(i));
+    current += cp;
+    i += cp.length;
   }
   words.push(current);
+  return words;
+}
 
-  let rows = [[]];
+// Visible width of a string, ignoring escapes.
+function wrap_visibleWidth(text) {
+  let out = "";
+  let i = 0;
+  while (i < text.length) {
+    const esc = wrap_escapeLength(text, i);
+    if (esc) { i += esc; continue; }
+    const cp = String.fromCodePoint(text.codePointAt(i));
+    out += cp;
+    i += cp.length;
+  }
+  return stringWidth(out);
+}
+
+// --- breaking one over-long word --------------------------------------------
+//
+// Stage two: walk code points, not clusters. `rows` is mutated in place; the
+// caller has already placed whatever precedes this word.
+
+function wrap_breakWord(rows, word, columns) {
+  // An ST-terminated OSC makes everything after it in this word unbreakable -
+  // including text past the link's close. Measured: a linked word plus trailing
+  // text stays on one row, while a following SEPARATE word wraps normally, so
+  // the state is per word rather than per line.
+  const stIndex = word.indexOf(wrap_ESC + "]");
+  if (stIndex >= 0) {
+    const esc = wrap_escapeLength(word, stIndex);
+    if (word.slice(stIndex, stIndex + esc).endsWith(wrap_ESC + "\\")) {
+      rows[rows.length - 1] += word;
+      return;
+    }
+  }
+
+  let i = 0;
+  let pending = "";
+  while (i < word.length) {
+    const esc = wrap_escapeLength(word, i);
+    if (esc) {
+      // Held back, not emitted: an escape at a break belongs to the row that
+      // follows it. Measured at width 1, where the sequence opening a word
+      // leads the next row instead of trailing the previous one.
+      pending += word.slice(i, i + esc);
+      i += esc;
+      continue;
+    }
+    const cp = String.fromCodePoint(word.codePointAt(i));
+    const w = stringWidth(cp);
+    const taken = wrap_visibleWidth(rows[rows.length - 1]);
+
+    // A zero-width code point with nothing visible after it stays where it is:
+    // measured, a trailing tab ends the row it is on rather than opening one.
+    const rest = word.slice(i + cp.length);
+    const nothingVisibleAfter = w === 0 && wrap_visibleWidth(rest) === 0;
+
+    // Two INDEPENDENT reasons to break, and both can fire for one code point.
+    // A row that is exactly full yields to whatever comes next; a glyph too
+    // wide for what remains breaks again. Written as `else if` - as the first
+    // draft of this engine had it - a wide glyph following a full row loses the
+    // empty row Bun puts between them.
+    if (!nothingVisibleAfter) {
+      let free = columns - taken;
+      if (taken === columns) { rows.push(""); free = columns; }
+      if (w > free) rows.push("");
+    }
+    rows[rows.length - 1] += pending + cp;
+    pending = "";
+    i += cp.length;
+  }
+  rows[rows.length - 1] += pending;
+}
+
+// --- wrapping one line ------------------------------------------------------
+
+function wrap_wrapLine(rawLine, columns, opts) {
+  let line = rawLine;
+  // A line made only of spaces and tabs collapses to one empty row when
+  // trimming. NOT JS trim(): that counts NBSP as whitespace, and measured, a
+  // lone NBSP survives (it is width 1 and prints) while a lone space does not.
+  if (opts.trim !== false && /^[ \t]*$/.test(line)) return [""];
+
+  // Leading whitespace: a leading SPACE begins a run that swallows following
+  // tabs too, but a tab that opens the line is kept. Measured on "  ab" -> "ab",
+  // " \t -" -> "-", "\tab" -> "\tab".
+  if (opts.trim !== false) line = line.replace(/^ [ \t]*/, "");
+
+  const words = wrap_splitWords(line);
+  const rows = [""];
+
   for (let index = 0; index < words.length; index++) {
     const word = words[index];
-    if (opts.trim !== false) rows[rows.length - 1] = trimStartTokens(rows[rows.length - 1]);
 
-    let len = rowWidth(rows[rows.length - 1]);
+    if (opts.trim !== false) {
+      // Leading spaces on a fresh row are dropped.
+      while (rows[rows.length - 1] === "" && index > 0 && word === "") break;
+    }
+
+    const wordWidth = wrap_visibleWidth(word);
+    let taken = wrap_visibleWidth(rows[rows.length - 1]);
+
     if (index !== 0) {
-      if (len >= columns && (opts.wordWrap === false || opts.trim === false)) {
-        rows.push([]);
-        len = 0;
+      // The separator space, unless the row is empty and we are trimming.
+      if (taken >= columns && (opts.wordWrap === false || opts.trim === false)) {
+        rows.push("");
+        taken = 0;
       }
-      if (len > 0 || opts.trim === false) {
-        rows[rows.length - 1].push({ ansi: false, text: " ", w: 1 });
-        len++;
+      if (taken > 0 || opts.trim === false) {
+        rows[rows.length - 1] += " ";
+        taken += 1;
       }
     }
 
-    const wordLen = rowWidth(word);
-
-    if (opts.hard && wordLen > columns) {
-      const remaining = columns - len;
-      const breaksThisLine = 1 + Math.floor((wordLen - remaining - 1) / columns);
-      const breaksNextLine = Math.floor((wordLen - 1) / columns);
-      if (breaksNextLine < breaksThisLine) rows.push([]);
-      hardWrapWord(rows, word, columns);
+    if (opts.hard && wordWidth > columns) {
+      const remaining = columns - taken;
+      const breaksHere = 1 + Math.floor((wordWidth - remaining - 1) / columns);
+      const breaksNext = Math.floor((wordWidth - 1) / columns);
+      if (breaksNext < breaksHere) rows.push("");
+      wrap_breakWord(rows, word, columns);
       continue;
     }
 
-    if (len + wordLen > columns && len > 0 && wordLen > 0) {
-      if (opts.wordWrap === false && len < columns) {
-        hardWrapWord(rows, word, columns);
+    if (taken + wordWidth > columns) {
+      if (opts.wordWrap === false && taken < columns) {
+        wrap_breakWord(rows, word, columns);
         continue;
       }
-      rows.push([]);
+      if (taken > 0 && wordWidth > 0) rows.push("");
+      if (opts.wordWrap === false) {
+        wrap_breakWord(rows, word, columns);
+        continue;
+      }
     }
 
-    if (len + wordLen > columns && opts.wordWrap === false) {
-      hardWrapWord(rows, word, columns);
+    if (taken + wordWidth > columns && opts.wordWrap === false) {
+      wrap_breakWord(rows, word, columns);
       continue;
     }
 
-    rows[rows.length - 1].push(...word);
+    rows[rows.length - 1] += word;
   }
 
-  if (opts.trim !== false) rows = rows.map(trimEndTokens);
+  if (opts.trim !== false) {
+    for (let i = 0; i < rows.length; i++) rows[i] = wrap_trimRow(rows[i]);
+  }
 
-  return render(rows);
+  return rows;
 }
 
-function hardWrapWord(rows, word, columns) {
-  // Two measured rules live here.
-  //
-  // Bun never breaks inside an OSC 8 hyperlink: a linked run stays on one row
-  // even at width 1, and ordinary wrapping resumes once it closes.
-  //
-  // And an escape sequence sitting exactly at a break belongs to the row that
-  // FOLLOWS it, not the one it ended. So escapes are held back until a visible
-  // character has decided which row it lands on - otherwise a colour reset
-  // closes the old row and the new one opens with nothing.
-  let inLink = false;
-  let pending = [];
-
-  const flushInto = (row) => { row.push(...pending); pending = []; };
-
-  // Precompute, for each position, whether any VISIBLE token follows it. A
-  // trailing zero-width token stays on the row it ends rather than starting a
-  // fresh one, and asking that question by identity lookup would be both
-  // fragile (duplicate tokens compare equal) and quadratic.
-  const visibleAfter = new Array(word.length).fill(false);
-  for (let k = word.length - 2; k >= 0; k--) {
-    visibleAfter[k] = visibleAfter[k + 1] || (!word[k + 1].ansi && word[k + 1].w > 0);
+// Remove spaces at the row's edges, keeping escapes. A trailing escape does not
+// shelter the spaces in front of it.
+function wrap_trimRow(row) {
+  let head = "";
+  let i = 0;
+  let sawSpace = false;
+  for (;;) {
+    const esc = wrap_escapeLength(row, i);
+    if (esc) { head += row.slice(i, i + esc); i += esc; continue; }
+    if (row[i] === " ") { sawSpace = true; i++; continue; }
+    // A tab is kept when it opens the row, but discarded once a space has been
+    // crossed: measured, "\tab" keeps its tab and " \t -" trims to "-".
+    if (row[i] === "\t" && sawSpace) { i++; continue; }
+    break;
   }
+  let body = row.slice(i);
 
-  for (let index = 0; index < word.length; index++) {
-    const t = word[index];
-    if (t.ansi) {
-      if (t.text.startsWith(WRAP_ESC + "]8;")) {
-        const uri = t.text.slice(4).split(";").slice(1).join(";")
-          .replace(/(\u0007|\u001b\\)$/, "");
-        // Only an ST-terminated opener makes the run unbreakable. Measured at
-        // width 1: a BEL-terminated link breaks per character like ordinary
-        // text. The earlier rule was generalised from the ST form alone -
-        // which was the only hyperlink the corpus contained.
-        inLink = uri !== "" && t.text.endsWith(WRAP_ESC + "\\");
-      }
-      pending.push(t);
+  let tail = "";
+  for (;;) {
+    let cut = body.length;
+    let scan = 0;
+    let lastEscStart = -1;
+    while (scan < body.length) {
+      const esc = wrap_escapeLength(body, scan);
+      if (esc) { lastEscStart = scan; scan += esc; continue; }
+      lastEscStart = -1;
+      scan += String.fromCodePoint(body.codePointAt(scan)).length;
+    }
+    if (lastEscStart >= 0 && lastEscStart + wrap_escapeLength(body, lastEscStart) === body.length) {
+      tail = body.slice(lastEscStart) + tail;
+      body = body.slice(0, lastEscStart);
       continue;
     }
-    if (inLink) {
-      flushInto(rows[rows.length - 1]);
-      rows[rows.length - 1].push(t);
-      continue;
-    }
-
-    // Hard wrapping works on CODE POINTS, not grapheme clusters. Measured: a
-    // ZWJ emoji family splits into its members with the joiners placed by the
-    // ordinary break rules, and a combining mark separates from its base -
-    // "e" + combining acute at width 1 gives "e" then the mark leading the
-    // next row. Keeping clusters whole reads like the careful choice and is
-    // not what Bun does. Cluster widths still govern everything else; this
-    // applies only once a word is being broken apart.
-    const points = [...t.text];
-    if (points.length > 1) {
-      for (let k = 0; k < points.length; k++) {
-        const piece = { ansi: false, text: points[k], w: stringWidth(points[k]) };
-        const last = k === points.length - 1;
-        const nothingAfter = piece.w === 0 && last && !visibleAfter[index];
-        if (!nothingAfter) {
-          let taken = rowWidth(rows[rows.length - 1]);
-          if (taken === columns) { rows.push([]); taken = 0; }
-          if (taken + piece.w > columns) rows.push([]);
-        }
-        flushInto(rows[rows.length - 1]);
-        rows[rows.length - 1].push(piece);
-      }
-      continue;
-    }
-
-    // Two independent reasons to break, and BOTH can fire for one character.
-    // A row that is exactly full yields to whatever comes next, even something
-    // of zero width. A glyph too wide for what remains breaks again. That is
-    // why a wide glyph following a full row gets an empty row between them,
-    // while one following an already-overflowing row does not: the first test
-    // only fires on an exact fit, never on a row that has already spilled.
-    //
-    // The exception is a zero-width token with nothing after it. A trailing
-    // tab stays on the row it ends - measured, "abc" + tab at width 1 ends
-    // "c\t", not "c\n\t" - because there is no following content for the
-    // fresh row to hold.
-    // A trailing zero-width token stays on the row it ends: NEITHER break
-    // applies to it. The second test matters as much as the first, because a
-    // row holding a glyph wider than the budget has already overflowed, so
-    // `taken + 0 > columns` is true and would push an empty row for a tab that
-    // occupies no space.
-    const nothingFollows = t.w === 0 && !visibleAfter[index];
-    if (!nothingFollows) {
-      let taken = rowWidth(rows[rows.length - 1]);
-      if (taken === columns) { rows.push([]); taken = 0; }
-      if (taken + t.w > columns) rows.push([]);
-    }
-
-    flushInto(rows[rows.length - 1]);
-    rows[rows.length - 1].push(t);
+    if (body.endsWith(" ")) { body = body.slice(0, -1); continue; }
+    cut = body.length;
+    break;
   }
-  flushInto(rows[rows.length - 1]);
+  return head + body + tail;
 }
 
-function render(rows) {
-  const state = { code: undefined, link: null };
+// --- join-time escape pass --------------------------------------------------
+
+function wrap_render(rows) {
+  let code;
+  let link = null;
   const out = [];
+
   for (let r = 0; r < rows.length; r++) {
-    const open = openers(state);
-    let text = "";
-    for (const t of rows[r]) {
-      text += t.text;
-      if (t.ansi) applyEscape(state, t.text);
+    const opener = (code === undefined ? "" : wrap_ESC + "[" + code + "m") + (link || "");
+    const row = rows[r];
+
+    // Update state from every escape this row contains.
+    let i = 0;
+    while (i < row.length) {
+      const esc = wrap_escapeLength(row, i);
+      if (!esc) { i += String.fromCodePoint(row.codePointAt(i)).length; continue; }
+      const text = row.slice(i, i + esc);
+      if (text.startsWith(wrap_ESC + "]8;")) {
+        const uri = text.slice(4).split(";").slice(1).join(";")
+          .replace(/(|\\)$/, "");
+        link = uri ? wrap_ESC + "]8;;" + uri + wrap_BEL : null;
+      } else if (text.startsWith(wrap_ESC + "[") && text.endsWith("m")) {
+        const params = text.slice(2, -1).split(";");
+        if (params.length === 1) {
+          const n = Number(params[0] === "" ? 0 : params[0]);
+          if (!Number.isNaN(n)) code = (n === 0 || n === 39) ? undefined : n;
+        }
+      }
+      i += esc;
     }
-    // No closer on the last row. Closers exist to stop colour bleeding ACROSS
-    // a break, and after the final row there is no break to bleed across, so
-    // Bun leaves an unclosed colour unclosed rather than tidying up after the
-    // caller.
-    out.push(open + text + (r === rows.length - 1 ? "" : closers(state)));
+
+    let closer = "";
+    if (r !== rows.length - 1) {
+      if (code !== undefined) {
+        const c = wrap_closerFor(code);
+        if (c !== null && c !== code) closer += wrap_ESC + "[" + c + "m";
+      }
+      if (link) closer += wrap_ESC + "]8;;" + wrap_BEL;
+    }
+    out.push(opener + row + closer);
   }
   return out.join("\n");
 }
 
 function wrapAnsi(string, columns, options) {
   const opts = Object.assign({ hard: false, trim: true, wordWrap: true }, options || {});
-  const s = String(string);
-  // Measured: at any width <= 0 Bun hands the input straight back, for all 280
-  // corpus cases and every option combination. The bundle never asks - its call
-  // site guards with `if(!(t>0))return e` - but matching costs one line.
-  if (!(columns > 0)) return s;
-  // No whole-input shortcut for blank input: measured, "\n" wraps to "\n" and
-  // " \n " to "\n". Trimming is per LINE - each blank line becomes empty and
-  // the line structure survives - so an early `return ""` for a string that
-  // trims to nothing silently ate the newlines.
-  // A lone carriage return breaks the line exactly as \r\n does - measured,
-  // "ab\rcd" wraps to "ab\ncd" rather than keeping the CR inside the word.
-  return s.replace(/\r\n?/g, "\n").split("\n")
-    .map((line) => wrapLine(line, columns, opts))
+  const text = String(string);
+  if (!(columns > 0)) return text;
+
+  // Render per input line, with fresh escape state each time. Carrying state
+  // across a newline added a closer to a row Bun leaves alone and reopened it
+  // on the next; measured on a lone SGR sequence followed by a newline, which
+  // Bun returns byte for byte.
+  return text.replace(/\r\n?/g, "\n").split("\n")
+    .map((line) => wrap_render(wrap_wrapLine(line, columns, opts)))
     .join("\n");
 }
-
 
 /* ----------------------------------------------------------------
  * Bun.YAML.parse  [IMPLEMENTED, for a measured subset]
