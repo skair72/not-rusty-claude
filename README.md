@@ -147,35 +147,37 @@ Measured 2026-08-25, Bun 1.3.14 against Node 24.0.0 and 26.7.0: `--version`,
 exit codes**; `doctor` differs in one line, the `Path:` naming the interpreter
 actually running. Where the shim cannot match Bun (`spawn`, `file`, `SQL`, …)
 it throws naming the API rather than guessing. Detail:
-[`docs/findings.md`](docs/findings.md) §11.
+[`docs/findings.md`](docs/findings.md) §11, whose "command surface only" line predates
+the interactive runs described next.
 
-The **interactive TUI works too** ✅ — driven through a pty here on 2026-08-26 under
-Node 24.19.0 it painted the welcome banner, took a keystroke at the theme picker,
-rendered the syntax preview and reached the login selector, all of it responsive.
-Two honest limits, and the second is sharper than it looks: it was **Linux**, and every
-run used a scratch `CLAUDE_CONFIG_DIR`, so what was exercised is **onboarding** — banner,
-pickers, login selector. The **authenticated REPL has never been rendered under Node on
-any platform**; an attempt with a fake key against the loopback mock stops at the login
-selector under Node *and* under Bun. Onboarding working is not the REPL working.
-The **authenticated REPL** was a different story, and finding out why took a day. On an
-Apple Silicon Mac it painted nothing, ignored Ctrl-C, and looked idle rather than stuck —
-while the same machine, binary and Node rendered onboarding perfectly with a scratch
-`CLAUDE_CONFIG_DIR`. Seven explanations were raised and killed by evidence (native
-addons, `Bun.Terminal`, a fullscreen renderer, a keychain freeze, MCP servers, a missing
-`ripgrep`, an eight-version bundle gap) before `scripts/node-trace.cjs` watched the
-object the shim installs and named it in one line: the REPL calls **`Bun.YAML.parse`**
-and **`Bun.wrapAnsi`**, the shim refused both, and a React error boundary swallowed
-every throw. Refusing loudly only helps if something can hear it.
+The **interactive TUI works too**. Onboarding ✅ was driven through a pty here on
+2026-08-26 under Node 24.19.0 — welcome banner, a keystroke at the theme picker, syntax
+preview, login selector, all responsive. The **authenticated REPL** 🍎 was confirmed on
+Apple Silicon with the reporter's own `~/.claude`, same date. Those are different code
+paths and different machines, which is the whole story below.
 
-Both are implemented now, each verified against Bun as oracle rather than written from
-memory — `wrapAnsi` byte-equal over 2,800 cases, `YAML.parse` matching on 138 of 150 and
-refusing the other 12 by name. ✅ **Confirmed on the machine that reported it**: Apple
-Silicon, Node 24.19.0, the reporter's own authenticated `~/.claude`, 2026-08-26 — the
-same command that painted nothing now runs the REPL. One limit stands: frontmatter using
-an anchor, a tag, a complex key or multiple documents still refuses, by name rather than
-by silent misparse. If a TUI will not paint, `scripts/node-trace.cjs` prints `THREW`
-with the API and the reason ([`docs/runbook.md`](docs/runbook.md) § Diagnosing a Node
-hang).
+Finding out why the REPL would not paint took a day. On that Mac it drew nothing,
+ignored Ctrl-C and looked idle rather than stuck, while the same machine and binary
+rendered onboarding perfectly with a scratch `CLAUDE_CONFIG_DIR`. Seven explanations
+were raised and killed by evidence — native addons, `Bun.Terminal`, a fullscreen
+renderer, a keychain freeze, MCP servers, a missing `ripgrep`, an eight-version bundle
+gap — before `scripts/node-trace.cjs` watched the object the shim installs and named it
+in one line: the REPL calls **`Bun.YAML.parse`** and **`Bun.wrapAnsi`**, the shim refused
+both, and a React error boundary swallowed every throw. Refusing loudly only helps if
+something can hear it.
+
+Both are implemented now, measured against Bun as oracle rather than written from memory
+— `wrapAnsi` byte-equal over 4,000 cases, `YAML.parse` matching on 141 of 178 and
+refusing 18 by name, with **zero** inputs accepted and parsed differently. A first
+version of both passed a smaller corpus and still carried thirteen real defects, found
+by review: the corpora were extended until they covered the shapes that had hidden them
+(multi-parameter SGR, `#` after an apostrophe, top-level flow collections).
+
+⚠️ **Still refused**, by name rather than by silent misparse: frontmatter using an
+anchor, a tag, a complex key, several documents, tab indentation, an explicit block
+scalar indent or an over-indented sequence entry. If a TUI will not paint,
+`scripts/node-trace.cjs` prints `THREW` with the API and the reason
+([`docs/runbook.md`](docs/runbook.md) § Diagnosing a Node hang).
 
 ## macOS
 

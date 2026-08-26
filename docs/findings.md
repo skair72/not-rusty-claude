@@ -1139,8 +1139,12 @@ the `globalThis.Bun.which` it misses). The shim covers **25** names — the extr
 `Bun.stdin`, occurs only in a doc string. It implements **seven** —
 `stringWidth`, `stripANSI`, `hash`, `which`, `semver.order`, `deepEquals`, `gc`
 — each pinned by a differential test against Bun in
-`tests/test_node_runtime.py`. Eleven throw, naming the API (`YAML`, `spawn`,
-`file`, `serve`, …); **seven** stay deliberately *undefined* (`Terminal`,
+`tests/test_node_runtime.py`. Two more arrived on 2026-08-26, `wrapAnsi` and
+`YAML.parse`, because the interactive REPL calls both and a refusal there was
+being swallowed by a React error boundary: nine implemented, with their own
+corpora in `tests/test_wrap_ansi.py` and `tests/test_yaml_parse.py`. Nine
+throw, naming the API (`spawn`, `file`, `serve`, …), and `YAML.parse` still
+refuses the constructs it could not match; **seven** stay deliberately *undefined* (`Terminal`,
 `WebView`, `JSONL`, `version`, `isStandaloneExecutable`, `stdin`) because the
 bundle feature-detects them — a plausible-looking stub is the §10 failure mode
 — and `Bun.ant`, for the opposite reason: it is not feature-detected, it is
@@ -1155,8 +1159,11 @@ claimed a surface the oracle lacks; all three call sites are bare
 `--version` (22 B), `--help` (16,890 B), `mcp list` (65 B) and `config ls`
 (35 B, exit 1 both) give byte-identical stdout and equal exit codes; `doctor`
 (973 B) differs in one line, `Path:`, naming the interpreter actually running.
-⚠️ **No agentic or interactive session has ever been run under Node**, here or
-anywhere — this is the command surface only.
+⚠️ **No agentic session — a real conversation with tool use — has ever been run
+under Node**, here or anywhere. The *interactive* path has, as of 2026-08-26:
+onboarding through a pty on Linux, and the authenticated REPL on Apple Silicon
+with a real config. Getting there is what `wrapAnsi` and `YAML.parse` were
+implemented for.
 
 ---
 

@@ -89,11 +89,14 @@
  * doctor matches except for its "Path:" line, which correctly names the
  * interpreter actually running.
  *
- * What is NOT: the interactive and agentic paths have never been run under
- * Node. wrapAnsi, which the renderer cannot do without, is implemented and
- * verified against Bun; YAML.parse is the next THROWS entry an interactive
- * run reaches; it is implemented for the subset frontmatter uses and
- * refuses anchors, tags, complex keys and multi-document input by name.
+ * What is NOT: the agentic path - a real conversation with tool use - has
+ * never been run under Node. The interactive path has: onboarding on Linux and
+ * the authenticated REPL on Apple Silicon, both 2026-08-26. Getting there
+ * needed wrapAnsi and YAML.parse, which the renderer and the skill loader
+ * cannot do without; both are implemented here and measured against Bun.
+ * YAML.parse still refuses anchors, tags, complex keys, multi-document input,
+ * tab indentation, explicit block scalar indents and over-indented sequence
+ * entries - by name, never by guessing.
  */
 
 const fs = require("node:fs");
@@ -970,20 +973,29 @@ function applyEscape(state, text) {
     // OSC 8 hyperlink: the closing form carries an empty URI.
     const body = text.slice(4);
     const uri = body.split(";").slice(1).join(";").replace(/(\u0007|\u001b\\)$/, "");
-    state.link = uri ? text : null;
+    state.link = uri ? WRAP_ESC + "]8;;" + uri + "\u0007" : null;
     return;
   }
   if (!text.startsWith(WRAP_ESC + "[") || !text.endsWith("m")) return;
 
-  // Measured, not assumed: Bun carries ONE code across a row break - the last
-  // it saw - and re-emits it verbatim at the head of every following row. That
-  // includes a closing code: after \e[22m the rows that follow open with
-  // \e[22m, which a set-of-active-codes model gets wrong.
-  for (const part of text.slice(2, -1).split(";")) {
-    const n = Number(part === "" ? 0 : part);
-    if (Number.isNaN(n)) continue;
-    state.code = (n === 0 || n === 39) ? undefined : n;
+  // Measured: Bun carries ONE code across a row break - the last SINGLE
+  // parameter it saw - and re-emits it at the head of every following row.
+  // That includes a closing code: after a lone 22 the rows that follow open
+  // with 22, which a set-of-active-codes model gets wrong.
+  //
+  // A MULTI-parameter sequence carries nothing at all. 256-colour, truecolor
+  // and combined codes are all multi-parameter and all ordinary in a themed
+  // TUI, and Bun leaves the rows after one of them bare. Taking the last
+  // parameter instead - as this did until it was measured properly - emitted
+  // an SGR code that does not exist: 38;5;208 became a carry of 208.
+  const params = text.slice(2, -1).split(";");
+  if (params.length > 1) {
+    state.code = undefined;
+    return;
   }
+  const n = Number(params[0] === "" ? 0 : params[0]);
+  if (Number.isNaN(n)) return;
+  state.code = (n === 0 || n === 39) ? undefined : n;
 }
 
 function openers(state) {
@@ -996,7 +1008,7 @@ function closers(state) {
     const c = closerFor(state.code);
     if (c !== null && c !== state.code) out += WRAP_ESC + "[" + c + "m";
   }
-  if (state.link) out += WRAP_ESC + "]8;;" + WRAP_ESC + "\\";
+  if (state.link) out += WRAP_ESC + "]8;;\u0007";
   return out;
 }
 
@@ -1015,9 +1027,17 @@ function trimStartTokens(tokens) {
 }
 
 function trimEndTokens(tokens) {
-  let i = tokens.length;
+  // Measured: "world <esc>[31m" trims to "world<esc>[31m" - the escape does not
+  // shelter the space before it. So step back over any trailing escapes first,
+  // trim the spaces behind them, then re-attach the escapes.
+  let end = tokens.length;
+  while (end > 0 && tokens[end - 1].ansi) end--;
+  const tail = tokens.slice(end);
+  let i = end;
   while (i > 0 && !tokens[i - 1].ansi && tokens[i - 1].text === " ") i--;
-  return tokens.slice(0, i).concat(tokens.slice(i).filter((t) => t.ansi));
+  return tokens.slice(0, i)
+    .concat(tokens.slice(i, end).filter((t) => t.ansi))
+    .concat(tail);
 }
 
 function wrapLine(line, columns, opts) {
@@ -1104,7 +1124,11 @@ function hardWrapWord(rows, word, columns) {
       if (t.text.startsWith(WRAP_ESC + "]8;")) {
         const uri = t.text.slice(4).split(";").slice(1).join(";")
           .replace(/(\u0007|\u001b\\)$/, "");
-        inLink = uri !== "";
+        // Only an ST-terminated opener makes the run unbreakable. Measured at
+        // width 1: a BEL-terminated link breaks per character like ordinary
+        // text. The earlier rule was generalised from the ST form alone -
+        // which was the only hyperlink the corpus contained.
+        inLink = uri !== "" && t.text.endsWith(WRAP_ESC + "\\");
       }
       pending.push(t);
       continue;
@@ -1134,14 +1158,18 @@ function hardWrapWord(rows, word, columns) {
 function render(rows) {
   const state = { code: undefined, link: null };
   const out = [];
-  for (const row of rows) {
+  for (let r = 0; r < rows.length; r++) {
     const open = openers(state);
     let text = "";
-    for (const t of row) {
+    for (const t of rows[r]) {
       text += t.text;
       if (t.ansi) applyEscape(state, t.text);
     }
-    out.push(open + text + closers(state));
+    // No closer on the last row. Closers exist to stop colour bleeding ACROSS
+    // a break, and after the final row there is no break to bleed across, so
+    // Bun leaves an unclosed colour unclosed rather than tidying up after the
+    // caller.
+    out.push(open + text + (r === rows.length - 1 ? "" : closers(state)));
   }
   return out.join("\n");
 }
@@ -1154,7 +1182,9 @@ function wrapAnsi(string, columns, options) {
   // site guards with `if(!(t>0))return e` - but matching costs one line.
   if (!(columns > 0)) return s;
   if (opts.trim !== false && s.trim() === "") return "";
-  return s.replace(/\r\n/g, "\n").split("\n")
+  // A lone carriage return breaks the line exactly as \r\n does - measured,
+  // "ab\rcd" wraps to "ab\ncd" rather than keeping the CR inside the word.
+  return s.replace(/\r\n?/g, "\n").split("\n")
     .map((line) => wrapLine(line, columns, opts))
     .join("\n");
 }
@@ -1202,9 +1232,13 @@ const yaml_refuse = (why) => unsupported("YAML.parse", why);
 const yaml_NULLS = /^(null|Null|NULL|~)$/;
 const yaml_TRUES = /^(true|True|TRUE)$/;
 const yaml_FALSES = /^(false|False|FALSE)$/;
-// Measured: Bun answers null for .inf/.nan in every case, rather than
-// Infinity/NaN. Matching that is the whole point of having an oracle.
-const yaml_INF_NAN = /^[+-]?\.(inf|nan)$/i;
+// Bun answers Infinity/-Infinity/NaN here. An earlier version of this file
+// claimed it answered null "measured" - it did not: the probe compared two
+// JSON.stringify outputs, and JSON.stringify maps Infinity and NaN to null, so
+// the channel destroyed the value before the comparison saw it. The corpus
+// probe now encodes types explicitly for exactly this reason.
+const yaml_INF = /^[+-]?\.inf$/i;
+const yaml_NAN = /^[+-]?\.nan$/i;
 const yaml_HEX = /^[+-]?0x[0-9a-fA-F]+$/;
 const yaml_OCTAL = /^[+-]?0o[0-7]+$/;
 const yaml_INTEGER = /^[+-]?[0-9]+$/;
@@ -1219,12 +1253,14 @@ function yaml_typeScalar(text) {
   if (yaml_NULLS.test(text)) return null;
   if (yaml_TRUES.test(text)) return true;
   if (yaml_FALSES.test(text)) return false;
-  if (yaml_INF_NAN.test(text)) return null;
-  if (yaml_HEX.test(text)) return parseInt(text.replace("0x", ""), 16) * (text[0] === "-" ? -1 : 1);
-  if (yaml_OCTAL.test(text)) return parseInt(text.replace("0o", ""), 8) * (text[0] === "-" ? -1 : 1);
+  if (yaml_INF.test(text)) return text[0] === "-" ? -Infinity : Infinity;
+  if (yaml_NAN.test(text)) return NaN;
+  // parseInt keeps the leading sign once "0x"/"0o" is removed, so the sign must
+  // NOT be applied a second time: "-0x10" -> "-10" -> parseInt(...,16) is -16.
+  if (yaml_HEX.test(text)) return parseInt(text.replace("0x", ""), 16);
+  if (yaml_OCTAL.test(text)) return parseInt(text.replace("0o", ""), 8);
   if (yaml_INTEGER.test(text) || yaml_FLOAT_SIGNED.test(text) || yaml_FLOAT_BARE.test(text) || yaml_EXPONENT.test(text)) {
-    const n = Number(text);
-    return Object.is(n, -0) ? 0 : n; // measured: -0 comes back as 0
+    return Number(text); // -0 stays -0: measured with Object.is, not JSON
   }
   return text;
 }
@@ -1290,14 +1326,23 @@ function yaml_parseFlow(s, i) {
 
     let value;
     let key = null;
+    let hasValue = true;
     if (!isSeq) {
+      // Bun stringifies a collection used as a key ("[object Object]", "1").
+      // That is a shape worth refusing rather than reproducing.
+      if (s[j] === "[" || s[j] === "{") yaml_refuse("a flow collection used as a key");
       [key, j] = yaml_readFlowScalarOrNested(s, j);
       while (j < s.length && /\s/.test(s[j])) j++;
-      if (s[j] !== ":") yaml_refuse("a flow mapping entry without a colon");
-      j++;
-      while (j < s.length && /\s/.test(s[j])) j++;
+      if (s[j] === ":") {
+        j++;
+        while (j < s.length && /\s/.test(s[j])) j++;
+      } else {
+        // No colon means the whole entry was the key, and its value is null.
+        hasValue = false;
+        value = null;
+      }
     }
-    [value, j] = yaml_readFlowScalarOrNested(s, j);
+    if (hasValue) [value, j] = yaml_readFlowScalarOrNested(s, j);
     if (isSeq) items.push(value);
     else items[String(key)] = value;
 
@@ -1315,7 +1360,17 @@ function yaml_readFlowScalarOrNested(s, j) {
     return [text, next];
   }
   let end = j;
-  while (end < s.length && !",:]}".includes(s[end])) end++;
+  while (end < s.length) {
+    const ch = s[end];
+    if (ch === "," || ch === "]" || ch === "}") break;
+    // In flow context a colon only ends a plain scalar when a space or a
+    // terminator follows it. Measured: `{a:1}` is the single key "a:1" with a
+    // null value, while `{a: 1}` is the mapping a -> 1, and `{a: b:c}` has the
+    // value "b:c". Breaking on every colon merged those three into one wrong
+    // shape.
+    if (ch === ":" && (end + 1 >= s.length || /[\s,\]}]/.test(s[end + 1]))) break;
+    end++;
+  }
   const raw = s.slice(j, end).trim();
   if (raw === "") yaml_refuse("an empty flow entry");
   return [yaml_typeScalar(raw), end];
@@ -1325,6 +1380,11 @@ function yaml_readFlowScalarOrNested(s, j) {
 
 function yaml_stripComment(line) {
   let inQuote = null;
+  // A quote only opens a quoted scalar where a value or key may begin: at the
+  // start of the line, or after ": " or "- ". Anywhere else - the apostrophe in
+  // "Don't" - it is an ordinary character. Treating every quote as an opener
+  // silently swallowed the rest of the line, comment included, into the value.
+  let canOpen = true;
   for (let i = 0; i < line.length; i++) {
     const ch = line[i];
     if (inQuote) {
@@ -1334,7 +1394,10 @@ function yaml_stripComment(line) {
       } else if (inQuote === '"' && ch === "\\") i++;
       continue;
     }
-    if (ch === '"' || ch === "'") { inQuote = ch; continue; }
+    if ((ch === '"' || ch === "'") && canOpen) { inQuote = ch; continue; }
+    if (!/\s/.test(ch)) {
+      canOpen = ch === ":" || ch === "-";
+    }
     // Measured: `a#b` keeps the hash, `a #b` does not. A comment needs
     // whitespace before it, or the start of the line.
     if (ch === "#" && (i === 0 || /\s/.test(line[i - 1]))) return line.slice(0, i);
@@ -1375,6 +1438,15 @@ function yaml_parseKey(content) {
     key = m[3].trim();
     if (key === "") return null;
     if (key.includes(": ")) yaml_refuse("a plain key containing ': '");
+    // `{a` and `[a` are not keys - they are the start of a flow collection
+    // that happens to contain a colon. Treating them as plain keys turned
+    // `{a: 1}` into {"{a": "1}"}, which is a wrong answer rather than a
+    // refusal. The caller handles the flow case; this just declines to claim
+    // the text is a mapping key.
+    if (/^[{[]/.test(key)) return null;
+    // A quote that opens but never closes is a parse error in Bun, and a key
+    // with a quoted section followed by bare text is too.
+    if (/^["']/.test(key)) yaml_refuse("a key that starts with a quote but is not a quoted scalar");
   }
   return { key: String(key), rest: content.slice(m[0].length - (m[4] === "\n" ? 1 : m[4].length)).trim(), consumed: m[0].length };
 }
@@ -1388,7 +1460,14 @@ function yaml_readBlockScalar(lines, start, header, parentIndent) {
     if (ch === "-") chomp = "strip";
     else if (ch === "+") chomp = "keep";
     else if (/[1-9]/.test(ch)) yaml_refuse("an explicit block scalar indent indicator");
-    else if (/\s/.test(ch)) break;
+    else if (/\s/.test(ch)) {
+      // Bun rejects `| junk`; silently ignoring the junk produced a value for
+      // a document Bun refuses to parse at all.
+      if (rest.slice(rest.indexOf(ch)).trim() !== "") {
+        yaml_refuse("trailing text after a block scalar header");
+      }
+      break;
+    }
     else yaml_refuse("an unsupported block scalar header '" + header + "'");
   }
 
@@ -1407,17 +1486,28 @@ function yaml_readBlockScalar(lines, start, header, parentIndent) {
   }
   let trailingBlanks = 0;
   while (body.length && body[body.length - 1] === "") { body.pop(); trailingBlanks++; }
+  // An empty block scalar is a parse error in Bun, not an empty string.
+  if (body.length === 0) yaml_refuse("a block scalar with no body");
 
   let text;
   if (style === "|") {
     text = body.join("\n");
     if (body.length) text += "\n";
   } else {
+    // A line indented further than the block's base indent is NOT folded - it
+    // keeps its own line and its extra indent. Folding it produced a different
+    // string from Bun's while still accepting the input.
     const folded = [];
+    let previousWasLiteral = false;
     for (const line of body) {
-      if (line === "") { folded.push("\n"); continue; }
-      if (folded.length && folded[folded.length - 1] !== "\n") folded.push(" ");
+      if (line === "") { folded.push("\n"); previousWasLiteral = false; continue; }
+      const literal = /^\s/.test(line);
+      if (folded.length) {
+        if (literal || previousWasLiteral) folded.push("\n");
+        else if (folded[folded.length - 1] !== "\n") folded.push(" ");
+      }
       folded.push(line);
+      previousWasLiteral = literal;
     }
     text = folded.join("");
     if (body.length) text += "\n";
@@ -1506,6 +1596,8 @@ function yaml_scalarValue(text, lines, i, indent) {
   }
   if (yaml_RESERVED_START.test(text)) yaml_refuse("a scalar starting with a reserved indicator");
   if (text === "-" || text.endsWith(":")) yaml_refuse("an ambiguous plain scalar");
+  // `a: - item` is a parse error in Bun, not the string "- item".
+  if (text.startsWith("- ")) yaml_refuse("a sequence entry on the same line as its key");
   if (text.startsWith("&") || text.startsWith("*")) yaml_refuse("anchors and aliases");
   if (text.startsWith("!")) yaml_refuse("tags");
   // Measured: Bun rejects a plain scalar containing ": ". `12:30` is fine,
@@ -1573,7 +1665,12 @@ function yamlParse(input) {
   const markers = lines.filter((l) => l.trim() === "---" || l.trim().startsWith("--- ")).length;
   if (markers > 1) yaml_refuse("multiple documents in one string");
   if (lines.length && (lines[0].trim() === "---" || lines[0].trim().startsWith("--- "))) {
-    lines = lines.slice(1);
+    // Content may sit on the marker line itself: `--- scalar` is a document
+    // whose value is "scalar", not an empty one. Dropping the whole line
+    // returned null for a document that has content, which is config silently
+    // missing rather than config loudly refused.
+    const inline = lines[0].trim().slice(3).trim();
+    lines = inline === "" ? lines.slice(1) : [inline].concat(lines.slice(1));
   }
 
   const meaningful = lines.filter((l) => !yaml_isBlank(l) && yaml_stripComment(l).trim() !== "");
@@ -1581,6 +1678,19 @@ function yamlParse(input) {
 
   const firstContent = yaml_stripComment(meaningful[0]).trim();
   yaml_checkUnsupportedMarkers(firstContent);
+
+  // A whole document can be one flow collection. It has to be handled before
+  // the mapping path, because `{a: 1}` looks like a key to a line-oriented
+  // reader. Only the single-line form is accepted: a flow spanning lines was
+  // not measured, so it refuses rather than guesses.
+  if (/^[{[]/.test(firstContent)) {
+    if (meaningful.length > 1) yaml_refuse("a flow collection spanning several lines");
+    const [value, end] = yaml_parseFlow(firstContent, 0);
+    if (firstContent.slice(end).trim() !== "") {
+      yaml_refuse("trailing content after a flow collection");
+    }
+    return value;
+  }
   if (!yaml_parseKey(firstContent) && !(firstContent === "-" || firstContent.startsWith("- "))) {
     // A bare top-level scalar.
     if (meaningful.length > 1) yaml_refuse("a bare scalar followed by more content");

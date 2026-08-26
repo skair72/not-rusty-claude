@@ -56,18 +56,34 @@ def answers(bun_bin, node_bin):
     }
 
 
-def test_the_corpus_is_not_quietly_empty(corpus):
-    """A differential over zero cases passes and proves nothing."""
-    import re
-    listed = re.search(r"const cases = \[\];(.*)module\.exports", corpus, re.S)
-    assert listed, "the corpus no longer builds a case list"
-    assert "for (let s = 0" in corpus and "for (let w = 0" in corpus, (
-        "the corpus stopped enumerating combinations")
+def test_the_corpus_is_not_quietly_empty(node_bin):
+    """A differential over zero cases passes and proves nothing.
+
+    This asks the corpus how many cases it actually builds, rather than
+    grepping its source for the shape of a loop - review showed the grep
+    version stayed green with `strings = []`, which is exactly the state it
+    claimed to rule out.
+    """
+    proc = subprocess.run(
+        [node_bin, "-e",
+         "const c = require('./wrap_ansi_corpus.cjs');"
+         "process.stdout.write(JSON.stringify("
+         "[c.strings.length, c.widths.length, c.optionSets.length, c.cases.length]))"],
+        capture_output=True, timeout=60, cwd=str(ROOT / "tests"))
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+    strings, widths, options, cases = json.loads(proc.stdout.decode())
+
+    assert strings >= 28 and widths >= 10 and options >= 10, (
+        f"a corpus dimension shrank: {strings} strings x {widths} widths x "
+        f"{options} option sets")
+    assert cases == strings * widths * options, (
+        f"{cases} cases from {strings}x{widths}x{options} - the enumeration "
+        "no longer covers every combination")
 
 
 def test_wrap_ansi_matches_bun_on_every_case(answers):
     bun, node = answers["bun"], answers["node"]
-    assert len(bun) == len(node) == 2800, (
+    assert len(bun) == len(node) == 4000, (
         f"corpus size changed: {len(bun)} under Bun, {len(node)} under Node")
 
     mismatches = [i for i, (b, n) in enumerate(zip(bun, node)) if b != n]

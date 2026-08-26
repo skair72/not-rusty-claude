@@ -248,9 +248,10 @@ runs the artifact under `node --require scripts/bun-shim.cjs`; the command surfa
 byte-identical to Bun ([findings.md](./findings.md) §11). The **interactive TUI also
 works** — driven through a pty here on 2026-08-26 it painted the banner, took a
 keystroke at the theme picker, rendered the syntax preview and reached the login
-selector. That was on **Linux**, and with a scratch config dir — so it is **onboarding**
-that is verified, not the authenticated REPL, which has never been rendered under Node. On macOS it paints nothing at all; see the
-troubleshooting row below, which ships the instrument that will say why.
+selector — that part on **Linux**, with a scratch config dir. The **authenticated
+REPL** works too, once `Bun.wrapAnsi` and `Bun.YAML.parse` were implemented: confirmed
+2026-08-26 on Apple Silicon with a real authenticated config, which is where it had
+been failing. The troubleshooting row below records what it was.
 
 **Run it by full path.** Do not create a `claude` shim on `PATH`; it would shadow
 your real installation, and every command in this repo is written to be run by

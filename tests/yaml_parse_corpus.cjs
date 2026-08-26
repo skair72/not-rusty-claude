@@ -7,7 +7,7 @@
 // whatever Bun says, captured at test time, so a Bun release that changes the
 // parse moves both sides at once.
 
-module.exports = [
+module.exports =[
   "name: foo",
   "name: foo\ndescription: does a thing",
   "name: foo\n\ndescription: blank line between",
@@ -115,7 +115,7 @@ module.exports = [
   "s:    spaced   value   ",
   "s: trailing   ",
   "s: \\u00e9clair",
-  "s: 日本語",
+  "s: \u65e5\u672c\u8a9e",
   "s: emoji_here",
   "\"quoted key\": 1",
   "'single key': 1",
@@ -157,5 +157,33 @@ module.exports = [
   "&a x",
   "a: &x {b: 1}\nc: *x",
   "<<: *base\na: 1",
-  "? [a, b]\n: c"
+  "? [a, b]\n: c",
+  "description: Don't use this # deprecated",
+  "s: a\"b # c",
+  "title: It's fine",
+  "n: -0x10",
+  "n: -0o17",
+  "n: +0x10",
+  "--- scalar",
+  "--- [1, 2]",
+  "--- |\n  text",
+  "{a: 1}",
+  "[a: 1]",
+  "{a: 1,\nb: 2}",
+  "{a:1}",
+  "[1, 2]",
+  "s: >\n  a\n    more\n  b",
+  "s: >\n  a\n  b\n    deeper",
+  "\"a: 1",
+  "\"a\" x: 1",
+  "s: | junk\n  body",
+  "s: > junk\n  body",
+  "a: - item",
+  "s: >\nnext: 1",
+  "s: |\nnext: 1",
+  "{[1]: x}",
+  "{x}: 1",
+  "[]: 1",
+  "s: 38;5;208",
+  "key: a:b"
 ];

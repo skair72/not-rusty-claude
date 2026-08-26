@@ -29,8 +29,8 @@ SHIM = ROOT / "scripts" / "bun-shim.cjs"
 # Every api the shim refuses that the bundle also mentions, measured against
 # linux-x64 2.1.231 on 2026-08-26. It is the whole refusal list: the bundle
 # mentions all of them somewhere. That is the honest limit of a static
-# cross-reference - it narrows to fifteen candidates, it does not name one.
-# Its value is drift: a new Claude version that reaches for a sixteenth, or an
+# cross-reference - it narrows to fourteen candidates, it does not name one.
+# Its value is drift: a new Claude version that reaches for a fifteenth, or an
 # api implemented here, both change this set and force a look.
 KNOWN_REFUSED_AND_REFERENCED = {
     "SQL", "TOML.parse", "Transpiler", "YAML.parse", "YAML.stringify",

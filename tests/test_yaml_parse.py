@@ -28,22 +28,33 @@ CORPUS = ROOT / "tests" / "yaml_parse_corpus.cjs"
 
 TIMEOUT = 120
 
-# Measured 2026-08-26 against Bun 1.3.14. Each of these is something Bun parses
-# and the shim declines, because matching it exactly could not be verified.
-# Shrink this list by implementing one - never by loosening a check.
+# Measured 2026-08-26 against Bun 1.3.14, and regenerated from a live run
+# rather than edited by hand. Each entry is something Bun parses and the shim
+# declines, because matching it exactly could not be verified.
+#
+# The list grew when review found the first version of this parser ACCEPTING
+# six of these and answering differently from Bun - the one failure mode the
+# contract forbids. Shrink it by implementing an entry, never by loosening a
+# check.
 PINNED_REFUSALS = {
-    "---\na: 1\n---\nb: 2",          # more than one document in a string
-    "a: &anchor 1\nb: *anchor",      # anchors and aliases
-    "a: &x {b: 1}\nc: *x",           # anchors and aliases
-    "&a x",                          # anchors and aliases
-    "a: !!str 1",                    # tags
-    "a: !!int '3'",                  # tags
-    "a: !custom 1",                  # tags
-    "? complex\n: key",              # explicit complex keys
-    "? [a, b]\n: c",                 # explicit complex keys
-    "a: 1\n\tb: 2",                  # a tab used for indentation
-    "a:\n- 1\n  - 2",                # an over-indented sequence entry
-    "s: |2\n   explicit indent",     # explicit block scalar indent indicator
+    "---\na: 1\n---\nb: 2",
+    "a: &anchor 1\nb: *anchor",
+    "a: !!str 1",
+    "? complex\n: key",
+    "a: 1\n\tb: 2",
+    "a:\n- 1\n  - 2",
+    "s: |2\n   explicit indent",
+    "a: !custom 1",
+    "a: !!int '3'",
+    "&a x",
+    "a: &x {b: 1}\nc: *x",
+    "? [a, b]\n: c",
+    "--- |\n  text",
+    "[a: 1]",
+    "{a: 1,\nb: 2}",
+    "{[1]: x}",
+    "{x}: 1",
+    "[]: 1",
 }
 
 
@@ -62,7 +73,7 @@ def cases():
     text = CORPUS.read_text()
     body = text[text.index("module.exports =") + len("module.exports ="):].rstrip().rstrip(";")
     parsed = json.loads(body)
-    assert len(parsed) >= 150, f"corpus shrank to {len(parsed)} cases"
+    assert len(parsed) >= 178, f"corpus shrank to {len(parsed)} cases"
     return parsed
 
 

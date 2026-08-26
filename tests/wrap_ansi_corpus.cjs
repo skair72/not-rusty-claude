@@ -29,6 +29,27 @@ const strings = [
   "café combining",
   RED + BOLD + "nested codes here" + NB + OFF,
   "word " + RED + "mid" + OFF + "dle break",
+
+  // Added 2026-08-26 after review. The corpus had no multi-parameter SGR at
+  // all - no 256-colour, no truecolor, no combined codes, no background, no
+  // reset - and behind that gap sat a real defect: the carry model kept the
+  // LAST parameter and re-synthesised it, turning 38;5;208 into a carry of
+  // \u001b[208m, an SGR code that does not exist. A themed TUI emits these
+  // constantly, so "byte-equal over 2,800 cases" was true and still missed the
+  // shapes that mattered most.
+  ESC + "[38;5;208m256 colour words wrapping here" + ESC + "[39m",
+  ESC + "[38;2;215;119;87mtruecolor words here" + ESC + "[39m",
+  ESC + "[48;5;20mbackground colour words" + ESC + "[49m",
+  ESC + "[1;31mcombined bold red words" + ESC + "[0m",
+  ESC + "[31mred words" + ESC + "[0m then plain text",
+  ESC + "[41maaa bbb ccc ddd eee",
+  ESC + "[31munclosed colour to the end",
+  "trailing escape then nothing " + ESC + "[31m",
+  ESC + "[4munderlined words here" + ESC + "[24m",
+  BOLD + "bold " + RED + "and red" + OFF + " tail" + NB,
+  // A BEL-terminated hyperlink: the other OSC 8 form, and the common one.
+  ESC + "]8;;https://x.example\u0007bel link" + ESC + "]8;;\u0007 after",
+  "a lone \r carriage return here",
 ];
 
 const widths = [0, 1, 2, 3, 4, 5, 6, 10, 20, 80];
