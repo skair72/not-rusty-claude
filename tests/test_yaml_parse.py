@@ -155,3 +155,43 @@ def test_the_frontmatter_shapes_the_bundle_uses_all_parse(answers, cases):
         assert "err" not in node, (
             f"a core frontmatter shape is refused: {src!r} -> {node['err']}")
         assert node["ok"] == answers["bun"][index[src]]["ok"]
+
+
+def test_a_long_sequence_of_mappings_parses_in_linear_time(node_bin, tmp_path):
+    """Complexity, not speed.
+
+    An earlier version copied the whole line array once per sequence entry,
+    which made a block sequence of mappings quadratic: 40k entries took seven
+    seconds where Bun takes twenty milliseconds. Frontmatter is tens of lines,
+    so nothing user-facing was at risk - but a parser that degrades as the
+    square of its input is a defect waiting for a bigger document.
+
+    Timing is noisy on a shared host, so this asserts the SHAPE of the growth
+    with a generous ceiling rather than any absolute duration: doubling the
+    input must not triple the time. Quadratic growth is 4x per doubling and
+    fails this comfortably; the linear implementation measured ~2x.
+    """
+    script = tmp_path / "perf.cjs"
+    script.write_text(
+        "const parse = globalThis.Bun.YAML.parse;\n"
+        "const timed = (n) => {\n"
+        "  const doc = Array.from({length: n}, (_, i) => `- a: ${i}\\n  b: x`).join('\\n');\n"
+        "  const t0 = process.hrtime.bigint();\n"
+        "  const out = parse(doc);\n"
+        "  if (out.length !== n) throw new Error('parsed ' + out.length + ' of ' + n);\n"
+        "  return Number(process.hrtime.bigint() - t0) / 1e6;\n"
+        "};\n"
+        "timed(2000);\n"  # warm up, so JIT does not skew the first measurement
+        "process.stdout.write(JSON.stringify([timed(10000), timed(20000)]));\n")
+
+    proc = subprocess.run([node_bin, "--require", str(SHIM), str(script)],
+                          capture_output=True, timeout=TIMEOUT)
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+    small, large = json.loads(proc.stdout.decode())
+
+    # Guard against a degenerate measurement making the ratio meaningless.
+    assert small > 1.0, f"the 10k-entry parse took {small:.1f}ms - too fast to compare"
+    assert large / small < 3.0, (
+        f"doubling the input multiplied the time by {large / small:.1f} "
+        f"({small:.0f}ms -> {large:.0f}ms). Linear growth is ~2x; quadratic is "
+        "~4x, which is what a per-entry copy of the line array produces.")

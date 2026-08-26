@@ -990,7 +990,11 @@ function applyEscape(state, text) {
   // an SGR code that does not exist: 38;5;208 became a carry of 208.
   const params = text.slice(2, -1).split(";");
   if (params.length > 1) {
-    state.code = undefined;
+    // A multi-parameter sequence contributes nothing AND clears nothing: after
+    // \u001b[4m\u001b[1;31m the rows still re-open with 4m. Measured - an
+    // earlier version cleared the carry here, which lost the underline. The
+    // sequence itself stays in the text either way; this is only about what is
+    // re-emitted at the head of the next row.
     return;
   }
   const n = Number(params[0] === "" ? 0 : params[0]);
@@ -1136,6 +1140,35 @@ function hardWrapWord(rows, word, columns) {
     if (inLink) {
       flushInto(rows[rows.length - 1]);
       rows[rows.length - 1].push(t);
+      continue;
+    }
+
+    // A cluster wider than the whole budget is split into its code points.
+    // Measured: at width 1 the ZWJ family emoji becomes one row per member
+    // with the joiners on their own rows, and a combining mark separates from
+    // its base. Keeping clusters whole - which reads like the careful choice -
+    // is what Bun does NOT do here.
+    if (t.w > columns && [...t.text].length > 1) {
+      // Zero-width code points attach to the code point that FOLLOWS them, not
+      // the one before: measured, "e" + combining acute at width 1 breaks as
+      // "e" then the mark joined to the next character, and a ZWJ emoji family
+      // at width 2 puts each joiner at the head of the row with its member.
+      const pieces = [];
+      let pending = "";
+      for (const cp of t.text) {
+        pending += cp;
+        if (stringWidth(cp) > 0) { pieces.push(pending); pending = ""; }
+      }
+      if (pending !== "") pieces.push(pending);
+
+      for (const text of pieces) {
+        const piece = { ansi: false, text, w: stringWidth(text) };
+        let taken = rowWidth(rows[rows.length - 1]);
+        if (taken === columns) { rows.push([]); taken = 0; }
+        if (taken + piece.w > columns) rows.push([]);
+        flushInto(rows[rows.length - 1]);
+        rows[rows.length - 1].push(piece);
+      }
       continue;
     }
 
@@ -1555,26 +1588,33 @@ function yaml_parseSequence(lines, start, indent) {
       i = next;
       continue;
     }
-    // `- - 1` opens a nested sequence, indented to line up after the dash.
-    if (inline === "-" || inline.startsWith("- ")) {
-      const rebuilt = lines.slice();
-      rebuilt[i] = " ".repeat(childIndent) + inline;
-      const [child, next] = yaml_parseSequence(rebuilt, i, childIndent);
-      out.push(child);
-      i = next;
-      continue;
-    }
-
-    const key = yaml_parseKey(inline);
-    if (key) {
-      // `- a: 1` starts a mapping whose remaining keys are indented to line up
-      // with the text after the dash.
-      const rebuilt = lines.slice();
-      rebuilt[i] = " ".repeat(childIndent) + inline;
-      const [child, next] = yaml_parseMapping(rebuilt, i, childIndent);
-      out.push(child);
-      i = next;
-      continue;
+    // A sequence entry's content is re-read as if it were indented to line up
+    // after the dash. That needs one line rewritten, not a copy of the whole
+    // document: an earlier version did `lines.slice()` per entry, which made a
+    // block sequence of mappings quadratic - 40k lines took 7s where Bun takes
+    // 21ms. The recursive call has fully returned by the time the original is
+    // put back, so nothing observes the temporary value.
+    const restoreIndex = i;
+    const restore = lines[restoreIndex];
+    lines[restoreIndex] = " ".repeat(childIndent) + inline;
+    try {
+      // `- - 1` opens a nested sequence, indented to line up after the dash.
+      if (inline === "-" || inline.startsWith("- ")) {
+        const [child, next] = yaml_parseSequence(lines, i, childIndent);
+        out.push(child);
+        i = next;
+        continue;
+      }
+      if (yaml_parseKey(inline)) {
+        // `- a: 1` starts a mapping whose remaining keys line up with the text
+        // after the dash.
+        const [child, next] = yaml_parseMapping(lines, i, childIndent);
+        out.push(child);
+        i = next;
+        continue;
+      }
+    } finally {
+      lines[restoreIndex] = restore;
     }
     out.push(yaml_scalarValue(inline, lines, i, indent)[0]);
     i++;

@@ -192,9 +192,17 @@ for (const name of ['spawn', 'exec', 'execFile']) {
         log('  child pid=' + pid + ' exited code=' + code +
             (signal ? ' signal=' + signal : '') + '  (' + short + ')');
       });
-      child.on('error', (err) => {
-        log('  child pid=' + pid + ' error ' + show(err && err.message, 120));
-      });
+      // Attaching an 'error' listener would make the emit "handled", so a
+      // spawn ENOENT that should crash the process would exit 0 in silence
+      // instead. Wrap emit to observe the event as it passes, and leave
+      // Node's own handled/unhandled bookkeeping untouched.
+      const originalEmit = child.emit;
+      child.emit = function (event, ...rest) {
+        if (event === 'error') {
+          log('  child pid=' + pid + ' error ' + show(rest[0] && rest[0].message, 120));
+        }
+        return originalEmit.call(this, event, ...rest);
+      };
     }
     return child;
   };
@@ -355,11 +363,30 @@ for (const method of ['on', 'once', 'addListener', 'prependListener']) {
 
 // --- lifecycle ---------------------------------------------------------------
 
-process.prependListener('uncaughtException', (err) => {
+// 'uncaughtExceptionMonitor' observes without handling: Node still prints the
+// stack and still exits non-zero afterwards. A plain 'uncaughtException'
+// listener HANDLES the error - the process then exits 0 in silence, which is
+// the very symptom this instrument exists to diagnose. Measured: with the old
+// listener, `setTimeout(() => { throw ... })` went from exit 1 with a stack to
+// exit 0 with nothing.
+process.on('uncaughtExceptionMonitor', (err) => {
   log('uncaughtException ' + show(err && err.stack, 1200));
 });
-process.prependListener('unhandledRejection', (reason) => {
+
+// There is no monitor event for rejections, so watch the process-level warning
+// instead of registering a handler that would suppress the default behaviour.
+process.on('unhandledRejection', function nrcTraceRejectionObserver(reason) {
   log('unhandledRejection ' + show((reason && reason.stack) || reason, 1200));
+  // Re-assert the default: a rejection with no OTHER handler must still be
+  // fatal. If this observer is the only listener, Node would treat the
+  // rejection as handled, so reproduce what --unhandled-rejections=throw does.
+  const listeners = process.listeners('unhandledRejection');
+  const onlyUs = listeners.length === 1 && listeners[0] === nrcTraceRejectionObserver;
+  if (onlyUs) {
+    process.nextTick(() => {
+      throw reason instanceof Error ? reason : new Error('Unhandled rejection: ' + show(reason, 200));
+    });
+  }
 });
 process.prependListener('beforeExit', (code) => log('beforeExit code=' + code));
 process.prependListener('exit', (code) => log('exit code=' + code + ' ' + handleSummary()));
