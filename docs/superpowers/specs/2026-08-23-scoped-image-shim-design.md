@@ -8,12 +8,12 @@ wording is kept and the departure is marked **Changed during implementation**
 (or **Changed during re-review**, for what a second adversarial pass falsified
 after the first fix landed), because in every case the reason is a review that
 falsified the original claim.
-The user-facing record is [findings.md](../../findings.md) §11 (*What shipped:
+The user-facing record is [findings.md](../../findings.md) §10 (*What shipped:
 the scoped shim*).
 
 Carried forward from the fleet review that closed PR #1: close the
 *image-processing* half of the equivalence gap
-([findings.md](../../findings.md) §11) with a shim scoped to one call site.
+([findings.md](../../findings.md) §10) with a shim scoped to one call site.
 
 ---
 
@@ -33,7 +33,7 @@ is gated behind it and is therefore *unreachable by construction*, so the
 
 ### Why not just set the flag
 
-Measured, and recorded in findings §11: defining
+Measured, and recorded in findings §10: defining
 `Bun.isStandaloneExecutable = true` globally makes the image path work **and
 silently breaks `Grep`**. With the flag set, "embedded ripgrep" means
 "re-exec `process.execPath` with argv0 `rg`", and `process.execPath` is `bun`.
@@ -235,7 +235,7 @@ about the artifact, and it measured false.
 ### Opt-out
 
 `NRC_NO_IMAGE_SHIM` set to **any non-empty value** skips the rewrite. This
-exists so the "as shipped" side of the A/B in findings §11 can be regenerated
+exists so the "as shipped" side of the A/B in findings §10 can be regenerated
 by anyone, from the same tree.
 
 "Any non-empty value" is a contract between two files, not a convenience.
@@ -320,7 +320,7 @@ output rather than a claim about the suite you are running.
 **Dynamic**, on the real artifact: an A/B driven through a **loopback-only mock
 of the Messages API**, committed to this repo as
 `scripts/mock-messages-api.mjs` and driven by `scripts/ab-equivalence.sh`.
-findings §11's evidence was previously unreproducible because that harness
+findings §10's evidence was previously unreproducible because that harness
 lived in `/tmp`; committing it is part of this change.
 
 All three measurements promised here are implemented, and the harness went
@@ -353,7 +353,7 @@ that the as-shipped Read case had been quietly fetching sharp's libvips
 packages from npm mid-run. Re-run in full on 2026-08-24 against `linux-x64`
 2.1.222 under Bun 1.3.14: four cases × three sides, `all expected results
 reproduced`, exit 0, every `egress=` line empty. The result table is in
-findings §11.
+findings §10.
 
 **Changed during re-review — what "the whole process tree" and "empty" now
 mean.** Both were claims before they were mechanisms:

@@ -6,7 +6,7 @@ docs/superpowers/specs/2026-08-23-scoped-image-shim-design.md (Part 1).
 The shim exists because one consequence of "we are not a standalone" is wrong:
 native image processing is gated behind that flag, so the Read tool cannot
 resize a large image. The tempting fix - set the flag - is MEASURED to break
-Grep (docs/findings.md §11), so the rewrite is scoped to a single call site.
+Grep (docs/findings.md §10), so the rewrite is scoped to a single call site.
 
 Everything therefore hangs on two properties.
 
@@ -74,7 +74,7 @@ IMAGE_SITE = (
 # The ripgrep site, verbatim from the same file. This is the gate that must
 # NEVER be flipped: with it true, "embedded ripgrep" means "re-exec
 # process.execPath with argv0 rg", process.execPath is bun, and Grep answers
-# "No matches found" for a string that exists (docs/findings.md §11).
+# "No matches found" for a string that exists (docs/findings.md §10).
 RIPGREP_SITE = (
     'let{cmd:r}=Syo("rg",[]);if(r!=="rg")return{mode:"system",command:r,'
     'args:[]}}if(%s()){let r={mode:"embedded",command:process.execPath,'
@@ -242,7 +242,7 @@ def test_the_ripgrep_gate_site_survives_untouched(postprocess):
     """The named, measured harm of flipping the flag globally: with the
     ripgrep gate true, "embedded ripgrep" becomes "re-exec process.execPath
     with argv0 rg", process.execPath is bun, and a Grep for a string that
-    exists answers `No matches found` (docs/findings.md §11). That is a wrong
+    exists answers `No matches found` (docs/findings.md §10). That is a wrong
     answer, not an error, so it is the one site this test names explicitly."""
     out, _ = postprocess.transform(_module())
 
@@ -261,7 +261,7 @@ def test_a_lost_image_guard_does_not_hand_the_rewrite_to_ripgrep(postprocess):
     check() returned [] - the before/after invariant counts how many sites
     moved, never which - so the build shipped `if(true){let r={mode:"embedded"`
     and a Grep that answers "No matches found" for a string that exists
-    (docs/findings.md §11). Selecting by SHAPE is what makes this a no-op.
+    (docs/findings.md §10). Selecting by SHAPE is what makes this a no-op.
     """
     src = _module(sites=(RIPGREP_SITE,)).replace(TAIL, LOST_GUARD_IMAGE_SITE + TAIL)
     call_end = src.index("if(CE()){") + len("if(CE()")
@@ -763,7 +763,7 @@ def test_a_rewrite_claimed_against_an_unidentified_gate_is_fatal(postprocess):
 
 def test_the_opt_out_is_read_in_main_not_in_transform(postprocess, monkeypatch):
     """transform() must stay a pure function of its arguments: the A/B in
-    docs/findings.md §11 is driven from one process, and an env var read down
+    docs/findings.md §10 is driven from one process, and an env var read down
     here would make the two halves depend on interpreter state."""
     monkeypatch.setenv("NRC_NO_IMAGE_SHIM", "1")
 

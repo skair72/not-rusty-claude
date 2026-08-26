@@ -147,6 +147,23 @@ BINARY_LINK := $(CACHE_DIR)/claude-$(PLATFORM).bin
 PYTEST_ARGS ?= -q -rs
 AB_ARGS     ?=
 
+# Running the artifact under Node instead of Bun (scripts/bun-shim.cjs).
+#
+# Node >= 24 only: the bundle uses `using` declarations and 22/23 fail
+# `node --check` on it - measured, so the recipes below check the major rather
+# than letting it fail as a SyntaxError 25 MB into a minified file.
+#
+# ws and undici are Bun builtins Node does not have, and the artifact imports
+# both. They go in CACHE_DIR, not in this checkout: this repo has no
+# package.json and gains no npm dependency, and nothing is installed globally.
+MIN_NODE_MAJOR      := 24
+NODE_BIN            ?= $(shell command -v node 2>/dev/null)
+NODE_DIR            := $(CACHE_DIR)/node
+NODE_MODULES        := $(NODE_DIR)/node_modules
+NODE_WS_VERSION     ?= 8.21.3
+NODE_UNDICI_VERSION ?= 7.29.0
+NODE_ARGS           ?= mcp list
+
 # The binary `build` extracts from. Empty means: the one `make binary`
 # downloaded, else let scripts/build.sh find one itself.
 CLAUDE_BINARY ?=
@@ -157,7 +174,7 @@ CLAUDE_BINARY ?=
 # directories it is about to remove one line later.
 KEEP_NOTICE ?= 1
 
-.PHONY: help doctor setup binary build smoke test ab clean distclean first-run
+.PHONY: help doctor setup binary build smoke node-deps node-run test ab clean distclean first-run
 
 help:
 	@printf '%s\n' \
@@ -169,6 +186,8 @@ help:
 	  '  binary      download this platform'"'"'s Claude Code binary and verify its sha256' \
 	  '  build       run scripts/build.sh -> $(OUT_DIR)/extract' \
 	  '  smoke       run the built artifact once (mcp list) under bun' \
+	  '  node-deps   download ws + undici into $(NODE_MODULES) (needs npm)' \
+	  '  node-run    run the built artifact under node + scripts/bun-shim.cjs' \
 	  '  test        run the pytest suite, saying up front what will run vs skip' \
 	  '  ab          scripts/ab-equivalence.sh, the three-way A/B (Linux only)' \
 	  '  first-run   setup + binary + build + smoke + test, in that order' \
@@ -185,9 +204,12 @@ help:
 	  '  CLAUDE_BINARY=      binary for `build` (default: the downloaded one)' \
 	  '  PYTEST_ARGS=$(PYTEST_ARGS)         passed to pytest' \
 	  '  AB_ARGS=            passed to scripts/ab-equivalence.sh' \
+	  '  NODE_BIN=$(NODE_BIN)' \
+	  '  NODE_ARGS=$(NODE_ARGS)       what `node-run` runs' \
 	  '' \
 	  'Also honoured from the environment: NRC_TEST_ELF, NRC_TEST_MACHO,' \
-	  'BUN_BIN, OUT_DIR, NRC_NO_IMAGE_SHIM.'
+	  'NRC_TEST_NODE, NRC_TEST_NODE_MODULES, NRC_TEST_ARTIFACT, BUN_BIN,' \
+	  'OUT_DIR, NRC_NO_IMAGE_SHIM.'
 
 doctor:
 	@set -eu; \
@@ -213,6 +235,18 @@ doctor:
 	  printf '    %-22s %s\n' 'pinned sha256' '$(BUN_SHA256)'; \
 	else \
 	  printf '    %-22s %s\n' 'pinned sha256' 'none pinned - setup will read $(BUN_SHASUMS_URL)'; \
+	fi; \
+	echo '==> node (scripts/bun-shim.cjs runs the artifact without bun)'; \
+	if [ -n '$(NODE_BIN)' ] && [ -x '$(NODE_BIN)' ]; then \
+	  printf '    %-22s %s (%s, needs >= $(MIN_NODE_MAJOR))\n' 'node' '$(NODE_BIN)' "$$('$(NODE_BIN)' -p process.versions.node 2>/dev/null || echo '?')"; \
+	else \
+	  printf '    %-22s %s\n' 'node' 'not found - set NODE_BIN='; \
+	fi; \
+	mods="$${NRC_TEST_NODE_MODULES:-$(NODE_MODULES)}"; \
+	if [ -f "$$mods/ws/package.json" ] && [ -f "$$mods/undici/package.json" ]; then \
+	  printf '    %-22s %s\n' 'ws + undici' "$$mods"; \
+	else \
+	  printf '    %-22s %s\n' 'ws + undici' 'missing - run: make node-deps'; \
 	fi; \
 	echo '==> claude binaries'; \
 	if [ -e '$(BINARY_LINK)' ]; then \
@@ -375,12 +409,74 @@ smoke:
 	  '$(BUN_BIN)' "$$art" mcp list; \
 	echo '==> smoke OK (exit 0). Your real ~/.claude was not touched.'
 
-# Three inputs decide how much of the suite actually executes, and every skip
-# in this repo comes from one of them (measured 2026-08-24: tests/conftest.py
-# is the only file that calls pytest.skip, through the real_elf_binary,
-# real_macho_binary and bun_bin fixtures). A fresh Mac has none of the three,
-# so a first run is mostly skips - which reads like a broken checkout unless
-# something says otherwise first. Hence the table.
+# ws and undici only. Measured on the 2.1.231 artifact: five non-builtin bare
+# specifiers are real code rather than string content - ws, undici, bun:ffi,
+# bun:jsc and node-fetch - and Bun provides all five while Node provides none.
+# Only ws and undici are needed to load the bundle: bun:ffi and bun:jsc are each
+# inside a try/catch (bun:ffi's also behind a macOS check), and node-fetch is an
+# SDK fetch fallback no command tested here reaches - it would throw if it did.
+#
+# The throwaway package.json below pins npm's install root. Without it npm walks
+# UP from $(NODE_DIR) and installs into the first ancestor holding a package.json
+# or a node_modules - usually $HOME. It lands in the cache dir, not the checkout.
+#
+# npm does the integrity checking here, which is a weaker guarantee than the
+# pinned sha256 above for bun: the registry vouches for its own tarballs.
+# --ignore-scripts means a substituted tarball cannot run code at install time.
+# Versions are pinned so the fetch is at least reproducible; both were the
+# current release when measured on 2026-08-25.
+node-deps:
+	@set -eu; \
+	mods="$${NRC_TEST_NODE_MODULES:-$(NODE_MODULES)}"; \
+	if [ -f "$$mods/ws/package.json" ] && [ -f "$$mods/undici/package.json" ]; then \
+	  echo "==> ws and undici already in $$mods"; \
+	elif [ "$$mods" != '$(NODE_MODULES)' ]; then \
+	  echo "error: NRC_TEST_NODE_MODULES=$$mods has no ws and undici. Put them there, or unset it and let this target install them." >&2; \
+	  exit 1; \
+	else \
+	  command -v npm >/dev/null 2>&1 || { \
+	    echo 'error: npm not found. Install Node >= $(MIN_NODE_MAJOR) (npm ships with it), or put ws and undici in a node_modules yourself and pass NRC_TEST_NODE_MODULES=<dir> - node-deps, node-run and test all read it.' >&2; \
+	    exit 1; }; \
+	  mkdir -p '$(NODE_DIR)'; \
+	  printf '%s\n' '{"name":"nrc-node-deps","version":"0.0.0","private":true}' > '$(NODE_DIR)/package.json'; \
+	  echo '==> npm install ws@$(NODE_WS_VERSION) undici@$(NODE_UNDICI_VERSION) -> $(NODE_MODULES)'; \
+	  cd '$(NODE_DIR)' && npm install --no-save --ignore-scripts --no-audit --no-fund --loglevel=error \
+	    'ws@$(NODE_WS_VERSION)' 'undici@$(NODE_UNDICI_VERSION)'; \
+	  [ -f '$(NODE_MODULES)/ws/package.json' ] && [ -f '$(NODE_MODULES)/undici/package.json' ] || { \
+	    echo 'error: npm exited 0 but $(NODE_MODULES) has no ws and undici - it installed somewhere else.' >&2; \
+	    exit 1; }; \
+	fi; \
+	echo '    nothing was installed globally, and nothing was written into this checkout.'
+
+# The Node counterpart of `smoke`. Same command, same throwaway config dir, so
+# the two are directly comparable by eye; tests/test_node_runtime.py is what
+# compares them byte for byte.
+node-run: node-deps
+	@set -eu; \
+	mods="$${NRC_TEST_NODE_MODULES:-$(NODE_MODULES)}"; \
+	art='$(OUT_DIR)/extract/cli.original.cjs'; \
+	[ -f "$$art" ] || { echo "error: no artifact at $$art - run: make build" >&2; exit 1; }; \
+	node='$(NODE_BIN)'; \
+	[ -n "$$node" ] && [ -x "$$node" ] || { echo 'error: no node found - install Node >= $(MIN_NODE_MAJOR), or set NODE_BIN=' >&2; exit 1; }; \
+	v="$$("$$node" -p process.versions.node 2>/dev/null || echo 0)"; \
+	major="$${v%%.*}"; \
+	[ "$$major" -ge $(MIN_NODE_MAJOR) ] 2>/dev/null || { \
+	  echo "error: $$node is Node $$v; the Claude bundle uses ES explicit resource management and needs Node >= $(MIN_NODE_MAJOR)" >&2; exit 1; }; \
+	cfg="$$(mktemp -d "$${TMPDIR:-/tmp}/nrc-node.XXXXXX")"; \
+	trap 'rm -rf "$$cfg"' EXIT INT TERM; \
+	echo "==> $$node --require scripts/bun-shim.cjs $$art $(NODE_ARGS)"; \
+	DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$$cfg" NODE_PATH="$$mods" \
+	  python3 -c 'import subprocess,sys; sys.exit(subprocess.run(sys.argv[1:], timeout=300).returncode)' \
+	  "$$node" --require '$(ROOT)/scripts/bun-shim.cjs' "$$art" $(NODE_ARGS); \
+	echo '==> node-run OK (exit 0). Your real ~/.claude was not touched.'
+
+# A handful of inputs decide how much of the suite actually executes, and every
+# skip in this repo comes from one of them: tests/conftest.py is the only file
+# that calls pytest.skip, through the real_elf_binary, real_macho_binary,
+# bun_bin, node_bin, ws_module, undici_module and built_artifact fixtures
+# (measured 2026-08-25). A fresh Mac has none of them, so a first run is mostly
+# skips - which reads like a broken checkout unless something says otherwise
+# first. Hence the table.
 #
 # The exact per-row counts are deliberately NOT hardcoded here. They were 6 /
 # 7 / 3 when measured on 2026-08-24, but the suite is actively growing and a
@@ -391,6 +487,12 @@ smoke:
 # Linux it is the ELF one, so `make binary` feeds `make test` without the user
 # having to know either env var. An env var that is already set always wins,
 # and conftest.py's own defaults are tried before the download.
+#
+# The recipe EXPORTS what it resolved (NRC_TEST_ELF, NRC_TEST_MACHO, BUN_BIN,
+# NRC_TEST_NODE, NRC_TEST_NODE_MODULES) so conftest.py sees the same choices
+# this table just printed. `node-deps` reads the last of those too, so a test
+# that shells back out to make must clear them first - see NODE_DEPS_INHERITED
+# in tests/test_makefile.py - or it measures its launcher, not the recipe.
 test:
 	@set -eu; \
 	cd '$(ROOT)'; \
@@ -415,6 +517,11 @@ test:
 	  if [ -x '$(BUN_DIR)/bun' ]; then bun='$(BUN_DIR)/bun'; bsrc='default'; \
 	  else bun="$$(command -v bun 2>/dev/null || true)"; bsrc='PATH'; fi; \
 	fi; \
+	node="$${NRC_TEST_NODE:-}"; nsrc='NRC_TEST_NODE'; \
+	if [ -z "$$node" ]; then node='$(NODE_BIN)'; nsrc='PATH'; fi; \
+	nver=''; \
+	if [ -n "$$node" ] && [ -x "$$node" ]; then nver="$$("$$node" -p process.versions.node 2>/dev/null || true)"; fi; \
+	mods="$${NRC_TEST_NODE_MODULES:-$(NODE_MODULES)}"; \
 	if command -v uv >/dev/null 2>&1; then \
 	  runner='uv run --no-project --with pytest python -m pytest'; rsrc='uv (no venv, installs nothing globally)'; \
 	elif python3 -c 'import pytest' >/dev/null 2>&1; then \
@@ -430,13 +537,26 @@ test:
 	  else printf '    %-22s SKIP   not found - set NRC_TEST_MACHO, or `make binary` on macOS\n' 'Mach-O Claude binary'; fi; \
 	if [ -n "$$bun" ] && [ -x "$$bun" ]; then printf '    %-22s RUN    %s [%s]\n' 'bun $(BUN_VERSION)' "$$bun" "$$bsrc"; \
 	  else printf '    %-22s SKIP   not found - run `make setup`\n' 'bun $(BUN_VERSION)'; fi; \
+	case "$$nver" in \
+	  ''|0) printf '    %-22s SKIP   not found - set NRC_TEST_NODE\n' 'node >= $(MIN_NODE_MAJOR)';; \
+	  1?.*|2[0-3].*) printf '    %-22s SKIP   %s is Node %s, too old to parse the bundle\n' 'node >= $(MIN_NODE_MAJOR)' "$$node" "$$nver";; \
+	  *) printf '    %-22s RUN    %s (%s) [%s]\n' 'node >= $(MIN_NODE_MAJOR)' "$$node" "$$nver" "$$nsrc";; \
+	esac; \
+	if [ -f "$$mods/ws/package.json" ] && [ -f "$$mods/undici/package.json" ]; then \
+	  printf '    %-22s RUN    %s\n' 'ws + undici' "$$mods"; \
+	  else printf '    %-22s SKIP   not in %s - run `make node-deps`\n' 'ws + undici' "$$mods"; fi; \
+	if [ -f '$(OUT_DIR)/extract/cli.original.cjs' ]; then \
+	  printf '    %-22s RUN    %s\n' 'built artifact' '$(OUT_DIR)/extract/cli.original.cjs'; \
+	  else printf '    %-22s SKIP   not built - run `make build`\n' 'built artifact'; fi; \
 	printf '    %-22s %s\n' 'runner' "$$rsrc"; \
-	echo '    Every skip this suite can produce comes from one of the three rows'; \
+	echo '    Every skip this suite can produce comes from one of the rows'; \
 	echo '    above; the SKIPPED lines pytest prints at the end give the counts.'; \
 	echo '==> running'; \
 	if [ -n "$$elf" ]; then NRC_TEST_ELF="$$elf"; export NRC_TEST_ELF; fi; \
 	if [ -n "$$macho" ]; then NRC_TEST_MACHO="$$macho"; export NRC_TEST_MACHO; fi; \
 	if [ -n "$$bun" ]; then BUN_BIN="$$bun"; export BUN_BIN; fi; \
+	if [ -n "$$node" ]; then NRC_TEST_NODE="$$node"; export NRC_TEST_NODE; fi; \
+	NRC_TEST_NODE_MODULES="$$mods"; export NRC_TEST_NODE_MODULES; \
 	$$runner tests/ $(PYTEST_ARGS)
 
 ab:

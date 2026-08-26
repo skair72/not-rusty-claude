@@ -109,3 +109,85 @@ def bun_bin():
         if path and os.path.isfile(path) and os.access(path, os.X_OK):
             return path
     pytest.skip("no bun available; set BUN_BIN")
+
+
+# --- running the artifact under Node instead of Bun -------------------------
+#
+# Three things the host may not have, one fixture each, all of them a SKIP with
+# the env var that fixes it - never a failure. `make node-run` sets all three up.
+
+MIN_NODE_MAJOR = 24  # the bundle uses `using`; Node 22/23 fail `node --check`
+
+CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "not-rusty-claude")
+NODE_MODULES = os.path.join(CACHE_DIR, "node", "node_modules")
+
+
+@pytest.fixture(scope="session")
+def node_bin():
+    """A Node >= 24 to run the artifact with; Bun stays the oracle.
+
+    A Node that is too old is reported as such rather than as "not found": the
+    bundle's `using` declarations are a hard parse error before 24, so an
+    otherwise healthy `node` on PATH is a specimen that is not what you think -
+    the same distinction _usable() draws for the binaries above.
+    """
+    import subprocess
+    candidates = [os.environ.get("NRC_TEST_NODE"), shutil.which("node")]
+    too_old = None
+    for path in candidates:
+        if not (path and os.path.isfile(path) and os.access(path, os.X_OK)):
+            continue
+        try:
+            out = subprocess.run([path, "-p", "process.versions.node"],
+                                 capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        version = out.stdout.strip()
+        try:
+            major = int(version.split(".")[0])
+        except ValueError:
+            continue
+        if major >= MIN_NODE_MAJOR:
+            return path
+        too_old = (path, version)
+    if too_old:
+        pytest.skip(
+            f"{too_old[0]} is Node {too_old[1]}; the Claude bundle uses `using` "
+            f"declarations and needs >= {MIN_NODE_MAJOR} - set NRC_TEST_NODE to one")
+    pytest.skip(f"no Node >= {MIN_NODE_MAJOR}; set NRC_TEST_NODE")
+
+
+def _node_module(name):
+    """The directory to put on NODE_PATH so `require(name)` resolves.
+
+    ws and undici are Bun builtins that Node lacks, so the artifact cannot load
+    without them - and they are deliberately NOT a dependency of this repo:
+    they live in a cache directory `make node-deps` fills, and nothing is
+    installed globally or into the checkout.
+    """
+    root = os.environ.get("NRC_TEST_NODE_MODULES") or NODE_MODULES
+    if os.path.isfile(os.path.join(root, name, "package.json")):
+        return root
+    pytest.skip(f"no `{name}` under {root} - run `make node-deps`, "
+                f"or set NRC_TEST_NODE_MODULES to a node_modules holding it")
+
+
+@pytest.fixture(scope="session")
+def ws_module():
+    return _node_module("ws")
+
+
+@pytest.fixture(scope="session")
+def undici_module():
+    return _node_module("undici")
+
+
+@pytest.fixture(scope="session")
+def built_artifact():
+    """The extracted CLI that `make build` produces."""
+    path = os.environ.get("NRC_TEST_ARTIFACT") or str(
+        ROOT / "build" / "extract" / "cli.original.cjs")
+    if not os.path.isfile(path):
+        pytest.skip(f"no artifact at {path} - run `make build`, "
+                    f"or set NRC_TEST_ARTIFACT")
+    return path

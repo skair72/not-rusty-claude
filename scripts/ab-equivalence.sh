@@ -9,7 +9,7 @@
 #
 #   as shipped : NRC_NO_IMAGE_SHIM=1 scripts/build.sh   (no shim: the CLI takes
 #                its non-standalone branch and never reaches for
-#                image-processor.node - docs/findings.md 11)
+#                image-processor.node - docs/findings.md 10)
 #   shimmed    : scripts/build.sh                       (shim applied to the ONE
 #                image-processor gate call site)
 #   global     : the as-shipped artifact plus
@@ -17,7 +17,7 @@
 #                after its CJS wrapper header - i.e. the obvious one-line "fix",
 #                flipping the flag for every gate site at once.
 #
-# WHY: docs/findings.md section 11 claims a behaviour flip between the first two
+# WHY: docs/findings.md section 10 claims a behaviour flip between the first two
 # builds - a Read of an oversized PNG errors on one side and returns a JPEG on
 # the other - and claims that the *global* flip buys that same JPEG at the price
 # of silently breaking Grep. That second claim is the entire justification for
@@ -60,7 +60,7 @@
 #     @img/sharp-linux-x64@0.35.3, @img/sharp-libvips-linux-x64@1.3.2,
 #     @img/sharp-wasm32@0.35.3, @emnapi/runtime@1.11.3 and tslib@2.8.1 in it.
 #     That is Bun's auto-install answering the bundled JS sharp fallback's
-#     require for libvips - the fallback findings.md 11 says is unreachable
+#     require for libvips - the fallback findings.md 10 says is unreachable
 #     goes shopping for itself. The shimmed and global sides do not: they get
 #     the native addon and never ask. With --no-install: 0 non-loopback sockets
 #     and every tool_result byte-identical, including the as-shipped Read error
@@ -247,7 +247,7 @@ mkdir -p "$WORK/hay"
 printf 'NEEDLE-12345\n' > "$WORK/hay/a.txt"
 
 PNG="$SCRATCH/gradient-3000.png"
-# Verbatim from docs/findings.md section 11. The whole point of the Read case
+# Verbatim from docs/findings.md section 10. The whole point of the Read case
 # is that the *input* reproduces, so the fixture is checked - but on its
 # DECODED content, not on its file size. The size is a property of the local
 # deflate, not of the image: measured on this host, byte-identical scanlines
@@ -343,7 +343,7 @@ build_side() {  # build_side <label> <outdir> <shim: yes|no>
 
 # The third side. It is NOT a build: it is the as-shipped artifact with one
 # statement prepended inside the CJS wrapper, which is exactly what "just set
-# the flag" means in practice and is how findings.md 11 measured it. Deriving it
+# the flag" means in practice and is how findings.md 10 measured it. Deriving it
 # from the as-shipped artifact rather than from the shimmed one keeps the
 # comparison honest - the only difference from side A is the global assignment.
 make_global_side() {  # make_global_side <src-extract-dir> <out-dir>
@@ -815,7 +815,7 @@ run_case() {  # run_case <case> <artifact> <label> ; prints the summary lines
 
   # env -i: inherited ANTHROPIC_* / CLAUDE_* from the caller's shell would
   # silently retarget this at a real endpoint. Only PATH survives, because the
-  # CLI shells out (and, as shipped, needs `rg` from PATH - findings.md 11).
+  # CLI shells out (and, as shipped, needs `rg` from PATH - findings.md 10).
   # `|| rc=$?` rather than a bare call: under `set -e` a non-zero CLI exit would
   # kill the whole comparison, and a non-zero exit is itself a result worth
   # printing next to the other side's.
@@ -903,7 +903,7 @@ run_case() {  # run_case <case> <artifact> <label> ; prints the summary lines
 
 # -------------------------------------------------------------------- cases
 
-# What each side is supposed to produce, as documented in docs/findings.md 11.
+# What each side is supposed to produce, as documented in docs/findings.md 10.
 # Without these the script is a printer, not a check: two sides that both
 # silently produced nothing would agree, and "SAME" would be reported as a
 # result. Every string below was measured on this host before it was written.
@@ -931,7 +931,7 @@ expect_for() {  # expect_for <case> <side>
     # expired. That is a result, not a bug in the harness.
     grep:global)    echo "No matches found" ;;
     # The documented failure, not merely "an error": the whole claim in
-    # findings.md 11 is that this specific message is what an unshimmed build
+    # findings.md 10 is that this specific message is what an unshimmed build
     # gives back for an oversized image.
     read:asshipped) echo "Unable to resize image" ;;
     read:shimmed)   echo "IMAGE media=image/jpeg" ;;
@@ -1019,11 +1019,11 @@ check_side() {  # check_side <case> <side> <summary>
 # The Grep case needs ripgrep on the PATH the runs are given. Measured, with a
 # PATH that had every /usr/bin entry except rg: the tool comes back is_error
 # with "ripgrep not found on PATH. Install it ... or use the native claude
-# binary which embeds it." - which is findings.md 11's point 4 arriving as a
+# binary which embeds it." - which is findings.md 10's point 4 arriving as a
 # case failure rather than as an explanation.
 if ! PATH="/usr/bin:/bin" command -v rg >/dev/null 2>&1; then
   warn "no rg on /usr/bin:/bin - the Grep case will fail: an extracted build has"
-  warn "  no embedded ripgrep and shells out to the system one (findings.md 11)."
+  warn "  no embedded ripgrep and shells out to the system one (findings.md 10)."
 fi
 
 echo

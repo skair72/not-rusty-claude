@@ -22,7 +22,7 @@ What it does (see docs/findings.md §6):
      MEASURED to break Grep - "embedded ripgrep" then means
      "re-exec process.execPath with argv0 rg", process.execPath is bun, and a
      search for a string that exists answers "No matches found". See
-     docs/findings.md §11 and
+     docs/findings.md §10 and
      docs/superpowers/specs/2026-08-23-scoped-image-shim-design.md.
      The site is chosen by SHAPE - the branch's own `if(<gate>())try{` - and
      not by proximity to the anchor, because the nearest gate call to the
@@ -131,7 +131,7 @@ SHIM_SOURCE = (
 # standalone the answer is false everywhere, which is right everywhere except
 # one place: native image processing is gated behind it, so the Read tool
 # cannot resize a large image and errors instead. Setting the flag globally is
-# NOT the fix - measured, docs/findings.md §11: it also makes "embedded
+# NOT the fix - measured, docs/findings.md §10: it also makes "embedded
 # ripgrep" mean "re-exec process.execPath (= bun) with argv0 rg", and Grep then
 # answers "No matches found" for a string that exists. A wrong answer is worse
 # than a missing feature, so the rewrite is scoped to a single call site.
@@ -205,7 +205,7 @@ def _image_site_re(name):
     a correct rewrite does, because the invariant counts how many sites moved
     and never which. check() then returns clean and the build ships a Grep
     that answers "No matches found" for a string that exists
-    (docs/findings.md §11). So the site is chosen by SHAPE, not by distance.
+    (docs/findings.md §10). So the site is chosen by SHAPE, not by distance.
 
     Measured on both real entry modules (linux-x64 2.1.222, darwin-arm64
     2.1.239): the image branch opens a try block - `if(CE())try{` /
@@ -455,7 +455,7 @@ def check(code, counts, assets_on_disk=None, asset_names_on_disk=None):
     # more went missing the text rewrite spread past the site it was aimed at -
     # and the site it would reach first is embedded ripgrep, whose failure mode
     # is not an error but the wrong answer ("No matches found" for a string
-    # that exists, docs/findings.md §11). That must never be a warning.
+    # that exists, docs/findings.md §10). That must never be a warning.
     applied = counts["image_shim"]
     before = counts["gate_calls_before"]
     after = counts["gate_calls_after"]
@@ -526,7 +526,7 @@ def main():
 
     # Read here and not in transform(): transform() stays a pure function of
     # its input, which is what lets the tests drive both halves of the
-    # docs/findings.md §11 A/B in one process.
+    # docs/findings.md §10 A/B in one process.
     # ANY non-empty value opts out, not just "1", because build.sh decides
     # which of its two "NOT APPLIED" messages to print with `[ -n ... ]`. Under
     # the old `!= "1"` rule, NRC_NO_IMAGE_SHIM=true meant "shim it" here and
