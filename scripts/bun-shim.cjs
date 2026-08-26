@@ -1106,7 +1106,18 @@ function wrap_breakWord(rows, word, columns) {
     // empty row Bun puts between them.
     if (!nothingVisibleAfter) {
       if (taken === columns) { rows.push(""); taken = 0; }
-      if (w > columns - taken) { rows.push(""); taken = 0; }
+      if (w > columns - taken) {
+        // A held-back escape is emitted BEFORE the break it precedes, when the
+        // break happens on an empty row. Measured at width 1: an SGR followed
+        // by a wide character leaves the SGR on the first row and the glyph on
+        // the next, rather than opening with an empty row.
+        if (pending !== "" && taken === 0) {
+          rows[rows.length - 1] += pending;
+          pending = "";
+        }
+        rows.push("");
+        taken = 0;
+      }
     }
 
     // NOTE: zero-width code points are NOT discarded here. They land on their
