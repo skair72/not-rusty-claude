@@ -892,10 +892,19 @@ function gc() {
  * That failure cost a day of investigation across two machines before a trace
  * named it, which is why this is implemented rather than refused.
  *
- * Every rule below was measured against Bun 1.3.14, not assumed: 2,800 cases
- * over 28 inputs (ANSI SGR, OSC 8 hyperlinks, CJK, emoji, combining marks,
- * tabs, embedded newlines), 10 widths and 10 option combinations, byte-equal.
- * tests/test_wrap_ansi.py re-runs that corpus with Bun as the oracle.
+ * Every rule below was measured against Bun 1.3.14, not assumed: 4,000 cases
+ * over 40 inputs (ANSI SGR including 256-colour and truecolor, OSC 8
+ * hyperlinks in both terminator forms, CJK, emoji, combining marks, tabs,
+ * carriage returns, embedded newlines), 10 widths and 10 option combinations.
+ * tests/test_wrap_ansi.py re-runs that corpus with Bun as the oracle, and
+ * tests/test_fuzz_differential.py adds generated inputs nobody chose.
+ *
+ * ⚠️ NOT byte-equal everywhere. The generative differential still reports
+ * divergences at narrow widths, mostly involving ST-terminated hyperlinks and
+ * zero-width sequences; they are pinned there as a count that may only fall.
+ * Unlike YAML.parse below, this function cannot refuse - a throw inside a
+ * render is swallowed by an error boundary and the TUI dies silently - so its
+ * contract is enforceable only by comparison.
  *
  * The four rules that are not obvious, each of which the corpus forced:
  *   - width <= 0 returns the input untouched
@@ -1123,7 +1132,17 @@ function hardWrapWord(rows, word, columns) {
 
   const flushInto = (row) => { row.push(...pending); pending = []; };
 
-  for (const t of word) {
+  // Precompute, for each position, whether any VISIBLE token follows it. A
+  // trailing zero-width token stays on the row it ends rather than starting a
+  // fresh one, and asking that question by identity lookup would be both
+  // fragile (duplicate tokens compare equal) and quadratic.
+  const visibleAfter = new Array(word.length).fill(false);
+  for (let k = word.length - 2; k >= 0; k--) {
+    visibleAfter[k] = visibleAfter[k + 1] || (!word[k + 1].ansi && word[k + 1].w > 0);
+  }
+
+  for (let index = 0; index < word.length; index++) {
+    const t = word[index];
     if (t.ansi) {
       if (t.text.startsWith(WRAP_ESC + "]8;")) {
         const uri = t.text.slice(4).split(";").slice(1).join(";")
@@ -1143,29 +1162,24 @@ function hardWrapWord(rows, word, columns) {
       continue;
     }
 
-    // A cluster wider than the whole budget is split into its code points.
-    // Measured: at width 1 the ZWJ family emoji becomes one row per member
-    // with the joiners on their own rows, and a combining mark separates from
-    // its base. Keeping clusters whole - which reads like the careful choice -
-    // is what Bun does NOT do here.
-    if (t.w > columns && [...t.text].length > 1) {
-      // Zero-width code points attach to the code point that FOLLOWS them, not
-      // the one before: measured, "e" + combining acute at width 1 breaks as
-      // "e" then the mark joined to the next character, and a ZWJ emoji family
-      // at width 2 puts each joiner at the head of the row with its member.
-      const pieces = [];
-      let pending = "";
-      for (const cp of t.text) {
-        pending += cp;
-        if (stringWidth(cp) > 0) { pieces.push(pending); pending = ""; }
-      }
-      if (pending !== "") pieces.push(pending);
-
-      for (const text of pieces) {
-        const piece = { ansi: false, text, w: stringWidth(text) };
-        let taken = rowWidth(rows[rows.length - 1]);
-        if (taken === columns) { rows.push([]); taken = 0; }
-        if (taken + piece.w > columns) rows.push([]);
+    // Hard wrapping works on CODE POINTS, not grapheme clusters. Measured: a
+    // ZWJ emoji family splits into its members with the joiners placed by the
+    // ordinary break rules, and a combining mark separates from its base -
+    // "e" + combining acute at width 1 gives "e" then the mark leading the
+    // next row. Keeping clusters whole reads like the careful choice and is
+    // not what Bun does. Cluster widths still govern everything else; this
+    // applies only once a word is being broken apart.
+    const points = [...t.text];
+    if (points.length > 1) {
+      for (let k = 0; k < points.length; k++) {
+        const piece = { ansi: false, text: points[k], w: stringWidth(points[k]) };
+        const last = k === points.length - 1;
+        const nothingAfter = piece.w === 0 && last && !visibleAfter[index];
+        if (!nothingAfter) {
+          let taken = rowWidth(rows[rows.length - 1]);
+          if (taken === columns) { rows.push([]); taken = 0; }
+          if (taken + piece.w > columns) rows.push([]);
+        }
         flushInto(rows[rows.length - 1]);
         rows[rows.length - 1].push(piece);
       }
@@ -1178,9 +1192,22 @@ function hardWrapWord(rows, word, columns) {
     // why a wide glyph following a full row gets an empty row between them,
     // while one following an already-overflowing row does not: the first test
     // only fires on an exact fit, never on a row that has already spilled.
-    let taken = rowWidth(rows[rows.length - 1]);
-    if (taken === columns) { rows.push([]); taken = 0; }
-    if (taken + t.w > columns) { rows.push([]); }
+    //
+    // The exception is a zero-width token with nothing after it. A trailing
+    // tab stays on the row it ends - measured, "abc" + tab at width 1 ends
+    // "c\t", not "c\n\t" - because there is no following content for the
+    // fresh row to hold.
+    // A trailing zero-width token stays on the row it ends: NEITHER break
+    // applies to it. The second test matters as much as the first, because a
+    // row holding a glyph wider than the budget has already overflowed, so
+    // `taken + 0 > columns` is true and would push an empty row for a tab that
+    // occupies no space.
+    const nothingFollows = t.w === 0 && !visibleAfter[index];
+    if (!nothingFollows) {
+      let taken = rowWidth(rows[rows.length - 1]);
+      if (taken === columns) { rows.push([]); taken = 0; }
+      if (taken + t.w > columns) rows.push([]);
+    }
 
     flushInto(rows[rows.length - 1]);
     rows[rows.length - 1].push(t);
@@ -1214,7 +1241,10 @@ function wrapAnsi(string, columns, options) {
   // corpus cases and every option combination. The bundle never asks - its call
   // site guards with `if(!(t>0))return e` - but matching costs one line.
   if (!(columns > 0)) return s;
-  if (opts.trim !== false && s.trim() === "") return "";
+  // No whole-input shortcut for blank input: measured, "\n" wraps to "\n" and
+  // " \n " to "\n". Trimming is per LINE - each blank line becomes empty and
+  // the line structure survives - so an early `return ""` for a string that
+  // trims to nothing silently ate the newlines.
   // A lone carriage return breaks the line exactly as \r\n does - measured,
   // "ab\rcd" wraps to "ab\ncd" rather than keeping the CR inside the word.
   return s.replace(/\r\n?/g, "\n").split("\n")
@@ -1233,8 +1263,9 @@ function wrapAnsi(string, columns, options) {
  * The contract is deliberately narrower than YAML: every input it ACCEPTS
  * produces exactly what Bun produces, and everything else THROWS. A wrong
  * parse is somebody's skill silently misconfigured; a refusal is a message
- * naming what is unsupported. Measured over the corpus: 138 cases match Bun
- * exactly, 12 refuse, 0 differ.
+ * naming what is unsupported. Measured over the curated corpus: 141 match Bun
+ * exactly, 18 refuse, 0 differ - and over 6,000 generated inputs across three
+ * seeds, 0 differ.
  *
  * Refused on purpose, each because matching Bun could not be verified:
  * anchors and aliases, tags, explicit complex keys (`? `), more than one
@@ -1583,6 +1614,23 @@ function yaml_parseSequence(lines, start, indent) {
     const childIndent = indent + (content === "-" ? 2 : raw.indexOf("-") - indent + 2);
 
     if (inline === "") {
+      // An empty sequence entry takes the following node as its value - but
+      // Bun captures that node even when it is OUTDENTED, swallowing what
+      // reads like a sibling key at a lower level. Measured, and it interacts
+      // with duplicate-key merging in ways that change which key wins.
+      //
+      // Matching that would mean inferring how far the capture extends, in a
+      // corner no frontmatter file contains. Refuse instead: the contract
+      // prefers a named refusal over a guess, and this converts every observed
+      // wrong answer in this shape into one.
+      let peek = i + 1;
+      while (peek < lines.length &&
+             (yaml_isBlank(lines[peek]) || yaml_stripComment(lines[peek]).trim() === "")) {
+        peek++;
+      }
+      if (peek < lines.length && yaml_indentOf(lines[peek]) <= indent) {
+        yaml_refuse("an empty sequence entry followed by outdented content");
+      }
       const [child, next] = yaml_parseNode(lines, i + 1, indent + 1);
       out.push(child);
       i = next;

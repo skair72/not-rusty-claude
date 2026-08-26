@@ -3,7 +3,7 @@
 // drift, and deliberately escape-free in source - a literal control byte in a
 // repo file is unreviewable.
 //
-// 28 inputs x 10 widths x 10 option combinations = 2,800 cases, covering SGR
+// 40 inputs x 10 widths x 10 option combinations = 4,000 cases, covering SGR
 // colour, OSC 8 hyperlinks, CJK, emoji, combining marks, tabs and embedded
 // newlines. Bun is the oracle; nothing here hardcodes an expected answer.
 

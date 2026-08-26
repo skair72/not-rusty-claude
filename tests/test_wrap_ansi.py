@@ -36,18 +36,6 @@ def _run(argv):
 
 
 @pytest.fixture(scope="module")
-def corpus():
-    import re
-    text = CORPUS.read_text()
-    counts = {}
-    for name in ("strings", "widths", "optionSets"):
-        block = re.search(rf"const {name} = \[(.*?)\n\];", text, re.S)
-        counts[name] = block is not None
-    assert all(counts.values()), f"corpus is not the expected shape: {counts}"
-    return text
-
-
-@pytest.fixture(scope="module")
 def answers(bun_bin, node_bin):
     """The same corpus, once under Bun and once under Node + the shim."""
     return {
