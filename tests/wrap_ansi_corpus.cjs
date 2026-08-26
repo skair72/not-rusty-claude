@@ -3,7 +3,7 @@
 // drift, and deliberately escape-free in source - a literal control byte in a
 // repo file is unreviewable.
 //
-// 40 inputs x 10 widths x 10 option combinations = 4,000 cases, covering SGR
+// 43 inputs x 10 widths x 10 option combinations = 4,300 cases, covering SGR
 // colour, OSC 8 hyperlinks, CJK, emoji, combining marks, tabs and embedded
 // newlines. Bun is the oracle; nothing here hardcodes an expected answer.
 
@@ -50,6 +50,19 @@ const strings = [
   // A BEL-terminated hyperlink: the other OSC 8 form, and the common one.
   ESC + "]8;;https://x.example\u0007bel link" + ESC + "]8;;\u0007 after",
   "a lone \r carriage return here",
+
+  // Added 2026-08-26, minimised from real 100-seed fuzz failures by deleting
+  // everything that was not load-bearing. Each one is an ST-terminated OSC 8
+  // with an EMPTY uri - a CLOSE, not an opener. The glue rule keyed on "ST
+  // terminated" alone and held these on one row; the oracle breaks them
+  // normally, because a close opens no link and so glues nothing.
+  //
+  // The generated corpus never produced this shape on its own, so nothing in
+  // the fuzz ratchet covers it: over 100 seeds the fix moved zero cases. It
+  // belongs here or it is unprotected.
+  ESC + "]8;;" + ESC + "\\" + ESC + "]8;;\u0007wo",
+  ESC + "]8;;" + ESC + "\\" + ESC + "]8;;\u0007" + "\u672c",
+  "." + ESC + "]8;;" + ESC + "\\" + ESC + "]8;;https://x.example/23\u0007f",
 ];
 
 const widths = [0, 1, 2, 3, 4, 5, 6, 10, 20, 80];

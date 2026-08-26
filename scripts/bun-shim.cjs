@@ -1073,9 +1073,17 @@ function wrap_breakWord(rows, word, columns) {
     const esc = wrap_escapeLength(word, scan);
     if (!esc) { scan += String.fromCodePoint(word.codePointAt(scan)).length; continue; }
     const text = word.slice(scan, scan + esc);
-    if (text.startsWith(wrap_ESC + "]") && text.endsWith(wrap_ESC + "\\")) {
-      glueFrom = scan;
-      break;
+    // Only an OPENER glues. An ST-terminated OSC 8 with an EMPTY uri is a
+    // close, and a close opens no link, so there is nothing for it to hold
+    // together. Minimised from real failures: "<st-close><bel-close>wo" at
+    // width 1 breaks to "w" and "o", and we were gluing it to one row purely
+    // because the close happened to be ST-terminated.
+    if (text.startsWith(wrap_ESC + "]8;;") && text.endsWith(wrap_ESC + "\\")) {
+      const uri = text.slice(5, -2);
+      if (uri !== "") {
+        glueFrom = scan;
+        break;
+      }
     }
     scan += esc;
   }
