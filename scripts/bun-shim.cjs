@@ -271,7 +271,13 @@ function clusterWidth(cluster) {
   // list rejects, while non-pictographic parts are SUMMED - CJK+ZWJ+CJK is 4,
   // emoji+ZWJ+letter is 3. So the test is on the parts, not on the joiner.
   if (count > 1 && cluster.includes(ZWJ) && ZWJ_PICTOGRAPHIC.test(cluster)) return 2;
-  if (variationSelector && count > 1 && sum < 1) return 1;
+  // A base too narrow to show through the table (sum 0) still prints one
+  // column when a variation selector rides it - EXCEPT when the cluster has
+  // no base at all: a bare VS16+ZWJ remnant, left over on a row after the
+  // hard breaker split its emoji base onto the row before. Measured, that
+  // remnant is 0, not 1 - the same answer as VS16 alone. Only a ZWJ turns it
+  // from "narrow base plus selector" into "joiner with nothing to join".
+  if (variationSelector && count > 1 && sum < 1 && !cluster.includes(ZWJ)) return 1;
   return sum;
 }
 
