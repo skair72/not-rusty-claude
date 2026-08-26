@@ -1270,10 +1270,21 @@ function wrap_wrapLine(rawLine, columns, opts) {
         wrap_breakWord(rows, word, columns);
         continue;
       }
-      if (taken > 0 && wordWidth > 0) rows.push("");
+      if (taken > 0 && wordWidth > 0) { rows.push(""); taken = 0; }
       if (opts.wordWrap === false) {
-        wrap_breakWord(rows, word, columns);
-        continue;
+        // The fresh row may hold the whole word, and then it is not broken at
+        // all. Measured at width 2: two spaces fill row one, and a ZWJ family
+        // - two columns as a cluster - lands WHOLE on row two. Only a word too
+        // wide for a row of its own is handed to the breaker.
+        //
+        // This is not a rule about clusters. The same family followed by "xy"
+        // splits at width 2 and at width 3, and survives whole at 4: what
+        // decides is whether the WORD fits, measured by cluster width. A
+        // cluster is split whenever the word around it has to be.
+        if (wordWidth > columns) {
+          wrap_breakWord(rows, word, columns);
+          continue;
+        }
       }
     }
 
