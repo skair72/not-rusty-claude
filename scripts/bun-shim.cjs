@@ -1046,6 +1046,23 @@ function wrap_pointCellWidth(cp) {
   return wrap_COMBINING_MARK.test(cp) ? 0 : stringWidth(cp);
 }
 
+// The same walk WITHOUT the mark rule, for callers asking "does this print
+// anything at all?" rather than "what does this cost the row?". The two
+// questions have different answers for the enclosing keycap U+20E3: it costs
+// the row nothing, and it very much prints.
+function wrap_pointWidthRaw(text) {
+  let total = 0;
+  let i = 0;
+  while (i < text.length) {
+    const esc = wrap_escapeLength(text, i);
+    if (esc) { i += esc; continue; }
+    const cp = String.fromCodePoint(text.codePointAt(i));
+    total += stringWidth(cp);
+    i += cp.length;
+  }
+  return total;
+}
+
 function wrap_pointWidth(text) {
   let total = 0;
   let i = 0;
@@ -1306,10 +1323,16 @@ function wrap_trimRow(row) {
       body = body.slice(0, -1);
       continue;
     }
-    // A row of zero-width code points - joiners, variation selectors,
-    // combining marks - trims to nothing. They print no glyph, so trimming
-    // treats the row as blank. Escapes are kept: they are state, not content.
-    if (body !== "" && wrap_pointWidth(body) === 0 && !/\u001b/.test(body)) {
+    // A row of code points that print NOTHING - joiners, variation selectors,
+    // combining marks - trims to nothing. Escapes are kept: they are state,
+    // not content.
+    //
+    // Measured RAW, not the way the breaker measures. The breaker charges a
+    // combining mark zero because it costs the row nothing; that is a
+    // different question from whether it prints. The enclosing keycap U+20E3
+    // costs nothing and prints two columns wide, and asking the breaker's
+    // question here wiped the row the oracle keeps for it.
+    if (body !== "" && wrap_pointWidthRaw(body) === 0 && !/\u001b/.test(body)) {
       body = "";
       continue;
     }
