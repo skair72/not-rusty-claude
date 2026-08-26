@@ -334,19 +334,19 @@ only as quoted command output labelled with the binary and date that produced
 it.** These counts *move*, in both directions, as test files are added and removed —
 which is exactly why. Every row was re-measured here on 2026-08-26
 by forcing it with the variables named beside it; `--collect-only` reports the
-same total, **258**, in all six configurations, because what the host has
+same total, **262**, in all six configurations, because what the host has
 changes the skips, never the collection.
 
 | host has | result | how the row was forced |
 | --- | --- | --- |
-| both binaries, Bun, Node 24 | **258 passed** | `NRC_TEST_NODE=…/v24.0.0/bin/node` (this host's own `node` is 22.23.2) |
-| …no Mach-O | 253 passed, 5 skipped | `NRC_TEST_MACHO=/nonexistent/macho` |
-| …no ELF | 253 passed, 5 skipped | `NRC_TEST_ELF=/nonexistent/elf` |
-| …neither binary | 248 passed, 10 skipped | both of those two variables at once |
-| …and no Bun | 211 passed, 47 skipped | …plus `BUN_BIN=/nonexistent/bun` and a `HOME` with no Bun under it |
-| none of them, Node 22 | 185 passed, 73 skipped | …and drop `NRC_TEST_NODE` — the command below |
+| both binaries, Bun, Node 24 | **262 passed** | `NRC_TEST_NODE=…/v24.0.0/bin/node` (this host's own `node` is 22.23.2) |
+| …no Mach-O | 257 passed, 5 skipped | `NRC_TEST_MACHO=/nonexistent/macho` |
+| …no ELF | 257 passed, 5 skipped | `NRC_TEST_ELF=/nonexistent/elf` |
+| …neither binary | 252 passed, 10 skipped | both of those two variables at once |
+| …and no Bun | 215 passed, 47 skipped | …plus `BUN_BIN=/nonexistent/bun` and a `HOME` with no Bun under it |
+| none of them, Node 22 | 189 passed, 73 skipped | …and drop `NRC_TEST_NODE` — the command below |
 
-Every row adds up to 258, and the skips decompose: **5** tests need the Mach-O
+Every row adds up to 262, and the skips decompose: **5** tests need the Mach-O
 binary, **5** the ELF one, **3** more only a Bun (5 + 5 + 3 = 13), and **60**
 need Node ≥ 24 — of which **32** also use Bun as their oracle and **6** also
 want `ws`+`undici`, which the moved `HOME` of the fifth row takes with it. Only
@@ -359,7 +359,7 @@ configurations above check out against them.
 **The Apple Silicon run is not reconcilable to this table, and should not be.**
 It reported **257 passed, 6 skipped, 0 failed, 263 collected** — a true
 measurement of the tree as it stood on 2026-08-24, whose test set is not
-today's. No arithmetic connects 263 to 258 and none is offered. What the Mac run
+today's. No arithmetic connects 263 to 262 and none is offered. What the Mac run
 established is in [§ macOS](#macos); its totals belong to the tree it ran on.
 
 The last two rows need care twice over. `BUN_BIN` is a *first* choice, not an
