@@ -1086,20 +1086,23 @@ function wrap_wrapLine(rawLine, columns, opts) {
   // lone NBSP survives (it is width 1 and prints) while a lone space does not.
   if (opts.trim !== false && /^[ \t]*$/.test(line)) return [""];
 
-  // Leading whitespace: a leading SPACE begins a run that swallows following
-  // tabs too, but a tab that opens the line is kept. Measured on "  ab" -> "ab",
-  // " \t -" -> "-", "\tab" -> "\tab".
-  if (opts.trim !== false) line = line.replace(/^ [ \t]*/, "");
-
   const words = wrap_splitWords(line);
   const rows = [""];
 
   for (let index = 0; index < words.length; index++) {
     const word = words[index];
 
+    // Leading whitespace is stripped from the CURRENT ROW once per word
+    // iteration - not once per line. That timing is the whole rule: " \tx"
+    // keeps its tab because no later iteration runs, while " \t x" loses it
+    // because the "x" iteration strips the row holding it. Seven measured
+    // shapes follow from this with no special cases.
+    //
+    // Spaces and tabs only, NOT JS trimStart(): that also removes NBSP, which
+    // Bun keeps because it is width 1 and prints. ESC is not stripped either,
+    // so a leading escape shelters what follows it.
     if (opts.trim !== false) {
-      // Leading spaces on a fresh row are dropped.
-      while (rows[rows.length - 1] === "" && index > 0 && word === "") break;
+      rows[rows.length - 1] = rows[rows.length - 1].replace(/^[ \t]+/, "");
     }
 
     const wordWidth = wrap_visibleWidth(word);
@@ -1156,19 +1159,10 @@ function wrap_wrapLine(rawLine, columns, opts) {
 // Remove spaces at the row's edges, keeping escapes. A trailing escape does not
 // shelter the spaces in front of it.
 function wrap_trimRow(row) {
-  let head = "";
-  let i = 0;
-  let sawSpace = false;
-  for (;;) {
-    const esc = wrap_escapeLength(row, i);
-    if (esc) { head += row.slice(i, i + esc); i += esc; continue; }
-    if (row[i] === " ") { sawSpace = true; i++; continue; }
-    // A tab is kept when it opens the row, but discarded once a space has been
-    // crossed: measured, "\tab" keeps its tab and " \t -" trims to "-".
-    if (row[i] === "\t" && sawSpace) { i++; continue; }
-    break;
-  }
-  let body = row.slice(i);
+  // Leading whitespace is handled in the word loop, per iteration. Only the
+  // trailing side is left here.
+  const head = "";
+  let body = row;
 
   let tail = "";
   for (;;) {

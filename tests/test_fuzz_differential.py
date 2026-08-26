@@ -57,8 +57,8 @@ SEEDS = [1, 7, 13, 99, 1337, 20260826, 24301, 424242]
 # this file exists to catch - fix the divergence instead, or pin the input as a
 # refusal if it cannot be matched.
 MAX_WRAP_DIVERGENCES = {
-    1: 472, 7: 483, 13: 509, 99: 481,
-    1337: 475, 20260826: 477, 24301: 519, 424242: 495,
+    1: 444, 7: 459, 13: 473, 99: 451,
+    1337: 444, 20260826: 445, 24301: 491, 424242: 463,
 }
 
 # YAML must be exact: it has a refusal channel, so anything it cannot match is
