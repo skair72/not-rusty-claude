@@ -1327,61 +1327,107 @@ function wrap_wrapLine(rawLine, columns, opts) {
 
 // Remove spaces at the row's edges, keeping escapes. A trailing escape does not
 // shelter the spaces in front of it.
+// Trailing whitespace, stripped by walking BACKWARD from the row's end - the
+// mirror of the leading strip's forward walk. An escape is transparent in
+// both directions: it never shelters what follows it (leading) and never
+// blocks removal of what precedes it (trailing). It is REMOVED from neither
+// side; it just does not count as a stopping point.
+//
+// The removable set is space and tab only - NBSP is NOT removable, matching
+// the leading side exactly. Measured with fromCharCode(0xa0), never typed
+// literally: a bare trailing NBSP survives alone, after visible text, and
+// with a tab after it (which then ALSO survives, since NBSP gives the row
+// nonzero visible width). An early version of this rule added NBSP to the
+// removable set from a probe script where the NBSP had been silently
+// flattened to a plain space by the file-writing tool - the two are
+// visually identical in a terminal, and only a byte-level check caught it.
+//
+// Also measured: TWO escape groups with a space between them, both
+// trailing, both go - "ab SPACE <SGR> SPACE <SGR> TAB" -> "ab<SGR><SGR>" -
+// which the three narrower rules this replaced could not reach, since none
+// of them accounted for an escape sitting BETWEEN two removable runs.
+function wrap_trimTrailing(row) {
+  const tokens = [];
+  let i = 0;
+  while (i < row.length) {
+    const esc = wrap_escapeLength(row, i);
+    if (esc) { tokens.push({ esc: true, text: row.slice(i, i + esc) }); i += esc; continue; }
+    const cp = String.fromCodePoint(row.codePointAt(i));
+    tokens.push({ esc: false, text: cp });
+    i += cp.length;
+  }
+  // If NOTHING in the row is a real glyph - only space, tab, and escapes -
+  // the whole thing collapses to just the escapes, in their original order.
+  // Generalises the single-tab case this replaced ("<SGR>\t" -> "<SGR>"):
+  // measured, "<TAB><SGR><TAB><CSI>" (no glyph anywhere) collapses to just
+  // "<SGR><CSI>" too, which the backward scan below cannot reach on its own
+  // - a tab's own predecessor being ANOTHER tab (not a space, not nothing)
+  // is not a case its per-token rule resolves.
+  if (tokens.every((t) => t.esc || t.text === " " || t.text === "\t")) {
+    return tokens.filter((t) => t.esc).map((t) => t.text).join("");
+  }
+
+  let stop = tokens.length;
+  for (let k = tokens.length - 1; k >= 0; k--) {
+    const t = tokens[k];
+    if (t.esc) continue;
+    if (t.text === " ") { stop = k; continue; }
+    if (t.text === "\t") {
+      // A space is removable regardless of what precedes it. A tab is not -
+      // it only goes if ITS immediate predecessor (skipping escapes) is a
+      // space, or there is none. Measured: NBSP+tab keeps BOTH (NBSP blocks
+      // it, same as any other visible character - "a<ESC>tab" keeps the tab
+      // too), while "ab<SP><ESC>tab" drops both, and a bare "<ESC>tab" with
+      // nothing before it drops the tab, leaving the escape.
+      let j = k - 1;
+      while (j >= 0 && tokens[j].esc) j--;
+      if (j < 0 || tokens[j].text === " ") { stop = k; continue; }
+    }
+    break;
+  }
+  let out = "";
+  for (let k = 0; k < tokens.length; k++) {
+    if (k < stop || tokens[k].esc) out += tokens[k].text;
+  }
+  return out;
+}
+
+// A row that prints NOTHING but zero-width marks - joiners, variation
+// selectors, combining marks - collapses to just its escapes, wherever they
+// sit among the marks. Escapes are state, not content, so they survive; the
+// marks do not.
+//
+// Measured RAW, not the way the breaker measures: the breaker charges a
+// combining mark zero because it costs the row nothing, which is a
+// different question from whether it prints. This has to reach INTO a row
+// that also holds escapes - a lone combining mark, split by a hard break
+// onto a row of its own alongside a CSI, still vanishes (leaving just the
+// CSI) even though the row is not escape-free. An earlier version of this
+// check required the row to contain no escape at all, which was true only
+// by accident: the OLD trailing-trim peeled escapes into a side variable
+// first, so by the time this ran, a mark-only remainder genuinely HAD no
+// escape in it. Once trailing-trim stopped doing that peeling, this check
+// had to look past escapes on its own.
+function wrap_trimZeroWidthMarks(row) {
+  const tokens = [];
+  let i = 0;
+  while (i < row.length) {
+    const esc = wrap_escapeLength(row, i);
+    if (esc) { tokens.push({ esc: true, text: row.slice(i, i + esc) }); i += esc; continue; }
+    const cp = String.fromCodePoint(row.codePointAt(i));
+    tokens.push({ esc: false, text: cp });
+    i += cp.length;
+  }
+  if (tokens.length && tokens.every((t) => t.esc || wrap_pointWidthRaw(t.text) === 0)) {
+    return tokens.filter((t) => t.esc).map((t) => t.text).join("");
+  }
+  return row;
+}
+
 function wrap_trimRow(row) {
   // Leading whitespace is handled in the word loop, per iteration. Only the
   // trailing side is left here.
-  const head = "";
-  let body = row;
-
-  let tail = "";
-  for (;;) {
-    let cut = body.length;
-    let scan = 0;
-    let lastEscStart = -1;
-    while (scan < body.length) {
-      const esc = wrap_escapeLength(body, scan);
-      if (esc) { lastEscStart = scan; scan += esc; continue; }
-      lastEscStart = -1;
-      scan += String.fromCodePoint(body.codePointAt(scan)).length;
-    }
-    if (lastEscStart >= 0 && lastEscStart + wrap_escapeLength(body, lastEscStart) === body.length) {
-      tail = body.slice(lastEscStart) + tail;
-      body = body.slice(0, lastEscStart);
-      continue;
-    }
-    // Trailing mirrors leading: a run that BEGINS with a space goes, tabs
-    // inside it included, while a tab not preceded by a space survives.
-    // Measured on "- \t ", "ab\t", "ab \t", "ab\t ", "ab\t\t", "ab  ",
-    // "ab \t\t", "ab\t \t". Applied per ROW, not per line: stripping the
-    // line first removed the separators that produce an empty final row at
-    // narrow widths.
-    const stripped = body.replace(/ [ \t]*$/, "");
-    if (stripped !== body) { body = stripped; continue; }
-    // A trailing tab goes when the row holds no VISIBLE character - escapes do
-    // not count as visible. Measured: "\u001b[9m\t" trims to "\u001b[9m",
-    // while "\u001b[9mx\t" and "a\u001b[9m\t" keep the tab because something
-    // printable precedes it.
-    if (body.endsWith("\t") && wrap_visibleWidth(body) === 0) {
-      body = body.slice(0, -1);
-      continue;
-    }
-    // A row of code points that print NOTHING - joiners, variation selectors,
-    // combining marks - trims to nothing. Escapes are kept: they are state,
-    // not content.
-    //
-    // Measured RAW, not the way the breaker measures. The breaker charges a
-    // combining mark zero because it costs the row nothing; that is a
-    // different question from whether it prints. The enclosing keycap U+20E3
-    // costs nothing and prints two columns wide, and asking the breaker's
-    // question here wiped the row the oracle keeps for it.
-    if (body !== "" && wrap_pointWidthRaw(body) === 0 && !/\u001b/.test(body)) {
-      body = "";
-      continue;
-    }
-    cut = body.length;
-    break;
-  }
-  return head + body + tail;
+  return wrap_trimZeroWidthMarks(wrap_trimTrailing(row));
 }
 
 // --- join-time escape pass --------------------------------------------------
