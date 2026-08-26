@@ -27,6 +27,8 @@ env var that fixes it. See tests/conftest.py.
 import json
 import os
 import pathlib
+import re
+import shlex
 import subprocess
 
 import pytest
@@ -683,3 +685,35 @@ def test_absent_apis_stay_undefined(node_bin):
     assert not present, (
         f"{present} are defined on the shim's Bun; the artifact feature-detects "
         f"them and a stub sends it down a path that has no working answer")
+
+
+def test_the_shim_path_make_node_run_prints_is_the_one_it_runs():
+    """`make node-run` used to ECHO a different --require argument than it ran.
+
+    The echo said `scripts/bun-shim.cjs`; the recipe executed
+    `$(ROOT)/scripts/bun-shim.cjs`. Those are not two spellings of one path: to
+    `node --require`, a bare `scripts/bun-shim.cjs` is a PACKAGE specifier
+    resolved in node_modules, so the line the target printed died with "Cannot
+    find module" while the target itself worked. Reported from a real macOS host
+    that copied the line it was shown.
+
+    Read statically rather than by running `make`: a subprocess version of this
+    test failed once, unreproducibly, for a reason I could not explain, and a
+    test whose red I cannot account for is worse than none. This asserts the
+    property directly - the printed argument and the executed one are the same
+    string, and it is one Node can resolve (absolute, or explicitly relative).
+    """
+    recipe = (ROOT / "Makefile").read_text()
+    echoed = re.findall(r'echo "==> \$\$node --require (\S+)', recipe)
+    executed = re.findall(r'"\$\$node" --require (\S+)', recipe)
+    assert len(echoed) == 1, f"expected one echoed --require, got {echoed}"
+    assert len(executed) == 1, f"expected one executed --require, got {executed}"
+
+    assert echoed[0] == executed[0], (
+        f"make node-run prints --require {echoed[0]} but runs "
+        f"--require {executed[0]}")
+
+    path = echoed[0].strip("'\"")
+    assert path.startswith("$(ROOT)/") or path.startswith("./"), (
+        f"--require {path!r} is a bare specifier: node resolves it in "
+        f"node_modules, not against the cwd, so the printed command cannot run")
