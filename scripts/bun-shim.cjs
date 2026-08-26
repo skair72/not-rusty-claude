@@ -1304,11 +1304,16 @@ function wrap_render(rows) {
 
     let closer = "";
     if (r !== rows.length - 1) {
+      // Link close FIRST, then the SGR closer. Measured with both in force at
+      // once: the row ends with the link's close followed by the colour reset,
+      // and the reverse order was what this emitted. The opener at row start
+      // uses the opposite order - SGR then link - so the two are not simply
+      // mirrored.
+      if (link) closer += wrap_ESC + "]8;;" + wrap_BEL;
       if (code !== undefined) {
         const c = wrap_closerFor(code);
         if (c !== null && c !== code) closer += wrap_ESC + "[" + c + "m";
       }
-      if (link) closer += wrap_ESC + "]8;;" + wrap_BEL;
     }
     out.push(opener + row + closer);
   }
