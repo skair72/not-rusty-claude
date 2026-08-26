@@ -1075,6 +1075,7 @@ function wrap_breakWord(rows, word, columns) {
 
   let i = 0;
   let pending = "";
+  let taken = null;
   while (i < word.length) {
     const esc = wrap_escapeLength(word, i);
     if (esc) {
@@ -1087,7 +1088,11 @@ function wrap_breakWord(rows, word, columns) {
     }
     const cp = String.fromCodePoint(word.codePointAt(i));
     const w = stringWidth(cp);
-    const taken = wrap_pointWidth(rows[rows.length - 1]);
+    // A running counter, NOT a re-measurement. Whatever stage one placed on
+    // this row was measured by cluster; every code point stage two adds is
+    // measured on its own. Re-measuring the row string picks one rule for both
+    // and gets the other case wrong.
+    if (taken === null) taken = wrap_visibleWidth(rows[rows.length - 1]);
 
     // A zero-width code point with nothing visible after it stays where it is:
     // measured, a trailing tab ends the row it is on rather than opening one.
@@ -1100,9 +1105,8 @@ function wrap_breakWord(rows, word, columns) {
     // draft of this engine had it - a wide glyph following a full row loses the
     // empty row Bun puts between them.
     if (!nothingVisibleAfter) {
-      let free = columns - taken;
-      if (taken === columns) { rows.push(""); free = columns; }
-      if (w > free) rows.push("");
+      if (taken === columns) { rows.push(""); taken = 0; }
+      if (w > columns - taken) { rows.push(""); taken = 0; }
     }
 
     // NOTE: zero-width code points are NOT discarded here. They land on their
@@ -1114,6 +1118,7 @@ function wrap_breakWord(rows, word, columns) {
 
     rows[rows.length - 1] += pending + cp;
     pending = "";
+    taken += w;
     i += cp.length;
   }
   rows[rows.length - 1] += pending;
