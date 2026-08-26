@@ -68,6 +68,10 @@ const WORDS = [
   // measurement works on clusters, so these break differently from how they
   // measure - which is exactly where the model has been wrong.
   "\ud83d\udc4d", "\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67",
+  // The TWO-member family: ICU's RGI_Emoji rejects it on Node 24.19 while
+  // accepting the three-member one, so the shim measured it 4 where Bun says 2.
+  // The corpus held only the three-member form and could not see the bug.
+  "\ud83d\udc68\u200d\ud83d\udc69", "\ud83d\udc68\u200d\ud83d\udc68",
   "\ud83c\uddfa\ud83c\uddf8", "1\ufe0f\u20e3", "\ud83d\udc4b\ud83c\udffd",
   "\ud83c\udff3\ufe0f\u200d\ud83c\udf08", "\ud83d\ude00",
   // Combining marks: zero width, attaching to what precedes them.

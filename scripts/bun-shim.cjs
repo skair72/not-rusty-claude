@@ -202,6 +202,10 @@ function codePointWidth(cp) {
 
 const GRAPHEMES = new Intl.Segmenter("en", { granularity: "grapheme" });
 const RGI_EMOJI = /^\p{RGI_Emoji}$/v;
+const ZWJ = "\u200d";
+// A ZWJ sequence made only of pictographs, joiners and variation selectors.
+const ZWJ_PICTOGRAPHIC =
+  /^\p{Extended_Pictographic}[\u{fe0e}\u{fe0f}\u{1f3fb}-\u{1f3ff}]*(?:\u200d\p{Extended_Pictographic}[\u{fe0e}\u{fe0f}\u{1f3fb}-\u{1f3ff}]*)+$/u;
 const CP_KEYCAP = 0x20e3;
 const CP_VS16 = 0xfe0f;
 const CP_VS15 = 0xfe0e;
@@ -257,6 +261,16 @@ function clusterWidth(cluster) {
   // makes every single code point match Bun on both, and changes nothing on the
   // probe's realistic or adversarial corpora.
   if (count > 1 && RGI_EMOJI.test(cluster)) return 2;
+  // ICU's RGI_Emoji is a curated LIST, and it moves: on Node 24.19 it rejects
+  // the man+woman family while accepting man+woman+girl, so that one cluster
+  // fell through to 2+0+2 = 4 where Bun says 2. Bun's rule is structural
+  // rather than curated - a ZWJ sequence whose parts are all pictographic is
+  // one glyph of width 2 - so ask that instead of trusting the list.
+  //
+  // Measured: emoji+ZWJ+emoji is 2 for every pair tried, including ones the
+  // list rejects, while non-pictographic parts are SUMMED - CJK+ZWJ+CJK is 4,
+  // emoji+ZWJ+letter is 3. So the test is on the parts, not on the joiner.
+  if (count > 1 && cluster.includes(ZWJ) && ZWJ_PICTOGRAPHIC.test(cluster)) return 2;
   if (variationSelector && count > 1 && sum < 1) return 1;
   return sum;
 }
