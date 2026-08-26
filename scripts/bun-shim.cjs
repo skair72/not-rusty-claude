@@ -1322,8 +1322,18 @@ function wrap_render(rows) {
   const out = [];
 
   for (let r = 0; r < rows.length; r++) {
-    const opener = (code === undefined ? "" : wrap_ESC + "[" + code + "m") + (link || "");
     const row = rows[r];
+    // A row that carries nothing does not re-open the style crossing it - it
+    // emits only the closer. Measured at width 1: "<41m>x<CJK>" puts a bare
+    // <49m> on the row between them, not <41m><49m>, and with <23m> - which
+    // closes with nothing - that row comes out completely empty.
+    //
+    // The LAST row is the exception and does re-open: "<41m>a " ends on a row
+    // holding just <41m>. So this is not "empty rows are bare", it is that a
+    // middle row with nothing on it has nothing to style.
+    const bare = row === "" && r !== rows.length - 1;
+    const opener = bare ? ""
+      : (code === undefined ? "" : wrap_ESC + "[" + code + "m") + (link || "");
 
     // Update state from every escape this row contains.
     let i = 0;
