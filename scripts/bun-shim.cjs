@@ -1437,7 +1437,32 @@ function wrap_hasLaterSpace(str, pos) {
   return false;
 }
 
+// A row qualifies (wrap_rowGateQualifies) only when its leading escape run
+// ends in a non-SGR CSI or an ST-terminated OSC 8. Rows are assembled purely
+// from the line's own escapes, so a line holding neither kind can have no
+// qualifying row anywhere in it, and the whole collapse pass below is then a
+// guaranteed no-op. Worth one O(n) scan up front because the pass costs a
+// full row-build per escape cluster, and the overwhelmingly common case -
+// ordinary colorized output, SGRs and nothing else - is exactly the case that
+// can never qualify.
+function wrap_lineCanGate(line) {
+  let p = 0;
+  while (p < line.length) {
+    const esc = wrap_escapeLength(line, p);
+    if (!esc) {
+      p += String.fromCodePoint(line.codePointAt(p)).length;
+      continue;
+    }
+    const text = line.slice(p, p + esc);
+    if (text.startsWith(wrap_ESC + "[") && !text.endsWith("m")) return true;
+    if (wrap_oscGlueEvent(text) === true) return true;
+    p += esc;
+  }
+  return false;
+}
+
 function wrap_collapseMidlineRuns(line, columns, opts) {
+  if (!wrap_lineCanGate(line)) return line;
   let working = line;
   let sawLink = false;
   const consumedRows = new Set();
