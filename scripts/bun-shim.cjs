@@ -1133,9 +1133,15 @@ function wrap_restNeedsNoRoom(rest) {
   while (i < rest.length) {
     const esc = wrap_escapeLength(rest, i);
     if (esc) {
-      const toggle = wrap_oscGlueEvent(rest.slice(i, i + esc));
-      if (toggle === true) return true;
-      if (toggle === false) return false;
+      // A BEL-terminated event is a no-op here, not a reason to stop: we are
+      // scanning from a point where glue is already off, so BEL cannot turn
+      // off something that was never on - it is exactly as transparent as a
+      // plain SGR. Only an ST event matters, because it is the one thing
+      // that can still grant the exemption. Measured: "1" + <VS16> + <keycap
+      // mark> + <BEL-close> + <SGR> inside a BEL-opened (never glued) link
+      // stays on ONE row - treating the BEL-close as "needs room" forced a
+      // break between the VS16 and the mark that Bun does not make.
+      if (wrap_oscGlueEvent(rest.slice(i, i + esc)) === true) return true;
       i += esc;
       continue;
     }
@@ -1404,27 +1410,37 @@ function wrap_trimTrailing(row) {
     return tokens.filter((t) => t.esc).map((t) => t.text).join("");
   }
 
-  let stop = tokens.length;
+  // Find where the trailing space/tab run begins, walking backward from the
+  // end and skipping escapes (NBSP is neither space nor tab, so it stops the
+  // walk exactly like any other real character).
+  let runStart = tokens.length;
   for (let k = tokens.length - 1; k >= 0; k--) {
     const t = tokens[k];
     if (t.esc) continue;
-    if (t.text === " ") { stop = k; continue; }
-    if (t.text === "\t") {
-      // A space is removable regardless of what precedes it. A tab is not -
-      // it only goes if ITS immediate predecessor (skipping escapes) is a
-      // space, or there is none. Measured: NBSP+tab keeps BOTH (NBSP blocks
-      // it, same as any other visible character - "a<ESC>tab" keeps the tab
-      // too), while "ab<SP><ESC>tab" drops both, and a bare "<ESC>tab" with
-      // nothing before it drops the tab, leaving the escape.
-      let j = k - 1;
-      while (j >= 0 && tokens[j].esc) j--;
-      if (j < 0 || tokens[j].text === " ") { stop = k; continue; }
-    }
+    if (t.text === " " || t.text === "\t") { runStart = k; continue; }
     break;
+  }
+  // Within that run, read FORWARD for the first real space and cut there:
+  // everything from that space onward is removed, and any tabs before it
+  // survive. A run with no space at all is not cut anywhere - trailing tabs
+  // alone are never removed. Measured against every combination of one or
+  // two tabs and one or two spaces: "\t\t" (no space) keeps both tabs,
+  // "\t " keeps the tab and drops the space, " \t" drops both (the first
+  // space is at the very start of the run, so nothing survives it), and
+  // "\t \t\t" (tab, space, tab, tab) keeps only the FIRST tab - the point is
+  // the FIRST space in the run, not the nearest one to the cut, which is why
+  // a rule keyed on each token's immediate predecessor could not reach it:
+  // that rule looks at what is behind the CURRENT position, not at whether a
+  // space appears anywhere before it in the run.
+  let cut = tokens.length;
+  for (let k = runStart; k < tokens.length; k++) {
+    const t = tokens[k];
+    if (t.esc) continue;
+    if (t.text === " ") { cut = k; break; }
   }
   let out = "";
   for (let k = 0; k < tokens.length; k++) {
-    if (k < stop || tokens[k].esc) out += tokens[k].text;
+    if (k < cut || tokens[k].esc) out += tokens[k].text;
   }
   return out;
 }

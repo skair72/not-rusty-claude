@@ -48,18 +48,23 @@ COUNT = 8000
 # coverage grows; each one is 8,000 more inputs nobody chose.
 SEEDS = [1, 7, 13, 99, 1337, 20260826, 24301, 424242]
 
-# Measured 2026-08-27 after replacing the single "glue from the first ST
-# opener to the end of the word" model with a left-to-right glue TOGGLE: an
-# ST-terminated OSC 8 event (open or close) turns glue on, a BEL-terminated
-# one turns it off, and a plain escape (SGR etc.) is transparent to it. That
-# was the largest remaining bug family (multi-link words), and fixing it
-# dropped every seed at once. May only go DOWN. Raising it to make a run pass
+# Measured 2026-08-27 after two more fixes on top of the glue-toggle rewrite:
+# (1) trailing space/tab trimming keyed on each token's immediate predecessor
+# could not see PAST the first tab it could not remove, so a run like
+# "<tab><space><tab><tab>" stopped at the first tab instead of finding the
+# space two tokens back - the real rule cuts at the FIRST real space in the
+# trailing run, keeping only what comes before it; (2) the glue-lookahead
+# used by the zero-width-code-point break exemption treated a BEL-terminated
+# OSC 8 event as "needs room" even when glue was never on to begin with,
+# which is a no-op, not a reason to force a break - only an ST event (which
+# actually grants the exemption) should short-circuit the scan. Both fixes
+# dropped every seed again. May only go DOWN. Raising it to make a run pass
 # would be reintroducing the exact defect class this file exists to catch -
 # fix the divergence instead, or pin the input as a refusal if it cannot be
 # matched.
 MAX_WRAP_DIVERGENCES = {
-    1: 10, 7: 9, 13: 15, 99: 14,
-    1337: 9, 20260826: 9, 24301: 10, 424242: 10,
+    1: 7, 7: 7, 13: 11, 99: 11,
+    1337: 5, 20260826: 7, 24301: 5, 424242: 8,
 }
 
 # YAML must be exact: it has a refusal channel, so anything it cannot match is
