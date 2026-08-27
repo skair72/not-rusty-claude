@@ -1373,11 +1373,13 @@ function wrap_wrapLine(rawLine, columns, opts) {
     const wordWidth = wrap_visibleWidth(word);
     let taken = wrap_visibleWidth(rows[rows.length - 1]);
 
+    let prePushed = false;
     if (index !== 0) {
       // The separator space, unless the row is empty and we are trimming.
       if (taken >= columns && (opts.wordWrap === false || opts.trim === false)) {
         rows.push("");
         taken = 0;
+        prePushed = true;
       }
       if (taken > 0 || opts.trim === false) {
         rows[rows.length - 1] += " ";
@@ -1408,7 +1410,27 @@ function wrap_wrapLine(rawLine, columns, opts) {
         wrap_breakWord(rows, word, columns);
         continue;
       }
-      if (taken > 0 && wordWidth > 0) { rows.push(""); taken = 0; }
+      // Skip ONLY when all three hold: the separator above already pushed a
+      // fresh row this same iteration, the word is glued throughout, AND
+      // wordWrap is false. No two of the three are enough on their own -
+      // each was measured by a case that isolates it. An ordinary word
+      // after the same kind of pre-push ("the" alone fills a width-1 row,
+      // "quick" follows, wordWrap left at its true default) still gets its
+      // own second push - Bun keeps the lone separator on its own row and
+      // starts "quick" fresh, so prePushed+wordWrap:false-shaped reasoning
+      // without glue is not enough. A glued word with taken small and no
+      // pre-push (a plain leading gap) still gets pushed onto its own row
+      // too, wordWrap setting aside - so glue alone is not enough. And a
+      // glued word after a genuine pre-push but with wordWrap left at its
+      // true default (not set to false) ALSO still gets pushed - measured
+      // at width 2 with a real word before the gap, trim:false, wordWrap
+      // unset: Bun opens a fourth row for the link rather than folding it
+      // onto the just-refilled third row. Only wordWrap:false changes that.
+      if (taken > 0 && wordWidth > 0 &&
+          !(prePushed && opts.wordWrap === false && wrap_gluedThroughout(word))) {
+        rows.push("");
+        taken = 0;
+      }
       if (opts.wordWrap === false) {
         // The fresh row may hold the whole word, and then it is not broken at
         // all. Measured at width 2: two spaces fill row one, and a ZWJ family

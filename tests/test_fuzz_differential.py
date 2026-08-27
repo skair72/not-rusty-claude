@@ -75,9 +75,23 @@ SEEDS = [1, 7, 13, 99, 1337, 20260826, 24301, 424242]
 # escape in the run instead of keying on the LAST one, so a CSI immediately
 # followed by an SGR reset kept sheltering a tab the SGR should have
 # unsheltered. Both fixes dropped every seed or held it even; none rose.
+#
+# Measured 2026-08-27, a third fix the same day: a row that is refilled to
+# exactly full by the separator space right after a forced pre-push folds a
+# GLUED word onto that row instead of opening another - but only when
+# wordWrap is false. Two broader attempts at this each regressed before
+# landing here: skipping the push for every glued word broke an ordinary
+# full-then-glued-word case that genuinely needs its own fresh row (110+
+# new failures, caught by the fresh 8-seed sweep, not the aggregate count);
+# skipping it whenever the pre-push had just fired broke plain non-glued
+# wrapping ("the"/"quick" each needing a row at width 1) and a glued word
+# reached with wordWrap left at its true default. Only the three-way
+# combination - pre-pushed, glued throughout, AND wordWrap:false - matches
+# Bun; the curated corpus (4,900 cases) caught the second attempt within
+# one pytest run, well before either fuzz sweep was re-measured.
 MAX_WRAP_DIVERGENCES = {
-    1: 6, 7: 6, 13: 9, 99: 9,
-    1337: 5, 20260826: 7, 24301: 5, 424242: 7,
+    1: 5, 7: 6, 13: 8, 99: 8,
+    1337: 5, 20260826: 6, 24301: 5, 424242: 6,
 }
 
 # YAML must be exact: it has a refusal channel, so anything it cannot match is
