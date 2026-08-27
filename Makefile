@@ -465,7 +465,7 @@ node-run: node-deps
 	  echo "error: $$node is Node $$v; the Claude bundle uses ES explicit resource management and needs Node >= $(MIN_NODE_MAJOR)" >&2; exit 1; }; \
 	cfg="$$(mktemp -d "$${TMPDIR:-/tmp}/nrc-node.XXXXXX")"; \
 	trap 'rm -rf "$$cfg"' EXIT INT TERM; \
-	echo "==> $$node --require scripts/bun-shim.cjs $$art $(NODE_ARGS)"; \
+	echo "==> $$node --require '$(ROOT)/scripts/bun-shim.cjs' $$art $(NODE_ARGS)"; \
 	DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$$cfg" NODE_PATH="$$mods" \
 	  python3 -c 'import subprocess,sys; sys.exit(subprocess.run(sys.argv[1:], timeout=300).returncode)' \
 	  "$$node" --require '$(ROOT)/scripts/bun-shim.cjs' "$$art" $(NODE_ARGS); \

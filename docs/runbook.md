@@ -244,14 +244,16 @@ before real use.
 
 **Under Node instead of Bun.** Node **≥ 24** only — the bundle's `using`
 declarations do not parse before it. `make node-deps && make node-run NODE_BIN=<node24>`
-runs the artifact under `node --require scripts/bun-shim.cjs`; the command surface is
-byte-identical to Bun ([findings.md](./findings.md) §11). The **interactive TUI also
-works** — driven through a pty here on 2026-08-26 it painted the banner, took a
-keystroke at the theme picker, rendered the syntax preview and reached the login
-selector — that part on **Linux**, with a scratch config dir. The **authenticated
-REPL** works too, once `Bun.wrapAnsi` and `Bun.YAML.parse` were implemented: confirmed
-2026-08-26 on Apple Silicon with a real authenticated config, which is where it had
-been failing. The troubleshooting row below records what it was.
+runs the artifact under `node --require ./scripts/bun-shim.cjs` (the `./` is
+load-bearing - a bare path is a package specifier, resolved in node_modules and
+never against the cwd); the command surface is byte-identical to Bun
+([findings.md](./findings.md) §11). The **interactive TUI also works** - driven
+through a pty here on 2026-08-26 it painted the banner, took a keystroke at the
+theme picker, rendered the syntax preview and reached the login selector - that
+part on **Linux**, with a scratch config dir. The **authenticated REPL** works
+too, once `Bun.wrapAnsi` and `Bun.YAML.parse` were implemented: confirmed
+2026-08-26 on Apple Silicon with a real authenticated config, which is where it
+had been failing. The troubleshooting row below records what it was.
 
 **Run it by full path.** Do not create a `claude` shim on `PATH`; it would shadow
 your real installation, and every command in this repo is written to be run by
