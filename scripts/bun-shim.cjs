@@ -936,6 +936,63 @@ function gc() {
  * enforceable only by comparison - never by a check in the code.
  * ---------------------------------------------------------------- */
 
+// MAP OF THE THOUSAND LINES BELOW. The header above says WHAT this function
+// is and why it measures width with two different machineries; this says
+// where everything lives, so nobody has to read the whole section to change
+// one rule.
+//
+// The pipeline, in call order. wrapAnsi normalises \r\n, splits on \n, and
+// runs each input line through wrap_render(wrap_wrapLine(...)) with fresh
+// escape state - state never crosses a newline. wrap_wrapLine resolves the
+// whitespace-only line, then (only when opts.trim !== false)
+// wrap_collapseMidlineRuns, then wrap_buildRows. wrap_buildRowsRaw does the
+// real work: it splits the line into words with wrap_splitWords, strips the
+// current row's leading whitespace once per word iteration, decides the
+// separator space and the row pushes, and hands any word too wide for a row
+// to wrap_breakWord, which walks CODE POINTS and mutates rows in place.
+// wrap_buildRows is wrap_buildRowsRaw plus a per-row wrap_trimRow
+// (wrap_trimTrailing, then wrap_trimZeroWidthMarks); the raw variant exists
+// because the collapse pass has to see trailing content that wrap_trimRow
+// would erase before the lookahead could read it. wrap_render owns escape
+// state ACROSS rows: it re-opens the SGR and OSC 8 link in force at each
+// row's start and closes them at its end, and it is the only stage that
+// emits bytes not present in the input.
+//
+// The data model, and its one real limitation. This shim SPLITS a line into
+// words and RECONSTRUCTS the separator spaces during placement. Real Bun
+// almost certainly does not: the evidence throughout the notes below - a gate
+// that is per ROW, a run whose fate depends on what lands in its row after
+// reflow, an eligible-SGR slot spent once per row - all reads as a
+// per-character streaming walk carrying per-row state. Most of the remaining
+// divergences sit exactly where the two models disagree, and so does the cost
+// below. Patching one more placement rule buys one more case; the rewrite
+// that closes the gap is a change of model, not a change of rules.
+//
+// Where per-row state lives, and why a TEXT pre-pass calls the row builder.
+// Rows do not exist until placement, but the whitespace-collapse gate is
+// decided per ROW - wrap_rowGateQualifies reads a row's OWN leading escape
+// run, and wrap_collapseMidlineRuns tracks the one eligible SGR per row in
+// consumedRows. So for every escape cluster it builds the rows of the prefix
+// up to that cluster to learn which row the candidate lands in, and then
+// builds them again around a tentative resolution so wrap_hasLaterSpace can
+// ask what else ends up in that same row. Two full row-builds per candidate,
+// discarded each time.
+//
+// The performance shape follows from that: a line that CAN gate is quadratic
+// where Bun is linear - docs/findings.md section 12 has the measurements and
+// `make wrap-bench` reproduces them. wrap_lineCanGate is why this is not a
+// disaster in practice. One O(n) scan proves that a line holding no non-SGR
+// CSI and no ST-terminated OSC 8 can have no qualifying row anywhere, and
+// ordinary colourised output - SGRs and nothing else - takes that early-out
+// and never builds a row twice.
+//
+// The dense "Measured: ..." comments below are probe results, not prose. Each
+// records what the Bun 1.3.14 binary actually did on an input someone ran,
+// usually after a regression that rule now prevents, and several name the
+// wrong rule they replaced. They are the only record of why any of this is
+// shaped the way it is. Move them with the code they explain; do not compress
+// them away.
+
 const wrap_ESC = "\u001b";
 const wrap_BEL = "\u0007";
 
