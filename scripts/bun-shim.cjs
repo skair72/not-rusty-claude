@@ -1356,16 +1356,32 @@ function wrap_breakWord(rows, word, columns) {
 // "[6n" or "[2K" when nothing else intervenes) - only "has an OSC 8
 // appeared yet" gates it, tracked once while scanning left to right.
 function wrap_collapseMidlineRuns(line) {
-  // Leading spaces/tabs before the CSI do not block this - measured, " \t "
-  // + a non-SGR CSI collapses a later run exactly as the CSI alone does.
-  // A leading VISIBLE character does block it, though ("z" + the same CSI
-  // leaves the later run untouched) - only whitespace is transparent here.
+  // Leading spaces/tabs before the escape run do not block this - measured,
+  // " \t " + a non-SGR CSI collapses a later run exactly as the CSI alone
+  // does. A leading VISIBLE character does block it, though ("z" + the same
+  // CSI leaves the later run untouched) - only whitespace is transparent.
+  //
+  // The gate is decided by the LAST escape in that leading run, not the
+  // first - measured across every SGR/CSI ordering (C, CC, CS, SC, CCS, CSC,
+  // CCC as single letters for "non-SGR CSI" and "SGR"): whichever one is
+  // LAST decides it, regardless of what came before. A trailing
+  // ST-terminated OSC 8 event qualifies the same as a non-SGR CSI; a
+  // BEL-terminated one does not - the same real-glue-vs-BEL distinction
+  // wrap_oscGlueEvent encodes everywhere else in this file.
   let start = 0;
   while (start < line.length && (line[start] === " " || line[start] === "\t")) start++;
-  const firstEsc = wrap_escapeLength(line, start);
-  if (!firstEsc) return line;
-  const first = line.slice(start, start + firstEsc);
-  if (!(first.startsWith(wrap_ESC + "[") && !first.endsWith("m"))) return line;
+  let gatePos = start;
+  let lastEsc = null;
+  while (gatePos < line.length) {
+    const esc = wrap_escapeLength(line, gatePos);
+    if (!esc) break;
+    lastEsc = line.slice(gatePos, gatePos + esc);
+    gatePos += esc;
+  }
+  if (lastEsc === null) return line;
+  const qualifies = (lastEsc.startsWith(wrap_ESC + "[") && !lastEsc.endsWith("m")) ||
+      wrap_oscGlueEvent(lastEsc) === true;
+  if (!qualifies) return line;
 
   let out = "";
   let i = 0;
