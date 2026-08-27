@@ -144,7 +144,7 @@ SEEDS = [1, 7, 13, 99, 1337, 20260826, 24301, 424242]
 # the aggregate count, which briefly rose by one on 7 of 8 seeds before the
 # trim:false guard landed. This dropped every seed again (30 -> 26 total).
 MAX_WRAP_DIVERGENCES = {
-    1: 2, 7: 2, 13: 3, 99: 0,
+    1: 1, 7: 2, 13: 3, 99: 0,
     1337: 0, 20260826: 2, 24301: 1, 424242: 2,
 }
 

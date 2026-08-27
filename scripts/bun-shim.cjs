@@ -1583,8 +1583,24 @@ function wrap_wrapLine(rawLine, columns, opts) {
       // refilled by an ordinary (non-glued) separator, no pre-push in
       // sight: columns 3-7 (word fits a fresh row) all push same as ever;
       // only columns 2 (3 > 2, the word could never fit alone) skips it.
+      //
+      // wrap_gluedThroughout(word) is not the only shape that gets this
+      // exemption: a word that opens with zero-width escapes (an SGR, say)
+      // and only turns permanently glued a few escapes in behaves exactly
+      // the same way once wrap_breakWord reaches the glue - nothing after
+      // it costs the row anything, so the push decision is answering a
+      // question this word does not ask, same as the opts.hard case above.
+      // wordWidth > 0 is already required to reach this line, so
+      // wrap_restNeedsNoRoom(word) cannot be the vacuous "trailing
+      // whitespace, no glue at all" true - reaching the word's own visible
+      // content before any glue open makes it return false instead.
+      // Measured: " \t " + an SGR + a glued CJK link at width 2,
+      // trim:false, wordWrap:false stays on ONE row; gluedThroughout alone
+      // said false (glue starts after the SGR, not at position 0) and
+      // pushed a row that Bun never opens.
       if (taken > 0 && wordWidth > 0 &&
-          !(opts.wordWrap === false && wrap_gluedThroughout(word) &&
+          !(opts.wordWrap === false &&
+            (wrap_gluedThroughout(word) || wrap_restNeedsNoRoom(word)) &&
             (prePushed || wordWidth > columns))) {
         rows.push("");
         taken = 0;
