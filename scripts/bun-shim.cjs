@@ -1355,63 +1355,77 @@ function wrap_breakWord(rows, word, columns) {
 // does not matter either way (cursor-up "[1A" behaves exactly like
 // "[6n" or "[2K" when nothing else intervenes) - only "has an OSC 8
 // appeared yet" gates it, tracked once while scanning left to right.
-function wrap_collapseMidlineRuns(line) {
-  // Leading spaces/tabs before the escape run do not block this - measured,
-  // " \t " + a non-SGR CSI collapses a later run exactly as the CSI alone
-  // does. A leading VISIBLE character does block it, though ("z" + the same
-  // CSI leaves the later run untouched) - only whitespace is transparent.
-  //
-  // The gate is decided by the LAST escape in that leading run, not the
-  // first - measured across every SGR/CSI ordering (C, CC, CS, SC, CCS, CSC,
-  // CCC as single letters for "non-SGR CSI" and "SGR"): whichever one is
-  // LAST decides it, regardless of what came before. A trailing
-  // ST-terminated OSC 8 event qualifies the same as a non-SGR CSI; a
-  // BEL-terminated one does not - the same real-glue-vs-BEL distinction
-  // wrap_oscGlueEvent encodes everywhere else in this file.
+// Whether a row's OWN leading escape run (before its first real character)
+// qualifies a whitespace run right after it for collapsing - the LAST
+// escape in that run decides it, not the first: measured across every
+// SGR/CSI ordering (C, CC, CS, SC, CCS, CSC, CCC as single letters for
+// "non-SGR CSI" and "SGR"), whichever is LAST decides it regardless of what
+// came before. A trailing ST-terminated OSC 8 event qualifies the same as a
+// non-SGR CSI; a BEL-terminated one does not - the same real-glue-vs-BEL
+// distinction wrap_oscGlueEvent encodes everywhere else in this file.
+function wrap_rowGateQualifies(row) {
   let start = 0;
-  while (start < line.length && (line[start] === " " || line[start] === "\t")) start++;
+  while (start < row.length && (row[start] === " " || row[start] === "\t")) start++;
   let gatePos = start;
   let lastEsc = null;
-  while (gatePos < line.length) {
-    const esc = wrap_escapeLength(line, gatePos);
+  while (gatePos < row.length) {
+    const esc = wrap_escapeLength(row, gatePos);
     if (!esc) break;
-    lastEsc = line.slice(gatePos, gatePos + esc);
+    lastEsc = row.slice(gatePos, gatePos + esc);
     gatePos += esc;
   }
-  if (lastEsc === null) return line;
-  const qualifies = (lastEsc.startsWith(wrap_ESC + "[") && !lastEsc.endsWith("m")) ||
+  if (lastEsc === null) return false;
+  return (lastEsc.startsWith(wrap_ESC + "[") && !lastEsc.endsWith("m")) ||
       wrap_oscGlueEvent(lastEsc) === true;
-  if (!qualifies) return line;
+}
 
-  let out = "";
-  let i = 0;
+// The gate is per ROW, not per line - measured (probe51): a non-SGR CSI
+// mid-line, before any wrapping, does not gate a later same-line SGR
+// (nothing at the LINE's own start), but the identical CSI, once a forced
+// break lands it at the START of a later row, gates an SGR later in THAT
+// row - even though the line itself still has no leading escape. Decided
+// left to right, one candidate at a time, because collapsing only removes
+// characters AFTER the candidate SGR: wrapping the prefix up to and
+// including a candidate (with every earlier collapse already applied)
+// tells us exactly which row it lands on, and that row's own leading run -
+// via wrap_rowGateQualifies - is what decides this candidate. sawLink stays
+// scoped to the whole line, unchanged from before: once any link has been
+// seen, no later SGR in the line collapses its whitespace, on any row.
+function wrap_collapseMidlineRuns(line, columns, opts) {
+  let working = line;
   let sawLink = false;
-  while (i < line.length) {
-    const esc = wrap_escapeLength(line, i);
-    if (esc) {
-      const text = line.slice(i, i + esc);
-      out += text;
-      i += esc;
-      if (text.startsWith(wrap_ESC + "]8;")) { sawLink = true; continue; }
-      if (!sawLink && text.startsWith(wrap_ESC + "[") && text.endsWith("m")) {
-        let j = i;
-        let lastSpace = -1;
-        while (j < line.length && (line[j] === " " || line[j] === "\t")) {
-          if (line[j] === " ") lastSpace = j;
-          j++;
-        }
-        if (lastSpace !== -1) {
-          out += line.slice(lastSpace, j);
-          i = j;
-        }
-      }
+  let i = 0;
+  while (i < working.length) {
+    const esc = wrap_escapeLength(working, i);
+    if (!esc) {
+      i += String.fromCodePoint(working.codePointAt(i)).length;
       continue;
     }
-    const cp = String.fromCodePoint(line.codePointAt(i));
-    out += cp;
-    i += cp.length;
+    const text = working.slice(i, i + esc);
+    if (text.startsWith(wrap_ESC + "]8;")) { sawLink = true; i += esc; continue; }
+    if (!sawLink && text.startsWith(wrap_ESC + "[") && text.endsWith("m")) {
+      let runEnd = i + esc;
+      let lastSpace = -1;
+      while (runEnd < working.length && (working[runEnd] === " " || working[runEnd] === "\t")) {
+        if (working[runEnd] === " ") lastSpace = runEnd;
+        runEnd++;
+      }
+      if (lastSpace !== -1) {
+        const prefix = working.slice(0, i + esc);
+        const prefixRows = wrap_buildRows(prefix, columns, opts);
+        if (wrap_rowGateQualifies(prefixRows[prefixRows.length - 1])) {
+          const kept = working.slice(lastSpace, runEnd);
+          working = working.slice(0, i + esc) + kept + working.slice(runEnd);
+          i = i + esc + kept.length;
+          continue;
+        }
+      }
+      i += esc;
+      continue;
+    }
+    i += esc;
   }
-  return out;
+  return working;
 }
 
 function wrap_wrapLine(rawLine, columns, opts) {
@@ -1420,8 +1434,11 @@ function wrap_wrapLine(rawLine, columns, opts) {
   // trimming. NOT JS trim(): that counts NBSP as whitespace, and measured, a
   // lone NBSP survives (it is width 1 and prints) while a lone space does not.
   if (opts.trim !== false && /^[ \t]*$/.test(line)) return [""];
-  if (opts.trim !== false) line = wrap_collapseMidlineRuns(line);
+  if (opts.trim !== false) line = wrap_collapseMidlineRuns(line, columns, opts);
+  return wrap_buildRows(line, columns, opts);
+}
 
+function wrap_buildRows(line, columns, opts) {
   const words = wrap_splitWords(line);
   const rows = [""];
 
