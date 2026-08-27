@@ -1535,7 +1535,18 @@ function wrap_wrapLine(rawLine, columns, opts) {
       // ask: measured at width 1, "x" then two spaces then a glued link
       // stays on ONE row with the second space, and pre-pushing a blank row
       // here put the link on a row of its own instead.
-      if (!wrap_gluedThroughout(word)) {
+      //
+      // The same is true of a word that is not glued at position 0 but
+      // turns permanently glued before anything in it costs the row a
+      // column - a leading SGR (zero width) then an ST-terminated OSC 8
+      // open, say. wrap_gluedThroughout requires glue AT position 0 and
+      // says false here, but wrap_breakWord still never breaks this word:
+      // it walks the SGR for free, then glue latches on and everything
+      // after rides along on whatever row it lands on. Measured: " " +
+      // SGR + a glued link at width 1, hard:true, trim:false stays on ONE
+      // row ("space, SGR, glued text"); the row-count math below, run on
+      // this word, wrongly pre-pushed an empty row for it.
+      if (!wrap_gluedThroughout(word) && !wrap_restNeedsNoRoom(word)) {
         const remaining = columns - taken;
         const breaksHere = 1 + Math.floor((wordWidth - remaining - 1) / columns);
         const breaksNext = Math.floor((wordWidth - 1) / columns);
