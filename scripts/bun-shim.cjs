@@ -1509,8 +1509,29 @@ function wrap_wrapLine(rawLine, columns, opts) {
       const rest = words.slice(index).join("");
       const blankExempt = wordWidth === 0 && !wrap_gluedThroughout(word) &&
           wrap_hasGlueOpen(rest) && wrap_restNeedsNoRoom(rest);
+      // A non-blank word gets the same push+space exemption when IT (not
+      // some later word) opens with zero-width escapes and only turns
+      // permanently glued a few escapes in - the same glue-prefix shape
+      // already exempted from the two too-wide-word push guards below.
+      // Unlike blankExempt this never skips PLACEMENT: the word still has
+      // real content that must reach wrap_breakWord/the normal path, so no
+      // continue here - only gluedThroughout(word) got that far before.
+      // Measured: a ZWJ family emoji, three spaces, then an SGR + a glued
+      // "." link at width 4, hard:true, wordWrap:false - the row is
+      // exactly full by the third space, and Bun attaches the glued word
+      // directly rather than opening a row for it.
+      //
+      // wordWidth > 0 is required here (unlike the two too-wide-word push
+      // guards, where it is already guaranteed by the surrounding
+      // structure): without it, a genuinely blank word with NO glue
+      // anywhere near it - wordWidth 0, nothing left to scan - would make
+      // wrap_restNeedsNoRoom(word) vacuously true and wrongly claim this
+      // exemption. blankExempt already covers the blank-word case, with
+      // its own wrap_hasGlueOpen guard against that same vacuous true.
+      const gluePrefixed = wrap_gluedThroughout(word) ||
+          (wordWidth > 0 && wrap_restNeedsNoRoom(word));
       if (taken >= columns && opts.trim !== false && opts.wordWrap === false &&
-          (wrap_gluedThroughout(word) || blankExempt)) {
+          (gluePrefixed || blankExempt)) {
         // Nothing: skip both steps below entirely.
         if (blankExempt) continue;
       } else {
