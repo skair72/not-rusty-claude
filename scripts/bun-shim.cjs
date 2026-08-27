@@ -1437,15 +1437,33 @@ function wrap_wrapLine(rawLine, columns, opts) {
 
     let prePushed = false;
     if (index !== 0) {
-      // The separator space, unless the row is empty and we are trimming.
-      if (taken >= columns && (opts.wordWrap === false || opts.trim === false)) {
-        rows.push("");
-        taken = 0;
-        prePushed = true;
-      }
-      if (taken > 0 || opts.trim === false) {
-        rows[rows.length - 1] += " ";
-        taken += 1;
+      // A row already exactly full (or over) gets neither the pre-push NOR
+      // the separator space when wordWrap is false and the UPCOMING word is
+      // glued throughout - it attaches directly to whatever is already
+      // there. Measured at width 1: "the quick" broken char by char fills
+      // its last row with "k", and a glued word right after it attaches
+      // with no space and no fresh row - "k<link>abc</link>", not "k
+      // <link>abc</link>" on its own row. A non-glued word in the same spot
+      // still gets the ordinary pre-push and space.
+      //
+      // trim:false turns this back off: "k" + glued word at width 1 merges
+      // with trim left at its default, but with trim:false the SAME input
+      // pre-pushes and keeps the separator space exactly as an ungated word
+      // would - "k\n <link>abc</link>", not "k<link>abc</link>".
+      if (taken >= columns && opts.trim !== false && opts.wordWrap === false &&
+          wrap_gluedThroughout(word)) {
+        // Nothing: skip both steps below entirely.
+      } else {
+        // The separator space, unless the row is empty and we are trimming.
+        if (taken >= columns && (opts.wordWrap === false || opts.trim === false)) {
+          rows.push("");
+          taken = 0;
+          prePushed = true;
+        }
+        if (taken > 0 || opts.trim === false) {
+          rows[rows.length - 1] += " ";
+          taken += 1;
+        }
       }
     }
 
@@ -1472,24 +1490,31 @@ function wrap_wrapLine(rawLine, columns, opts) {
         wrap_breakWord(rows, word, columns);
         continue;
       }
-      // Skip ONLY when all three hold: the separator above already pushed a
-      // fresh row this same iteration, the word is glued throughout, AND
-      // wordWrap is false. No two of the three are enough on their own -
-      // each was measured by a case that isolates it. An ordinary word
-      // after the same kind of pre-push ("the" alone fills a width-1 row,
-      // "quick" follows, wordWrap left at its true default) still gets its
-      // own second push - Bun keeps the lone separator on its own row and
-      // starts "quick" fresh, so prePushed+wordWrap:false-shaped reasoning
-      // without glue is not enough. A glued word with taken small and no
-      // pre-push (a plain leading gap) still gets pushed onto its own row
-      // too, wordWrap setting aside - so glue alone is not enough. And a
-      // glued word after a genuine pre-push but with wordWrap left at its
-      // true default (not set to false) ALSO still gets pushed - measured
-      // at width 2 with a real word before the gap, trim:false, wordWrap
-      // unset: Bun opens a fourth row for the link rather than folding it
-      // onto the just-refilled third row. Only wordWrap:false changes that.
+      // Skip the push when wordWrap is false, the word is glued throughout,
+      // AND (the separator above already pushed a fresh row this same
+      // iteration OR the word is wider than the terminal anyway). Neither
+      // half of that last OR is enough alone with the first two: an ordinary
+      // word after the same kind of pre-push ("the" alone fills a width-1
+      // row, "quick" follows, wordWrap left at its true default) still gets
+      // its own second push - so prePushed+wordWrap:false-shaped reasoning
+      // without glue is not enough; a glued word after a genuine pre-push
+      // but with wordWrap left at its true default ALSO still gets pushed -
+      // measured at width 2 with a real word before the gap, trim:false,
+      // wordWrap unset: Bun opens a fourth row rather than folding onto the
+      // just-refilled row. Only wordWrap:false changes that.
+      //
+      // The wordWidth > columns half: a glued word that could never fit a
+      // fresh row EITHER gains nothing from pushing one, since
+      // wrap_breakWord dumps a glued word raw regardless of which row it
+      // starts on - and Bun skips the push in exactly that situation even
+      // with NO pre-push at all. Measured by holding the glued word's width
+      // fixed at 3 and sweeping columns from 2 to 7 with the row exactly
+      // refilled by an ordinary (non-glued) separator, no pre-push in
+      // sight: columns 3-7 (word fits a fresh row) all push same as ever;
+      // only columns 2 (3 > 2, the word could never fit alone) skips it.
       if (taken > 0 && wordWidth > 0 &&
-          !(prePushed && opts.wordWrap === false && wrap_gluedThroughout(word))) {
+          !(opts.wordWrap === false && wrap_gluedThroughout(word) &&
+            (prePushed || wordWidth > columns))) {
         rows.push("");
         taken = 0;
       }
