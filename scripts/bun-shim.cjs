@@ -1082,85 +1082,122 @@ function wrap_pointWidth(text) {
   return total;
 }
 
-// Where an ST-terminated OSC 8 link starts gluing a word together, or -1 if
-// none does. Pulled out of wrap_breakWord so the OUTER word-placement loop
-// can ask the same question before deciding whether a word will actually be
-// broken at all - a fully-glued word (glueFrom 0) is appended raw regardless
-// of width, so row-count math that assumes breaking happens is wrong for it.
-//
-// An ST-terminated OSC makes everything after it in this word unbreakable -
-// including text past the link's close. Measured: a linked word plus trailing
-// text stays on one row, while a following SEPARATE word wraps normally, so
-// the state is per word rather than per line.
-// The glue starts AT the ST-terminated link, not at the start of the word:
-// measured, halfwidth kana before such a link still breaks per character
-// while everything from the link onward stays on one row. An early return
-// for the whole word - which is what this did first - glued the prefix too.
-function wrap_glueFrom(word) {
-  for (let scan = 0; scan < word.length; ) {
+// An OSC 8 event's terminator, not whether it opens or closes a link, decides
+// whether it glues. Measured with a state machine, not a single scan: an
+// ST-terminated event (open OR close, any uri) turns glue ON; a
+// BEL-terminated OSC 8 event turns it OFF. While glued the running width
+// counter is simply never touched - not charged, not reset - so it resumes
+// counting from wherever it stood before glue began once glue ends. A bare
+// ST-terminated close with nothing before or after it glues the rest of the
+// word just as an opener does - "only openers glue" was a narrower rule that
+// happened to match every case tried until one without a following BEL
+// exposed it: "<st-close>abcdefgh" glues the whole thing under Bun. A plain
+// SGR (or any non-OSC-8 escape) is transparent to this state - it neither
+// toggles glue nor touches the counter.
+// Returns null if `text` is not an OSC 8 event; otherwise true (ST, glue on)
+// or false (BEL, glue off).
+function wrap_oscGlueEvent(text) {
+  if (!text.startsWith(wrap_ESC + "]8;;")) return null;
+  if (text.endsWith(wrap_ESC + "\\")) return true;
+  if (text.endsWith(wrap_BEL)) return false;
+  return null;
+}
+
+// Whether wrap_breakWord will treat this word as one raw, unbroken blob: it
+// must OPEN glued (its first escape is an ST-terminated OSC 8 event) and stay
+// glued with no BEL event anywhere later to end it. This is what the
+// row-count pre-push math in wrap_wrapLine needs to know - that math answers
+// "how many times will this word be broken", which is meaningless for a word
+// wrap_breakWord never breaks at all.
+function wrap_gluedThroughout(word) {
+  const firstEsc = wrap_escapeLength(word, 0);
+  if (!firstEsc || wrap_oscGlueEvent(word.slice(0, firstEsc)) !== true) return false;
+  for (let scan = firstEsc; scan < word.length; ) {
     const esc = wrap_escapeLength(word, scan);
     if (!esc) { scan += String.fromCodePoint(word.codePointAt(scan)).length; continue; }
-    const text = word.slice(scan, scan + esc);
-    // Only an OPENER glues. An ST-terminated OSC 8 with an EMPTY uri is a
-    // close, and a close opens no link, so there is nothing for it to hold
-    // together. Minimised from real failures: "<st-close><bel-close>wo" at
-    // width 1 breaks to "w" and "o", and we were gluing it to one row purely
-    // because the close happened to be ST-terminated.
-    if (text.startsWith(wrap_ESC + "]8;;") && text.endsWith(wrap_ESC + "\\")) {
-      const uri = text.slice(5, -2);
-      // ...and only if the link actually COVERS something. An OSC 8 that is
-      // immediately followed by another OSC 8 is superseded before it reaches
-      // any text, so it holds nothing together. Minimised from real failures:
-      // "<st-open><bel-open>CJK" breaks per character under the oracle, and we
-      // glued the whole line onto one row because an ST-terminated opener was
-      // present somewhere.
-      const nextLen = wrap_escapeLength(word, scan + esc);
-      const superseded = nextLen > 0 &&
-        word.slice(scan + esc, scan + esc + nextLen).startsWith(wrap_ESC + "]8;;");
-      if (uri !== "" && !superseded) return scan;
-    }
+    if (wrap_oscGlueEvent(word.slice(scan, scan + esc)) === false) return false;
     scan += esc;
   }
-  return -1;
+  return true;
+}
+
+// True if nothing from here to the end of `rest` will ever need row space:
+// either it is all zero-width code points and transparent escapes, or it
+// reaches a glue-ON event first - and glued content is exempt from width
+// entirely, so anything after that event needs no room either. Measured:
+// "abc<TAB><ST-open>de<ST-close>" at width 3 does NOT break before the tab,
+// while "abc<TAB>de" (no link) does - the tab is zero-width either way, so
+// the difference is what comes after it, not the tab itself.
+function wrap_restNeedsNoRoom(rest) {
+  let i = 0;
+  while (i < rest.length) {
+    const esc = wrap_escapeLength(rest, i);
+    if (esc) {
+      const toggle = wrap_oscGlueEvent(rest.slice(i, i + esc));
+      if (toggle === true) return true;
+      if (toggle === false) return false;
+      i += esc;
+      continue;
+    }
+    const cp = String.fromCodePoint(rest.codePointAt(i));
+    if (wrap_pointCellWidth(cp) !== 0) return false;
+    i += cp.length;
+  }
+  return true;
 }
 
 function wrap_breakWord(rows, word, columns) {
-  const glueFrom = wrap_glueFrom(word);
-  if (glueFrom === 0) {
-    rows[rows.length - 1] += word;
-    return;
-  }
-  if (glueFrom > 0) {
-    wrap_breakWord(rows, word.slice(0, glueFrom), columns);
-    rows[rows.length - 1] += word.slice(glueFrom);
-    return;
-  }
-
   let i = 0;
   let pending = "";
   let taken = null;
+  let glued = false;
   while (i < word.length) {
     const esc = wrap_escapeLength(word, i);
     if (esc) {
+      const text = word.slice(i, i + esc);
+      const toggle = wrap_oscGlueEvent(text);
+      if (toggle === true) glued = true;
+      else if (toggle === false) glued = false;
       // Held back, not emitted: an escape at a break belongs to the row that
       // follows it. Measured at width 1, where the sequence opening a word
       // leads the next row instead of trailing the previous one.
-      pending += word.slice(i, i + esc);
+      pending += text;
       i += esc;
       continue;
     }
     const cp = String.fromCodePoint(word.codePointAt(i));
-    const w = wrap_pointCellWidth(cp);
     // A running counter, NOT a re-measurement. Whatever stage one placed on
     // this row was measured by cluster; every code point stage two adds is
     // measured on its own. Re-measuring the row string picks one rule for both
-    // and gets the other case wrong.
+    // and gets the other case wrong. Seeded here, on the FIRST real code
+    // point, regardless of glue state - not only once unglued - or a word
+    // that opens glued would re-derive it later from wrap_visibleWidth of a
+    // row that by then holds the raw glued text, double-counting content
+    // glue was supposed to charge nothing for.
     if (taken === null) taken = wrap_visibleWidth(rows[rows.length - 1]);
+    if (glued) {
+      // While glued, everything is appended raw - no width check, no break,
+      // and no charge to the counter - regardless of how little room is
+      // left on the row. Measured: a row already exactly full when glue
+      // turns back off resumes counting from that same fullness, not from
+      // zero - "abc" + <BEL-open>"def"<BEL-close> at width 3 breaks right
+      // after "abc", because the counter was never touched while unglued
+      // content never appeared, and forcing it to zero on the glue-off
+      // transition here erased that fullness and let "def" spill onto the
+      // still-full row instead.
+      rows[rows.length - 1] += pending + cp;
+      pending = "";
+      i += cp.length;
+      continue;
+    }
+    const w = wrap_pointCellWidth(cp);
 
     // A zero-width code point with nothing visible after it stays where it is:
     // measured, a trailing tab ends the row it is on rather than opening one.
+    // "Nothing visible" reaches through a glue-ON event too - see
+    // wrap_restNeedsNoRoom.
     const rest = word.slice(i + cp.length);
-    const nothingVisibleAfter = w === 0 && wrap_pointWidth(rest) === 0;
+    const nothingVisibleAfter = w === 0 && wrap_restNeedsNoRoom(rest);
 
     // Two INDEPENDENT reasons to break, and both can fire for one code point.
     // A row that is exactly full yields to whatever comes next; a glyph too
@@ -1277,7 +1314,7 @@ function wrap_wrapLine(rawLine, columns, opts) {
       // ask: measured at width 1, "x" then two spaces then a glued link
       // stays on ONE row with the second space, and pre-pushing a blank row
       // here put the link on a row of its own instead.
-      if (wrap_glueFrom(word) !== 0) {
+      if (!wrap_gluedThroughout(word)) {
         const remaining = columns - taken;
         const breaksHere = 1 + Math.floor((wordWidth - remaining - 1) / columns);
         const breaksNext = Math.floor((wordWidth - 1) / columns);

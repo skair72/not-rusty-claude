@@ -48,17 +48,18 @@ COUNT = 8000
 # coverage grows; each one is 8,000 more inputs nobody chose.
 SEEDS = [1, 7, 13, 99, 1337, 20260826, 24301, 424242]
 
-# Measured 2026-08-26 with these seeds and COUNT, against the WIDENED grammar -
-# the counts are higher than the first pinning because the vocabulary now
-# reaches shapes the old one could not generate, not because anything got
-# worse. wrapAnsi's divergences concentrate at narrow widths and involve
-# ST-terminated hyperlinks, ZWJ sequences and combining marks. May only go DOWN.
-# Raising it to make a run pass would be reintroducing the exact defect class
-# this file exists to catch - fix the divergence instead, or pin the input as a
-# refusal if it cannot be matched.
+# Measured 2026-08-27 after replacing the single "glue from the first ST
+# opener to the end of the word" model with a left-to-right glue TOGGLE: an
+# ST-terminated OSC 8 event (open or close) turns glue on, a BEL-terminated
+# one turns it off, and a plain escape (SGR etc.) is transparent to it. That
+# was the largest remaining bug family (multi-link words), and fixing it
+# dropped every seed at once. May only go DOWN. Raising it to make a run pass
+# would be reintroducing the exact defect class this file exists to catch -
+# fix the divergence instead, or pin the input as a refusal if it cannot be
+# matched.
 MAX_WRAP_DIVERGENCES = {
-    1: 16, 7: 20, 13: 22, 99: 21,
-    1337: 16, 20260826: 14, 24301: 18, 424242: 25,
+    1: 10, 7: 9, 13: 15, 99: 14,
+    1337: 9, 20260826: 9, 24301: 10, 424242: 10,
 }
 
 # YAML must be exact: it has a refusal channel, so anything it cannot match is
