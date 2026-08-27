@@ -1139,8 +1139,12 @@ the `globalThis.Bun.which` it misses). The shim covers **25** names — the extr
 `Bun.stdin`, occurs only in a doc string. It implements **seven** —
 `stringWidth`, `stripANSI`, `hash`, `which`, `semver.order`, `deepEquals`, `gc`
 — each pinned by a differential test against Bun in
-`tests/test_node_runtime.py`. Eleven throw, naming the API (`YAML`, `spawn`,
-`file`, `serve`, …); **seven** stay deliberately *undefined* (`Terminal`,
+`tests/test_node_runtime.py`. Two more arrived on 2026-08-26, `wrapAnsi` and
+`YAML.parse`, because the interactive REPL calls both and a refusal there was
+being swallowed by a React error boundary: nine implemented, with their own
+corpora in `tests/test_wrap_ansi.py` and `tests/test_yaml_parse.py`. Nine
+throw, naming the API (`spawn`, `file`, `serve`, …), and `YAML.parse` still
+refuses the constructs it could not match; **seven** stay deliberately *undefined* (`Terminal`,
 `WebView`, `JSONL`, `version`, `isStandaloneExecutable`, `stdin`) because the
 bundle feature-detects them — a plausible-looking stub is the §10 failure mode
 — and `Bun.ant`, for the opposite reason: it is not feature-detected, it is
@@ -1155,8 +1159,180 @@ claimed a surface the oracle lacks; all three call sites are bare
 `--version` (22 B), `--help` (16,890 B), `mcp list` (65 B) and `config ls`
 (35 B, exit 1 both) give byte-identical stdout and equal exit codes; `doctor`
 (973 B) differs in one line, `Path:`, naming the interpreter actually running.
-⚠️ **No agentic or interactive session has ever been run under Node**, here or
-anywhere — this is the command surface only.
+⚠️ **No agentic session — a real conversation with tool use — has ever been run
+under Node**, here or anywhere. The *interactive* path has, as of 2026-08-26:
+onboarding through a pty on Linux, and the authenticated REPL on Apple Silicon
+with a real config. Getting there is what `wrapAnsi` and `YAML.parse` were
+implemented for.
+
+---
+
+## 12. `Bun.wrapAnsi` answers like Bun, but not in Bun's time ⚠️
+
+Measured 2026-08-27 on this Linux host, `scripts/wrap-bench.cjs` under both
+runtimes (`make wrap-bench`), COLS=100, BUDGET=1000ms. The differential fuzzing
+measures how closely the shim's *answers* track Bun's — closely, but not
+exactly: 38 divergences remain across the 100-seed sweep, and §13 documents a
+shape the grammar cannot even reach. Nothing in the suite measures how long
+those answers take, and that turns out to be the larger gap.
+
+**How to read this table, including its error bars.** Every cell is the median
+of 3 reps, interleaved — rep 1 of every revision, then rep 2, then rep 3 — so
+host drift is spread across the columns rather than landing on whichever
+revision was measured last. It is not eliminated: the driver walks the
+revisions in a fixed order within each rep, so column position stays
+confounded with any drift *inside* a rep, and n=3 is too few to separate them.
+This is better than the separate single runs it replaces, which had this branch
+carrying both 16.9 ms and 17.9 ms for the same row and reading the gap as
+signal. It is not a controlled experiment.
+
+Per-column rep-to-rep spread, `(max-min)/min`, worst row of each: shim columns
+16-19%, Bun 33%. **The Bun column is the noisy one**, because its cells are
+0.01 ms and the timer is not that sharp — so the ratios below are soft in
+their last digit and are rounded to two significant figures. The 410x cell is
+the weakest: pick a different one of the three Bun samples and it reads
+anywhere from 345x to 460x. Ratios are the portable part; absolute
+milliseconds belong to this host and this load.
+
+| case | Bun 1.3.14 | node + shim | ratio |
+|---|---|---|---|
+| plain 40-line frame (5,739 ch) | 0.287 ms | 16.0 ms | 56x |
+| plain code line (156 ch) | 0.009 ms | 0.325 ms | 36x |
+| plain paragraph, 120 words (1,038 ch) | 0.051 ms | 3.6 ms | 71x |
+| gating line, 20 words (180 ch) | 0.010 ms | 4.1 ms | 410x |
+| gating line, 60 words (523 ch) | 0.029 ms | 35.8 ms | 1,200x |
+| gating line, 120 words (1,042 ch) | 0.054 ms | 142 ms | 2,600x |
+| gating line, 240 words (2,080 ch) | 0.111 ms | 598 ms | 5,400x |
+
+**The split is a cliff, not a gradient.** A "plain" line carries SGRs and
+nothing else. A "gating" line carries one non-SGR CSI — a cursor query, an
+erase-line, anything a TUI emits — and that single escape is enough to make
+every row of the line eligible for the midline whitespace collapse.
+
+### How the shim got here, per revision
+
+Same benchmark, same session, the shim swapped underneath it by
+`git show <rev>:scripts/bun-shim.cjs`:
+
+| case | `ba8886c` before | `d730e94` row-scoped fix | `b85f9ac` early-out | HEAD |
+|---|---|---|---|---|
+| plain 40-line frame | 65.2 ms | 107 ms | 15.6 ms | 16.0 ms |
+| plain paragraph 120w | 70.7 ms | 136 ms | 3.7 ms | 3.6 ms |
+| plain code line | 2.1 ms | 3.9 ms | 0.316 ms | 0.325 ms |
+| gating line 20w | 2.2 ms | 3.8 ms | 3.9 ms | 4.1 ms |
+| gating line 60w | 18.5 ms | 33.7 ms | 35.1 ms | 35.8 ms |
+| gating line 120w | 81.5 ms | 144 ms | 142 ms | 142 ms |
+| gating line 240w | 313 ms | 601 ms | 606 ms | 598 ms |
+
+HEAD equals `b85f9ac` on every row to within ±5%, against a per-row spread of
+5-16%, so `586725a`'s leading-tab shelter fix cost nothing measurable.
+
+**Plain lines take the early-out.** `wrap_lineCanGate` proves no row can
+qualify (a row qualifies only on a non-SGR CSI or an ST-terminated OSC 8 at its
+leading edge, and rows are built from the line's own escapes), so the whole
+collapse pass is skipped in one O(n) scan. That early-out is `b85f9ac`, and on
+plain lines it more than undoes the regression: the 40-line frame goes
+65 → 107 → 16 ms, ending ~4x faster than before `d730e94` was written, because
+the pass it now skips was never free to begin with.
+
+What the plain rows do *not* establish is linearity. There is no plain-line
+length sweep here — the three plain cases are different shapes, not one shape
+at three lengths, and the 5,739-character "frame" is 40 separate lines rather
+than a long one. The only two comparable single-line points scale as
+length^1.27 (156 → 1,038 ch is 6.7x length for 11.1x time), and no fixed
+per-call overhead accounts for it. "Linear" here is a claim about the code
+path, not a measurement; if it matters, sweep it.
+
+**On gating lines the correctness fix cost ~1.8x, and that cost is permanent.**
+This is the part of the table most easily misread. `d730e94` raised every
+gating case by 1.68x, 1.82x, 1.76x and 1.92x across the four sizes (geometric
+mean 1.79x — call it ~1.8x, not "doubled"), and `b85f9ac` recovers none of it:
+an early-out that proves the collapse pass is unnecessary cannot help a line
+where the pass *is* necessary. HEAD remains 1.75-1.94x slower than `ba8886c`
+there. That is the price paid for the six divergences `d730e94` fixed, and it
+was worth paying, but "the regression was fixed" is a plain-line-only claim.
+
+**Gating lines are quadratic in escapes x length, not in length alone.**
+`wrap_collapseMidlineRuns` must know which *row* each candidate SGR lands on,
+because the gate is per-row — so it rebuilds the rows from scratch, once per
+escape cluster, over a growing prefix. Each rebuild is O(length) and there is
+one per cluster, so cost tracks the *product*. The benchmark scales both
+together (an SGR pair every third word), which is why 11.6x the length costs
+144x the time, close to 12² — that is the product moving, not length squared.
+Bun stays linear across the same inputs (0.010 → 0.111 ms, 11.1x). A long
+gating line carrying only a handful of SGRs is not shown here to be expensive,
+and should not be assumed to be: the 598 ms figure belongs to a 2 KB line with
+~160 escapes on this host at COLS=100.
+
+**This is the word-model tax, and it is the same root cause as the remaining
+divergences.** This shim splits a line into words and reconstructs separator
+spaces during placement; Bun almost certainly walks characters once, carrying
+per-row state as it goes. A streaming walk would not need to rebuild anything
+to answer "which row am I on" — it would already know. Both the 38 residual
+`wrapAnsi` divergences and this quadratic are that one mismatch, seen from two
+sides. Patching either further without the rewrite is buying inches.
+
+**Not yet load-bearing, but do not assume that holds.** No agentic session has
+run under Node at all (§11), so nothing has profiled a real render loop. The
+plain-line numbers are the common case and are survivable; whether real Claude
+Code output puts non-SGR CSIs on long lines is unmeasured, and that question
+decides whether this is a footnote or a blocker.
+
+---
+
+## 13. An OSC 8 hyperlink whose uri contains the letter `m` wraps differently ⚠️
+
+Measured 2026-08-27 against Bun 1.3.14, found while auditing a stale comment
+rather than by fuzzing — the generated grammar never puts a whitespace run
+directly behind a leading OSC 8, so all 800,000 cases are blind to it.
+
+A leading escape does not shelter the whitespace behind it from the per-row
+leading trim, with one documented exception: a non-SGR CSI shelters a **tab**,
+and only a tab. Sweeping that rule again turned up two things the original
+sweep had recorded wrongly.
+
+**An ST-terminated OSC 8 shelters the tab too**, opener or closer, empty uri or
+not. The original sweep recorded both OSC 8 forms as non-sheltering, which is
+true only of the BEL form. Fixed: the shelter test is now literally
+`wrap_rowGateQualifies`'s test, and not by coincidence — the same two escape
+kinds that let a row gate its whitespace collapse are the ones that shelter a
+tab at its leading edge. Pinned by two new corpus cases.
+
+**The BEL form shelters if and only if its uri contains the letter `m`.** Not
+implemented. Reproduce with `ESC ]8;; <uri> BEL " \t ab"` at any width:
+
+| uri | Bun keeps the tab? |
+|---|---|
+| `z` | no |
+| `m` | **yes** |
+| `zzzzzzzz` | no |
+| `zzzmzzzz` | **yes** |
+| `abcdefgh` | no |
+| `abcdefgm` | **yes** |
+| `http://x` | no |
+| `https://x.example` | **yes** |
+
+One character decides it, anywhere in the uri, at any length including one.
+`m` is the final byte of an SGR (`ESC [ 0 m`), so the likely mechanism is an
+OSC scan that ends the "escape" early at an SGR terminator and treats what
+follows as something else. Note the trigger is `m` specifically, not the CSI
+final-byte class: `abcdefgh` above contains `h`, equally a valid CSI final
+byte, and does not trigger. Sweeping the whole class expecting hits will find
+none.
+
+This was first mistaken for a length rule, then for a `://` rule, then for the
+substring `exam`; each held over a dozen samples and then broke. Single-
+character bisection is what settled it, and the result reproduces in a fresh
+process, from a file and from `bun -e`, so it is neither harness state nor
+transpiler cache.
+
+**Deliberately not matched.** The shim's contract is byte-equality with Bun,
+which in principle includes Bun's bugs — but reimplementing this one means
+deciding how far bug-compatibility goes, and that is a design call rather than
+a fix. It affects zero of the 800,000 fuzzed cases and no plausible real uri
+policy. Recorded so the next person to sweep this rule does not spend the
+afternoon rediscovering it. The corpus deliberately pins the ST behavior and
+deliberately omits the BEL one, with a comment saying why.
 
 ---
 

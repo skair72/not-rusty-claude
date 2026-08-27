@@ -91,8 +91,14 @@
  * doctor matches except for its "Path:" line, which correctly names the
  * interpreter actually running.
  *
- * What is NOT: the interactive and agentic paths have never been run under
- * Node. They will reach a THROWS entry - wrapAnsi or YAML first - and say so.
+ * What is NOT: the agentic path - a real conversation with tool use - has
+ * never been run under Node. The interactive path has: onboarding on Linux and
+ * the authenticated REPL on Apple Silicon, both 2026-08-26. Getting there
+ * needed wrapAnsi and YAML.parse, which the renderer and the skill loader
+ * cannot do without; both are implemented here and measured against Bun.
+ * YAML.parse still refuses anchors, tags, complex keys, multi-document input,
+ * tab indentation, explicit block scalar indents and over-indented sequence
+ * entries - by name, never by guessing.
  */
 
 const fs = require("node:fs");
@@ -198,6 +204,10 @@ function codePointWidth(cp) {
 
 const GRAPHEMES = new Intl.Segmenter("en", { granularity: "grapheme" });
 const RGI_EMOJI = /^\p{RGI_Emoji}$/v;
+const ZWJ = "\u200d";
+// A ZWJ sequence made only of pictographs, joiners and variation selectors.
+const ZWJ_PICTOGRAPHIC =
+  /^\p{Extended_Pictographic}[\u{fe0e}\u{fe0f}\u{1f3fb}-\u{1f3ff}]*(?:\u200d\p{Extended_Pictographic}[\u{fe0e}\u{fe0f}\u{1f3fb}-\u{1f3ff}]*)+$/u;
 const CP_KEYCAP = 0x20e3;
 const CP_VS16 = 0xfe0f;
 const CP_VS15 = 0xfe0e;
@@ -253,7 +263,23 @@ function clusterWidth(cluster) {
   // makes every single code point match Bun on both, and changes nothing on the
   // probe's realistic or adversarial corpora.
   if (count > 1 && RGI_EMOJI.test(cluster)) return 2;
-  if (variationSelector && count > 1 && sum < 1) return 1;
+  // ICU's RGI_Emoji is a curated LIST, and it moves: on Node 24.19 it rejects
+  // the man+woman family while accepting man+woman+girl, so that one cluster
+  // fell through to 2+0+2 = 4 where Bun says 2. Bun's rule is structural
+  // rather than curated - a ZWJ sequence whose parts are all pictographic is
+  // one glyph of width 2 - so ask that instead of trusting the list.
+  //
+  // Measured: emoji+ZWJ+emoji is 2 for every pair tried, including ones the
+  // list rejects, while non-pictographic parts are SUMMED - CJK+ZWJ+CJK is 4,
+  // emoji+ZWJ+letter is 3. So the test is on the parts, not on the joiner.
+  if (count > 1 && cluster.includes(ZWJ) && ZWJ_PICTOGRAPHIC.test(cluster)) return 2;
+  // A base too narrow to show through the table (sum 0) still prints one
+  // column when a variation selector rides it - EXCEPT when the cluster has
+  // no base at all: a bare VS16+ZWJ remnant, left over on a row after the
+  // hard breaker split its emoji base onto the row before. Measured, that
+  // remnant is 0, not 1 - the same answer as VS16 alone. Only a ZWJ turns it
+  // from "narrow base plus selector" into "joiner with nothing to join".
+  if (variationSelector && count > 1 && sum < 1 && !cluster.includes(ZWJ)) return 1;
   return sum;
 }
 
@@ -877,6 +903,1727 @@ function gc() {
   return undefined;
 }
 
+
+/* ----------------------------------------------------------------
+ * Bun.wrapAnsi  [IMPLEMENTED]
+ *
+ * ANSI-aware line wrapping. The TUI cannot render a frame without it: the
+ * bundle calls it as a straight passthrough, `Bun.wrapAnsi(text, cols, opts)`,
+ * and a refusal here throws inside a React render where an error boundary
+ * swallows it - the process then idles, paints nothing, and never crashes.
+ * That failure cost a day of investigation across two machines before a trace
+ * named it, which is why this is implemented rather than refused.
+ *
+ * It is built on TWO STAGES, because that is what the oracle does and a single
+ * unified tokenizer cannot express it (measured in the notes below):
+ *
+ *   1. WORD PLACEMENT measures whole words with the grapheme-aware
+ *      stringWidth above. A ZWJ emoji family is width 2 and survives whole at
+ *      columns 2, even though it is five code points.
+ *   2. BREAKING an over-long word walks CODE POINTS with a per-code-point
+ *      width. That same family becomes one member per row. Two different width
+ *      machineries, deliberately.
+ *   3. ESCAPE STATE is re-emitted at join time, per input line: every row is
+ *      opened with what was in force and closed at its end, and state does not
+ *      cross a newline in the input.
+ *
+ * The first implementation used one cluster tokenizer for both stages. That
+ * mismatch - not any single missing rule - is what produced defect after
+ * defect: thirteen found by review, then more by the generative differential,
+ * each "fixed" by a patch that the next case invalidated.
+ *
+ * ⚠️ NOT byte-equal to Bun everywhere. tests/test_fuzz_differential.py pins the
+ * remaining gap as a count that may only fall, and reports it per seed.
+ * Unlike YAML.parse below, this function cannot refuse, so its contract is
+ * enforceable only by comparison - never by a check in the code.
+ * ---------------------------------------------------------------- */
+
+// MAP OF THE THOUSAND LINES BELOW. The header above says WHAT this function
+// is and why it measures width with two different machineries; this says
+// where everything lives, so nobody has to read the whole section to change
+// one rule.
+//
+// The pipeline, in call order. wrapAnsi normalises \r\n, splits on \n, and
+// runs each input line through wrap_render(wrap_wrapLine(...)) with fresh
+// escape state - state never crosses a newline. wrap_wrapLine resolves the
+// whitespace-only line, then (only when opts.trim !== false)
+// wrap_collapseMidlineRuns, then wrap_buildRows. wrap_buildRowsRaw does the
+// real work: it splits the line into words with wrap_splitWords, strips the
+// current row's leading whitespace once per word iteration, decides the
+// separator space and the row pushes, and hands any word too wide for a row
+// to wrap_breakWord, which walks CODE POINTS and mutates rows in place.
+// wrap_buildRows is wrap_buildRowsRaw plus a per-row wrap_trimRow
+// (wrap_trimTrailing, then wrap_trimZeroWidthMarks); the raw variant exists
+// because the collapse pass has to see trailing content that wrap_trimRow
+// would erase before the lookahead could read it. wrap_render owns escape
+// state ACROSS rows: it re-opens the SGR and OSC 8 link in force at each
+// row's start and closes them at its end, and it is the only stage that
+// emits bytes not present in the input.
+//
+// The data model, and its one real limitation. This shim SPLITS a line into
+// words and RECONSTRUCTS the separator spaces during placement. Real Bun
+// almost certainly does not: the evidence throughout the notes below - a gate
+// that is per ROW, a run whose fate depends on what lands in its row after
+// reflow, an eligible-SGR slot spent once per row - all reads as a
+// per-character streaming walk carrying per-row state. Most of the remaining
+// divergences sit exactly where the two models disagree, and so does the cost
+// below. Patching one more placement rule buys one more case; the rewrite
+// that closes the gap is a change of model, not a change of rules.
+//
+// Where per-row state lives, and why a TEXT pre-pass calls the row builder.
+// Rows do not exist until placement, but the whitespace-collapse gate is
+// decided per ROW - wrap_rowGateQualifies reads a row's OWN leading escape
+// run, and wrap_collapseMidlineRuns tracks the one eligible SGR per row in
+// consumedRows. So for every escape cluster it builds the rows of the prefix
+// up to that cluster to learn which row the candidate lands in, and then
+// builds them again around a tentative resolution so wrap_hasLaterSpace can
+// ask what else ends up in that same row. Two full row-builds per candidate,
+// discarded each time.
+//
+// The performance shape follows from that: a line that CAN gate is quadratic
+// where Bun is linear - docs/findings.md section 12 has the measurements and
+// `make wrap-bench` reproduces them. wrap_lineCanGate is why this is not a
+// disaster in practice. One O(n) scan proves that a line holding no non-SGR
+// CSI and no ST-terminated OSC 8 can have no qualifying row anywhere, and
+// ordinary colourised output - SGRs and nothing else - takes that early-out
+// and never builds a row twice.
+//
+// The dense "Measured: ..." comments below are probe results, not prose. Each
+// records what the Bun 1.3.14 binary actually did on an input someone ran,
+// usually after a regression that rule now prevents, and several name the
+// wrong rule they replaced. They are the only record of why any of this is
+// shaped the way it is. Move them with the code they explain; do not compress
+// them away.
+
+const wrap_ESC = "\u001b";
+const wrap_BEL = "\u0007";
+
+// --- scanning ---------------------------------------------------------------
+
+// Roughly nineteen places below walk a string as a sequence of tokens, each
+// either an escape sequence or a single code point, with the same four lines:
+//
+//   const esc = wrap_escapeLength(text, i);
+//   if (esc) { ...; i += esc; continue; }
+//   const cp = String.fromCodePoint(text.codePointAt(i));
+//   ...; i += cp.length;
+//
+// That repetition is deliberate, and hoisting it into a shared walker is a
+// measured regression, not a cleanup. Benchmarked on the hottest of the
+// sites (wrap_visibleWidth's walk, 1,711 characters of colorized prose,
+// three runs each): the inline idiom costs 27 us per call, a shared walker
+// taking a per-token callback costs 32 us (+18%), and a generator costs 72 us
+// (2.7x). Making the shared walker's call site megamorphic - which is what
+// nineteen different callbacks would actually do to it - changed nothing
+// measurable, so the cost is the closure call itself, not the polymorphism.
+//
+// wrapAnsi is a TUI hot path already 50x slower than the Bun it stands in for
+// (docs/findings.md section 12), so an 18% tax on its innermost loop buys
+// tidier source at a price this shim cannot afford. Each copy also sits under
+// its own measured-behavior comment; merging them would orphan those.
+//
+// Length of the escape sequence starting at i, or 0 if there is none.
+function wrap_escapeLength(text, i) {
+  if (text[i] !== wrap_ESC) return 0;
+  const next = text[i + 1];
+  if (next === "[") {
+    let j = i + 2;
+    while (j < text.length && text.charCodeAt(j) >= 0x20 && text.charCodeAt(j) <= 0x3f) j++;
+    return j < text.length ? j - i + 1 : text.length - i;
+  }
+  if (next === "]") {
+    let j = i + 2;
+    while (j < text.length) {
+      if (text[j] === wrap_BEL) return j - i + 1;
+      if (text[j] === wrap_ESC && text[j + 1] === "\\") return j - i + 2;
+      j++;
+    }
+    return text.length - i;
+  }
+  return next === undefined ? 1 : 2;
+}
+
+// --- escape state -----------------------------------------------------------
+
+// Swept code by code against the oracle rather than reasoned from the SGR
+// spec, because the oracle's table is not the spec's. Measured at width 1,
+// where row one ends mid-style and whatever trails it IS the closer:
+//
+//   6  (rapid blink) closes with 25, the same as 5 - we closed nothing
+//   53 (overline)    closes with NOTHING - we closed with 55
+//   38 and 48        close with NOTHING - we closed with 39 and 49
+//
+// 38 and 48 are the PREFIXES of an extended colour ("38;5;n"), so a bare 38
+// selects no colour and there is nothing to close. The ranges below stop at
+// 37 and 47 for that reason. 53 looks like a plain gap in the oracle's table.
+const wrap_CLOSERS = new Map([
+  [1, 22], [2, 22], [3, 23], [4, 24], [5, 25], [6, 25], [7, 27], [8, 28], [9, 29],
+]);
+
+function wrap_closerFor(code) {
+  if (wrap_CLOSERS.has(code)) return wrap_CLOSERS.get(code);
+  if ((code >= 30 && code <= 37) || (code >= 90 && code <= 97)) return 39;
+  if ((code >= 40 && code <= 47) || (code >= 100 && code <= 107)) return 49;
+  return null;
+}
+
+// --- the word splitter ------------------------------------------------------
+//
+// A "word" is a run between single spaces. Escapes belong to the word they
+// precede; the space itself is a separator, not part of either side.
+
+function wrap_splitWords(line) {
+  const words = [];
+  let current = "";
+  let i = 0;
+  while (i < line.length) {
+    const esc = wrap_escapeLength(line, i);
+    if (esc) { current += line.slice(i, i + esc); i += esc; continue; }
+    if (line[i] === " ") { words.push(current); current = ""; i++; continue; }
+    const cp = String.fromCodePoint(line.codePointAt(i));
+    current += cp;
+    i += cp.length;
+  }
+  words.push(current);
+  return words;
+}
+
+// Visible width of a string, ignoring escapes.
+function wrap_visibleWidth(text) {
+  let out = "";
+  let i = 0;
+  while (i < text.length) {
+    const esc = wrap_escapeLength(text, i);
+    if (esc) { i += esc; continue; }
+    const cp = String.fromCodePoint(text.codePointAt(i));
+    out += cp;
+    i += cp.length;
+  }
+  return stringWidth(out);
+}
+
+// --- breaking one over-long word --------------------------------------------
+//
+// Stage two: walk code points, not clusters. `rows` is mutated in place; the
+// caller has already placed whatever precedes this word.
+
+// Width as the BREAKER counts it: the sum of each code point's own width,
+// which is not the cluster width. Measured, they disagree on every emoji
+// cluster - a rainbow flag is 2 as a cluster but 3 summed, a wave with a skin
+// tone is 2 versus 4. Stage one places whole words by cluster width; stage two
+// walks code points and must count them the same way it walks them, or a row
+// that looks full to one stage looks roomy to the other.
+// A combining mark measures ZERO when the engine walks code points, whatever
+// the width table says about the mark on its own. The table is not wrong:
+// asked in isolation, Bun answers 2 for the enclosing keycap U+20E3, and we
+// match it. But the walk does not charge the row for it.
+//
+// Measured: "1<VS16><KEYCAP>xy" fits on ONE row at width 3 - four visible
+// columns in three - while "<CJK>xy" does not, so the keycap's two columns
+// cost the row nothing and the ideograph's two cost it everything. That is why
+// "1<VS16><KEYCAP>" survives whole at width 1 where the rainbow flag splits:
+// the flag's second half is a BASE reached through a joiner, not a mark.
+//
+// Only Mn and Me are marks here. Skin-tone modifiers are Sk, and measured,
+// they do cost their width - thumbs-up and its modifier land on separate rows
+// at width 1. A rule that zeroed every cluster continuation would merge them.
+const wrap_COMBINING_MARK = /^[\p{Mn}\p{Me}]$/u;
+
+function wrap_pointCellWidth(cp) {
+  return wrap_COMBINING_MARK.test(cp) ? 0 : stringWidth(cp);
+}
+
+// A whole-string walk that does NOT apply wrap_pointCellWidth's mark rule,
+// for callers asking "does this print anything at all?" rather than "what
+// does this cost the row?". The two questions have different answers for the
+// enclosing keycap U+20E3: it costs the row nothing, and it very much
+// prints.
+function wrap_pointWidthRaw(text) {
+  let total = 0;
+  let i = 0;
+  while (i < text.length) {
+    const esc = wrap_escapeLength(text, i);
+    if (esc) { i += esc; continue; }
+    const cp = String.fromCodePoint(text.codePointAt(i));
+    total += stringWidth(cp);
+    i += cp.length;
+  }
+  return total;
+}
+
+// An OSC 8 event's terminator, not whether it opens or closes a link, decides
+// whether it glues. Measured with a state machine, not a single scan: an
+// ST-terminated event (open OR close, any uri) turns glue ON; a
+// BEL-terminated OSC 8 event turns it OFF. While glued the running width
+// counter is simply never touched - not charged, not reset - so it resumes
+// counting from wherever it stood before glue began once glue ends. A bare
+// ST-terminated close with nothing before or after it glues the rest of the
+// word just as an opener does - "only openers glue" was a narrower rule that
+// happened to match every case tried until one without a following BEL
+// exposed it: "<st-close>abcdefgh" glues the whole thing under Bun. A plain
+// SGR (or any non-OSC-8 escape) is transparent to this state - it neither
+// toggles glue nor touches the counter.
+// Returns null if `text` is not an OSC 8 event; otherwise true (ST, glue on)
+// or false (BEL, glue off).
+function wrap_oscGlueEvent(text) {
+  if (!text.startsWith(wrap_ESC + "]8;;")) return null;
+  if (text.endsWith(wrap_ESC + "\\")) return true;
+  if (text.endsWith(wrap_BEL)) return false;
+  return null;
+}
+
+// Whether a BEL-terminated OSC 8 event, with something still AFTER it,
+// appears anywhere in `text` - used to decide, at the moment ST-disabled
+// mode is about to start, whether it will ever end and matter. A BEL that
+// is the last thing in the word behaves as if it were never there: nothing
+// remains to place under the resumed check, so it does not count. Measured:
+// an ST-opened link that stays open with a BEL-opened link later still
+// merges onto an already-full row with no break, when that trailing link is
+// itself the end of the word - the identical word with anything at all
+// after that trailing link's open DOES break.
+function wrap_hasLaterBel(text) {
+  let i = 0;
+  while (i < text.length) {
+    const esc = wrap_escapeLength(text, i);
+    if (esc) {
+      if (wrap_oscGlueEvent(text.slice(i, i + esc)) === false && i + esc < text.length) {
+        return true;
+      }
+      i += esc;
+      continue;
+    }
+    i += String.fromCodePoint(text.codePointAt(i)).length;
+  }
+  return false;
+}
+
+// Whether wrap_breakWord will treat this word as one raw, unbroken blob: it
+// must OPEN glued (its first escape is an ST-terminated OSC 8 event) and stay
+// glued with no BEL event anywhere later to end it. This is what the
+// row-count pre-push math in wrap_buildRowsRaw needs to know - that math answers
+// "how many times will this word be broken", which is meaningless for a word
+// wrap_breakWord never breaks at all.
+function wrap_gluedThroughout(word) {
+  const firstEsc = wrap_escapeLength(word, 0);
+  if (!firstEsc || wrap_oscGlueEvent(word.slice(0, firstEsc)) !== true) return false;
+  for (let scan = firstEsc; scan < word.length; ) {
+    const esc = wrap_escapeLength(word, scan);
+    if (!esc) { scan += String.fromCodePoint(word.codePointAt(scan)).length; continue; }
+    if (wrap_oscGlueEvent(word.slice(scan, scan + esc)) === false) return false;
+    scan += esc;
+  }
+  return true;
+}
+
+// True if nothing from here to the end of `rest` will ever need row space:
+// either it is all zero-width code points and transparent escapes, or it
+// reaches a glue-ON event first - and glued content is exempt from width
+// entirely, so anything after that event needs no room either. Measured:
+// "abc<TAB><ST-open>de<ST-close>" at width 3 does NOT break before the tab,
+// while "abc<TAB>de" (no link) does - the tab is zero-width either way, so
+// the difference is what comes after it, not the tab itself.
+function wrap_restNeedsNoRoom(rest) {
+  let i = 0;
+  while (i < rest.length) {
+    const esc = wrap_escapeLength(rest, i);
+    if (esc) {
+      // A BEL-terminated event is a no-op here, not a reason to stop: we are
+      // scanning from a point where glue is already off, so BEL cannot turn
+      // off something that was never on - it is exactly as transparent as a
+      // plain SGR. Only an ST event matters, because it is the one thing
+      // that can still grant the exemption. Measured: "1" + <VS16> + <keycap
+      // mark> + <BEL-close> + <SGR> inside a BEL-opened (never glued) link
+      // stays on ONE row - treating the BEL-close as "needs room" forced a
+      // break between the VS16 and the mark that Bun does not make.
+      if (wrap_oscGlueEvent(rest.slice(i, i + esc)) === true) return true;
+      i += esc;
+      continue;
+    }
+    const cp = String.fromCodePoint(rest.codePointAt(i));
+    if (wrap_pointCellWidth(cp) !== 0) return false;
+    i += cp.length;
+  }
+  return true;
+}
+
+// Whether an ST-terminated OSC 8 open event appears anywhere in `text`.
+// wrap_restNeedsNoRoom answers true for plain trailing whitespace with
+// nothing after it too - vacuously, since an empty/all-zero-width rest never
+// hits a reason to return false. That vacuous case is not the same as glue
+// actually being on its way, and callers that mean "because glue is coming"
+// need this to tell the two apart.
+function wrap_hasGlueOpen(text) {
+  let i = 0;
+  while (i < text.length) {
+    const esc = wrap_escapeLength(text, i);
+    if (esc) {
+      if (wrap_oscGlueEvent(text.slice(i, i + esc)) === true) return true;
+      i += esc;
+      continue;
+    }
+    i += String.fromCodePoint(text.codePointAt(i)).length;
+  }
+  return false;
+}
+
+function wrap_breakWord(rows, word, columns) {
+  let i = 0;
+  let pending = "";
+  let taken = null;
+  let glued = false;
+  while (i < word.length) {
+    const esc = wrap_escapeLength(word, i);
+    if (esc) {
+      const text = word.slice(i, i + esc);
+      const toggle = wrap_oscGlueEvent(text);
+      if (toggle === true) {
+        // Entering ST-disabled mode from normal is checked against the
+        // column budget like any other token - BUT ONLY when something
+        // later in the word will ever turn it back off. Measured: "ab"
+        // (fills width 1) + an ST-opened link that stays open with no BEL
+        // anywhere for the rest of the word merges the link onto the same
+        // full row with no break; the identical prefix with a BEL-opened
+        // link somewhere later in the word DOES break before the ST-open.
+        // Once already disabled, a second ST event (its own close, or a
+        // later link's open) never re-triggers this - only the transition
+        // out of normal mode does.
+        if (!glued) {
+          if (taken === null) taken = wrap_visibleWidth(rows[rows.length - 1]);
+          if (taken === columns && wrap_hasLaterBel(word.slice(i + esc))) {
+            rows.push("");
+            taken = 0;
+          }
+        }
+        glued = true;
+      }
+      else if (toggle === false) {
+        // Leaving ST-disabled mode touches nothing: `taken` just resumes
+        // being checked from whatever value it was frozen at on entry (see
+        // the entry-side comment above - that entry check is what actually
+        // zeroes it, via an ordinary push, whenever entry happened to land
+        // on an exactly-full row). Measured at width 2: "a" (room for one
+        // more) + an ST-opened link + 2 columns of glued content + a BEL
+        // close resumes counting from 1, not 0 - the very next character
+        // fills the row the rest of the way and only the one after THAT
+        // gets pushed. An earlier attempt zeroed the counter unconditionally
+        // here and got that case wrong by one character.
+        glued = false;
+      }
+      // Held back, not emitted: an escape at a break belongs to the row that
+      // follows it. Measured at width 1, where the sequence opening a word
+      // leads the next row instead of trailing the previous one.
+      pending += text;
+      i += esc;
+      continue;
+    }
+    const cp = String.fromCodePoint(word.codePointAt(i));
+    // A running counter, NOT a re-measurement. Whatever stage one placed on
+    // this row was measured by cluster; every code point stage two adds is
+    // measured on its own. Re-measuring the row string picks one rule for both
+    // and gets the other case wrong. Seeded here, on the FIRST real code
+    // point, regardless of glue state - not only once unglued - or a word
+    // that opens glued would re-derive it later from wrap_visibleWidth of a
+    // row that by then holds the raw glued text, double-counting content
+    // glue was supposed to charge nothing for.
+    if (taken === null) taken = wrap_visibleWidth(rows[rows.length - 1]);
+    if (glued) {
+      // While glued, everything is appended raw - no width check, no break,
+      // and no charge to the counter - regardless of how little room is
+      // left on the row. Measured: a row already exactly full when glue
+      // turns back off resumes counting from that same fullness, not from
+      // zero - "abc" + <BEL-open>"def"<BEL-close> at width 3 breaks right
+      // after "abc", because the counter was never touched while unglued
+      // content never appeared, and forcing it to zero on the glue-off
+      // transition here erased that fullness and let "def" spill onto the
+      // still-full row instead.
+      rows[rows.length - 1] += pending + cp;
+      pending = "";
+      i += cp.length;
+      continue;
+    }
+    const w = wrap_pointCellWidth(cp);
+
+    // A zero-width code point with nothing visible after it stays where it is:
+    // measured, a trailing tab ends the row it is on rather than opening one.
+    // "Nothing visible" reaches through a glue-ON event too - see
+    // wrap_restNeedsNoRoom.
+    const rest = word.slice(i + cp.length);
+    const nothingVisibleAfter = w === 0 && wrap_restNeedsNoRoom(rest);
+
+    // Two INDEPENDENT reasons to break, and both can fire for one code point.
+    // A row that is exactly full yields to whatever comes next; a glyph too
+    // wide for what remains breaks again. Written as `else if` - as the first
+    // draft of this engine had it - a wide glyph following a full row loses the
+    // empty row Bun puts between them.
+    if (!nothingVisibleAfter) {
+      if (taken === columns) { rows.push(""); taken = 0; }
+      if (w > columns - taken) {
+        // A held-back escape ENDS the row it is on. Measured at width 3:
+        // "ab<23m><CJK>" puts the escape on row one, "ab<23m", and re-opens
+        // it on row two - it does not lead row two alone.
+        //
+        // The row that is EXACTLY full is the exception, and it needs no
+        // condition here: "abc<23m><CJK>" leaves the escape to lead row two,
+        // and the flush above has already opened that row by the time this
+        // runs. Two earlier special cases - an SGR before a wide character at
+        // width 1, and a link's close staying on the row the link occupies -
+        // were this same rule seen from two narrow angles, and both fall out
+        // of it.
+        if (pending !== "") {
+          rows[rows.length - 1] += pending;
+          pending = "";
+        }
+        rows.push("");
+        taken = 0;
+      }
+    }
+
+    // NOTE: zero-width code points are NOT discarded here. They land on their
+    // own row, and it is TRIMMING that empties that row afterwards - measured
+    // by varying only the options: with trim:false the flag's variation
+    // selector and joiner are visible on their own row, with trim:true the row
+    // is empty. Deleting them in the breaker got the trim:true case right for
+    // the wrong reason and the trim:false case wrong.
+
+    rows[rows.length - 1] += pending + cp;
+    pending = "";
+    taken += w;
+    i += cp.length;
+  }
+  rows[rows.length - 1] += pending;
+}
+
+// --- wrapping one line ------------------------------------------------------
+
+// A whitespace run directly following an SGR collapses down to just its
+// rightmost space when the run's ROW qualifies for it (see
+// wrap_rowGateQualifies below) - the tabs and extra spaces before that space
+// vanish, whatever comes after stays. Measured, all with a qualifying
+// leading run (e.g. a non-SGR CSI like "[6n" or "[2K") immediately
+// before the SGR:
+//   "  "      (2 spaces)      -> " "        five and six behave the same
+//   "\t "     (tab, space)    -> " "        the tab is discarded
+//   "\t\t "   (2 tabs, space) -> " "        any number of tabs, same result
+//   " \t\t"   (space, 2 tabs) -> " \t\t"    nothing after the rightmost space
+//                                            is touched
+//   "\t \t"   (tab,space,tab) -> " \t"      only what is BEFORE the rightmost
+//                                            space is discarded
+// A run with no space at all is untouched (nothing to anchor on). Without a
+// qualifying leading run, an adjacent SGR does nothing either: both factors
+// are required. opts.trim === false disables this outright - measured, all
+// four spaces of "word<SGR>    1234" survive whole with trim:false, at any
+// width; wordWrap does not gate it either way.
+//
+// A third factor, found by a regression: an OSC 8 link ANYWHERE earlier in
+// the line - even fully closed well before the run in question - turns the
+// whole mechanism off for the rest of the line. Measured with the identical
+// leading CSI and adjacent SGR that collapse on their own: inserting a
+// closed "link" word between the CSI and the word carrying the SGR leaves
+// the later three-space run completely untouched. The CSI's final letter
+// does not matter either way (cursor-up "[1A" behaves exactly like
+// "[6n" or "[2K" when nothing else intervenes) - only "has an OSC 8
+// appeared yet" gates it, tracked once while scanning left to right.
+// Whether a row's OWN leading escape run (before its first real character)
+// qualifies a whitespace run right after it for collapsing - the LAST
+// escape in that run decides it, not the first: measured across every
+// SGR/CSI ordering (C, CC, CS, SC, CCS, CSC, CCC as single letters for
+// "non-SGR CSI" and "SGR"), whichever is LAST decides it regardless of what
+// came before. A trailing ST-terminated OSC 8 event qualifies the same as a
+// non-SGR CSI; a BEL-terminated one does not - the same real-glue-vs-BEL
+// distinction wrap_oscGlueEvent encodes everywhere else in this file.
+function wrap_rowGateQualifies(row) {
+  let start = 0;
+  while (start < row.length && (row[start] === " " || row[start] === "\t")) start++;
+  let gatePos = start;
+  let lastEsc = null;
+  while (gatePos < row.length) {
+    const esc = wrap_escapeLength(row, gatePos);
+    if (!esc) break;
+    lastEsc = row.slice(gatePos, gatePos + esc);
+    gatePos += esc;
+  }
+  if (lastEsc === null) return false;
+  return (lastEsc.startsWith(wrap_ESC + "[") && !lastEsc.endsWith("m")) ||
+      wrap_oscGlueEvent(lastEsc) === true;
+}
+
+// The gate is per ROW, not per line - measured (probe51): a non-SGR CSI
+// mid-line, before any wrapping, does not gate a later same-line SGR
+// (nothing at the LINE's own start), but the identical CSI, once a forced
+// break lands it at the START of a later row, gates an SGR later in THAT
+// row - even though the line itself still has no leading escape. Decided
+// left to right, one candidate at a time, because collapsing only removes
+// characters AFTER the candidate SGR: wrapping the prefix up to and
+// including a candidate (with every earlier collapse already applied)
+// tells us exactly which row it lands on, and that row's own leading run -
+// via wrap_rowGateQualifies - is what decides this candidate. sawLink stays
+// scoped to the whole line, unchanged from before: once any link has been
+// seen, no later SGR in the line collapses its whitespace, on any row.
+//
+// Two more factors, found by regression (probes 65-77), refine this beyond
+// "every qualifying SGR's run collapses to its rightmost space":
+//
+// 1. Only the FIRST SGR encountered in a given (gate-qualifying) row is
+//    ever eligible - measured with two, then three, SGR+whitespace pairs in
+//    one row: only the first one's run is touched at all; every later SGR
+//    in that same row is left completely untouched, run and all, even when
+//    it is the row's last SGR with nothing after it. This holds regardless
+//    of whether the first SGR even HAS a run to collapse (probe75): an SGR
+//    glued straight to the next character with no adjacent whitespace still
+//    uses up the row's one slot. A fresh row (reached by wrapping, not by a
+//    literal "\n") gets its own fresh slot - each row's own leading run
+//    decides its own eligibility and its own first-SGR independently. A
+//    candidate whose OWN gate check fails does NOT use up the slot (seed3
+//    regression): what spends the row's slot is passing the gate check, not
+//    collapsing anything - a candidate with no run to collapse at all
+//    (probe75 above) spends it just the same.
+// 2. For the one eligible SGR's run, "collapse to the rightmost space" (or,
+//    with no space to anchor on, leave the run untouched) is only what
+//    happens absent a later space; if the ROW this candidate lands in -
+//    once the rest of the line has reflowed around the run's tentative
+//    resolution - holds a literal space anywhere after the kept text, the
+//    run collapses to NOTHING instead. This is row-scoped, not a raw scan
+//    of the rest of the line: a candidate whose row ends mid-hard-broken-
+//    word ("long"/"er", "日本"/"語") has no space anywhere in
+//    THAT row even though a later row does, and Bun leaves its run's
+//    tentative resolution alone in that case - a whole-line lookahead
+//    wrongly deletes it. Measured both ways with an otherwise-identical
+//    run: "x"+SGR+"   "+"y" (nothing later in the row) keeps one space;
+//    "x"+SGR+"   "+"y z" (a later separator space in the same row) drops
+//    it entirely; a tab-only run with no space of its own still drops to
+//    nothing when a later space is in the row, even though with no later
+//    space that same tab-only run is left completely untouched (no
+//    anchor). A trailing space at end-of-line counts even though it will
+//    itself be trimmed away; a later TAB with no accompanying space does
+//    not count, nor does a later run that is tabs-only.
+function wrap_hasLaterSpace(str, pos) {
+  let p = pos;
+  while (p < str.length) {
+    const esc = wrap_escapeLength(str, p);
+    if (esc) { p += esc; continue; }
+    if (str[p] === " ") return true;
+    p += String.fromCodePoint(str.codePointAt(p)).length;
+  }
+  return false;
+}
+
+// A row qualifies (wrap_rowGateQualifies) only when its leading escape run
+// ends in a non-SGR CSI or an ST-terminated OSC 8. Rows are assembled purely
+// from the line's own escapes, so a line holding neither kind can have no
+// qualifying row anywhere in it, and the whole collapse pass below is then a
+// guaranteed no-op. Worth one O(n) scan up front because the pass costs a
+// full row-build per escape cluster, and the overwhelmingly common case -
+// ordinary colorized output, SGRs and nothing else - is exactly the case that
+// can never qualify.
+function wrap_lineCanGate(line) {
+  let p = 0;
+  while (p < line.length) {
+    const esc = wrap_escapeLength(line, p);
+    if (!esc) {
+      p += String.fromCodePoint(line.codePointAt(p)).length;
+      continue;
+    }
+    const text = line.slice(p, p + esc);
+    if (text.startsWith(wrap_ESC + "[") && !text.endsWith("m")) return true;
+    if (wrap_oscGlueEvent(text) === true) return true;
+    p += esc;
+  }
+  return false;
+}
+
+function wrap_collapseMidlineRuns(line, columns, opts) {
+  if (!wrap_lineCanGate(line)) return line;
+  let working = line;
+  let sawLink = false;
+  const consumedRows = new Set();
+  let i = 0;
+  while (i < working.length) {
+    const esc = wrap_escapeLength(working, i);
+    if (!esc) {
+      i += String.fromCodePoint(working.codePointAt(i)).length;
+      continue;
+    }
+    // Adjacent escapes with no real character between them act as ONE
+    // candidate, not one each - measured (idx278 regression): an SGR
+    // immediately followed by a second SGR, with a run right after the
+    // second, still collapses that run - the pair does not use up the row's
+    // one slot twice. Walk the whole cluster and judge only its LAST escape,
+    // the same "last one decides" rule wrap_rowGateQualifies already applies
+    // to a row's own leading run.
+    let clusterEnd = i;
+    let lastEscText = null;
+    while (clusterEnd < working.length) {
+      const e = wrap_escapeLength(working, clusterEnd);
+      if (!e) break;
+      const t = working.slice(clusterEnd, clusterEnd + e);
+      if (t.startsWith(wrap_ESC + "]8;")) sawLink = true;
+      lastEscText = t;
+      clusterEnd += e;
+    }
+    if (!sawLink && lastEscText.startsWith(wrap_ESC + "[") && lastEscText.endsWith("m")) {
+      const prefix = working.slice(0, clusterEnd);
+      const prefixRows = wrap_buildRowsRaw(prefix, columns, opts);
+      const rowIndex = prefixRows.length - 1;
+      if (consumedRows.has(rowIndex)) { i = clusterEnd; continue; }
+      if (!wrap_rowGateQualifies(prefixRows[rowIndex])) { i = clusterEnd; continue; }
+      consumedRows.add(rowIndex);
+      let runEnd = clusterEnd;
+      let lastSpace = -1;
+      while (runEnd < working.length && (working[runEnd] === " " || working[runEnd] === "\t")) {
+        if (working[runEnd] === " ") lastSpace = runEnd;
+        runEnd++;
+      }
+      if (runEnd === clusterEnd) { i = clusterEnd; continue; }
+      // The old rule's result (rightmost space, or the run untouched if it
+      // has no space to anchor on) is only a TENTATIVE resolution here: it
+      // exists so the rest of the line can be built around it to find out
+      // which row the candidate lands in, and whether that row goes on to
+      // hold a literal space after the kept text.
+      const anchoredKept = lastSpace !== -1
+        ? working.slice(lastSpace, runEnd)
+        : working.slice(clusterEnd, runEnd);
+      const tentative = working.slice(0, clusterEnd) + anchoredKept + working.slice(runEnd);
+      const tentativeRows = wrap_buildRowsRaw(tentative, columns, opts);
+      const row = tentativeRows[rowIndex];
+      const searchFrom = prefixRows[rowIndex].length + anchoredKept.length;
+      if (row !== undefined && row.startsWith(prefixRows[rowIndex]) && wrap_hasLaterSpace(row, searchFrom)) {
+        working = working.slice(0, clusterEnd) + working.slice(runEnd);
+        i = clusterEnd;
+        continue;
+      }
+      working = tentative;
+      i = clusterEnd + anchoredKept.length;
+      continue;
+    }
+    i = clusterEnd;
+  }
+  return working;
+}
+
+function wrap_wrapLine(rawLine, columns, opts) {
+  let line = rawLine;
+  // A line made only of spaces and tabs collapses to one empty row when
+  // trimming. NOT JS trim(): that counts NBSP as whitespace, and measured, a
+  // lone NBSP survives (it is width 1 and prints) while a lone space does not.
+  if (opts.trim !== false && /^[ \t]*$/.test(line)) return [""];
+  if (opts.trim !== false) line = wrap_collapseMidlineRuns(line, columns, opts);
+  return wrap_buildRows(line, columns, opts);
+}
+
+// Builds rows without the final per-row edge trim - used internally by
+// wrap_collapseMidlineRuns to look ahead at a row's true trailing content
+// (a later space at end-of-line still counts even though wrap_buildRows
+// itself would go on to trim it away).
+function wrap_buildRowsRaw(line, columns, opts) {
+  const words = wrap_splitWords(line);
+  const rows = [""];
+
+  for (let index = 0; index < words.length; index++) {
+    const word = words[index];
+
+    // Leading whitespace is stripped from the CURRENT ROW once per word
+    // iteration - not once per line. That timing is the whole rule: " \tx"
+    // keeps its tab because no later iteration runs, while " \t x" loses it
+    // because the "x" iteration strips the row holding it. Seven measured
+    // shapes follow from this with no special cases.
+    //
+    // Spaces and tabs only, NOT JS trimStart(): that also removes NBSP, which
+    // Bun keeps because it is width 1 and prints. ESC is not stripped either,
+    // so a leading escape shelters what follows it.
+    if (opts.trim !== false) {
+      // Leading ESCAPES do not shelter the whitespace behind them. Measured:
+      // an SGR followed by " \t " loses all three, exactly as the bare form
+      // does, so the strip has to step over the escapes first rather than
+      // anchor at the row's very start.
+      // ...but a NON-SGR CSI in that leading run shelters a tab, and only a
+      // tab. Swept escape by escape: with no escape, with any SGR, and with a
+      // BEL-terminated OSC 8, " \t ab" trims to "ab". With \u001b[H,
+      // \u001b[6n, \u001b[2K or \u001b[?25l it trims to "\tab" - the spaces
+      // still go and the tab stays. The other five whitespace shapes are
+      // identical across all ten escapes.
+      // An ST-terminated OSC 8 shelters the tab too, open or close - measured
+      // 2026-08-27, and the reason this is not simply "a non-SGR CSI": the
+      // sweep above originally recorded BOTH OSC 8 forms as non-sheltering,
+      // which is true only of the BEL one. That makes the test here exactly
+      // wrap_rowGateQualifies's, and not by coincidence - the same two escape
+      // kinds that let a row gate its whitespace collapse are the ones that
+      // shelter a tab at its leading edge.
+      // Only the LAST escape in the leading run decides it, not "any of
+      // them" - measured with a non-SGR CSI immediately followed by an SGR
+      // reset, the tab is NOT sheltered and goes, same as if the CSI were
+      // never there. Reassigning on every escape (not OR-ing) gets this
+      // right without disturbing the single-escape cases above, since for
+      // those the last escape and the only escape are the same one.
+      const row = rows[rows.length - 1];
+      let head = 0;
+      let sheltersTab = false;
+      for (;;) {
+        const esc = wrap_escapeLength(row, head);
+        if (!esc) break;
+        const text = row.slice(head, head + esc);
+        sheltersTab = (text.startsWith(wrap_ESC + "[") && !text.endsWith("m")) ||
+            wrap_oscGlueEvent(text) === true;
+        head += esc;
+      }
+      rows[rows.length - 1] = row.slice(0, head) +
+        row.slice(head).replace(sheltersTab ? /^ +/ : /^[ \t]+/, "");
+    }
+
+    const wordWidth = wrap_visibleWidth(word);
+    let taken = wrap_visibleWidth(rows[rows.length - 1]);
+
+    let prePushed = false;
+    if (index !== 0) {
+      // A row already exactly full (or over) gets neither the pre-push NOR
+      // the separator space when wordWrap is false and the UPCOMING word is
+      // glued throughout - it attaches directly to whatever is already
+      // there. Measured at width 1: "the quick" broken char by char fills
+      // its last row with "k", and a glued word right after it attaches
+      // with no space and no fresh row - "k<link>abc</link>", not "k
+      // <link>abc</link>" on its own row. A non-glued word in the same spot
+      // still gets the ordinary pre-push and space.
+      //
+      // trim:false turns this back off: "k" + glued word at width 1 merges
+      // with trim left at its default, but with trim:false the SAME input
+      // pre-pushes and keeps the separator space exactly as an ungated word
+      // would - "k\n <link>abc</link>", not "k<link>abc</link>".
+      //
+      // The same exemption extends to a BLANK word (wrap_splitWords
+      // produces one whenever a tab, or a run of spaces, sits between two
+      // real words - the run's non-space characters and the empty strings
+      // either side of consumed spaces all become their own "words"). A
+      // blank word carries zero width itself, so wrap_gluedThroughout(word)
+      // is false for it even though glue is coming later. The real question
+      // is the one wrap_restNeedsNoRoom already answers elsewhere: does
+      // everything from here to the end of the line need no room, either
+      // because it is zero-width or because glue starts before anything
+      // that isn't? Measured: "e" + "  \t  " + a glued link, walked word by
+      // word ("e", "", "\t", "", <link>), fills the row to exactly full by
+      // the second blank word - and Bun does NOT push there, because the
+      // rest (the remaining blank word plus the glued word) needs no room.
+      // Restricted to wordWidth === 0 so a word with real leading content
+      // before its own later glue is untouched; that shape is already
+      // covered by wrap_gluedThroughout requiring glue at position 0.
+      //
+      // A blank word that gets this exemption also never gets PLACED - not
+      // just spared the push and space. Measured: the same input at width 1
+      // ("e" + three blank words + the glued link) drops the tab entirely,
+      // "e<link>bidi</link>" with no "\t" anywhere - so once the row is
+      // already exactly full and nothing ahead needs room, a blank word's
+      // own (whitespace) content is discarded along with its separator, not
+      // appended to the row. A glued word getting the same exemption still
+      // needs to run through the normal placement below (it has real
+      // content to break onto the row), so the skip-placement only applies
+      // to the blank-word half of the OR.
+      //
+      // wrap_restNeedsNoRoom alone is not enough: it also answers true for
+      // plain trailing whitespace with nothing after it at all (vacuously -
+      // an empty rest never finds a reason to say false), and that is NOT
+      // glue coming later. Measured: "trailing" + three trailing spaces at
+      // width 1 keeps its final row break ("...g\n"); the fix without this
+      // guard swallowed it, dropping the trailing empty row. Requiring an
+      // actual glue-open somewhere in the rest tells the two apart.
+      const rest = words.slice(index).join("");
+      const blankExempt = wordWidth === 0 && !wrap_gluedThroughout(word) &&
+          wrap_hasGlueOpen(rest) && wrap_restNeedsNoRoom(rest);
+      // A non-blank word gets the same push+space exemption when IT (not
+      // some later word) opens with zero-width escapes and only turns
+      // permanently glued a few escapes in - the same glue-prefix shape
+      // already exempted from the two too-wide-word push guards below.
+      // Unlike blankExempt this never skips PLACEMENT: the word still has
+      // real content that must reach wrap_breakWord/the normal path, so no
+      // continue here - only gluedThroughout(word) got that far before.
+      // Measured: a ZWJ family emoji, three spaces, then an SGR + a glued
+      // "." link at width 4, hard:true, wordWrap:false - the row is
+      // exactly full by the third space, and Bun attaches the glued word
+      // directly rather than opening a row for it.
+      //
+      // wordWidth > 0 is required here (unlike the two too-wide-word push
+      // guards, where it is already guaranteed by the surrounding
+      // structure): without it, a genuinely blank word with NO glue
+      // anywhere near it - wordWidth 0, nothing left to scan - would make
+      // wrap_restNeedsNoRoom(word) vacuously true and wrongly claim this
+      // exemption. blankExempt already covers the blank-word case, with
+      // its own wrap_hasGlueOpen guard against that same vacuous true.
+      const gluePrefixed = wrap_gluedThroughout(word) ||
+          (wordWidth > 0 && wrap_restNeedsNoRoom(word));
+      if (taken >= columns && opts.trim !== false && opts.wordWrap === false &&
+          (gluePrefixed || blankExempt)) {
+        // Nothing: skip both steps below entirely.
+        if (blankExempt) continue;
+      } else {
+        // The separator space, unless the row is empty and we are trimming.
+        if (taken >= columns && (opts.wordWrap === false || opts.trim === false)) {
+          rows.push("");
+          taken = 0;
+          prePushed = true;
+        }
+        if (taken > 0 || opts.trim === false) {
+          rows[rows.length - 1] += " ";
+          taken += 1;
+        }
+      }
+    }
+
+    if (opts.hard && wordWidth > columns) {
+      // A word that glues from its very first character is never actually
+      // BROKEN - wrap_breakWord appends it to the current row as-is, no
+      // matter how little room is left. The row-count math below assumes
+      // breaking happens, so it is answering a question this word does not
+      // ask: measured at width 1, "x" then two spaces then a glued link
+      // stays on ONE row with the second space, and pre-pushing a blank row
+      // here put the link on a row of its own instead.
+      //
+      // The same is true of a word that is not glued at position 0 but
+      // turns permanently glued before anything in it costs the row a
+      // column - a leading SGR (zero width) then an ST-terminated OSC 8
+      // open, say. wrap_gluedThroughout requires glue AT position 0 and
+      // says false here, but wrap_breakWord still never breaks this word:
+      // it walks the SGR for free, then glue latches on and everything
+      // after rides along on whatever row it lands on. Measured: " " +
+      // SGR + a glued link at width 1, hard:true, trim:false stays on ONE
+      // row ("space, SGR, glued text"); the row-count math below, run on
+      // this word, wrongly pre-pushed an empty row for it.
+      if (!wrap_gluedThroughout(word) && !wrap_restNeedsNoRoom(word)) {
+        const remaining = columns - taken;
+        const breaksHere = 1 + Math.floor((wordWidth - remaining - 1) / columns);
+        const breaksNext = Math.floor((wordWidth - 1) / columns);
+        if (breaksNext < breaksHere) rows.push("");
+      }
+      wrap_breakWord(rows, word, columns);
+      continue;
+    }
+
+    if (taken + wordWidth > columns) {
+      if (opts.wordWrap === false && taken < columns) {
+        wrap_breakWord(rows, word, columns);
+        continue;
+      }
+      // Skip the push when wordWrap is false, the word is glued throughout,
+      // AND (the separator above already pushed a fresh row this same
+      // iteration OR the word is wider than the terminal anyway). Neither
+      // half of that last OR is enough alone with the first two: an ordinary
+      // word after the same kind of pre-push ("the" alone fills a width-1
+      // row, "quick" follows, wordWrap left at its true default) still gets
+      // its own second push - so prePushed+wordWrap:false-shaped reasoning
+      // without glue is not enough; a glued word after a genuine pre-push
+      // but with wordWrap left at its true default ALSO still gets pushed -
+      // measured at width 2 with a real word before the gap, trim:false,
+      // wordWrap unset: Bun opens a fourth row rather than folding onto the
+      // just-refilled row. Only wordWrap:false changes that.
+      //
+      // The wordWidth > columns half: a glued word that could never fit a
+      // fresh row EITHER gains nothing from pushing one, since
+      // wrap_breakWord dumps a glued word raw regardless of which row it
+      // starts on - and Bun skips the push in exactly that situation even
+      // with NO pre-push at all. Measured by holding the glued word's width
+      // fixed at 3 and sweeping columns from 2 to 7 with the row exactly
+      // refilled by an ordinary (non-glued) separator, no pre-push in
+      // sight: columns 3-7 (word fits a fresh row) all push same as ever;
+      // only columns 2 (3 > 2, the word could never fit alone) skips it.
+      //
+      // wrap_gluedThroughout(word) is not the only shape that gets this
+      // exemption: a word that opens with zero-width escapes (an SGR, say)
+      // and only turns permanently glued a few escapes in behaves exactly
+      // the same way once wrap_breakWord reaches the glue - nothing after
+      // it costs the row anything, so the push decision is answering a
+      // question this word does not ask, same as the opts.hard case above.
+      // wordWidth > 0 is already required to reach this line, so
+      // wrap_restNeedsNoRoom(word) cannot be the vacuous "trailing
+      // whitespace, no glue at all" true - reaching the word's own visible
+      // content before any glue open makes it return false instead.
+      // Measured: " \t " + an SGR + a glued CJK link at width 2,
+      // trim:false, wordWrap:false stays on ONE row; gluedThroughout alone
+      // said false (glue starts after the SGR, not at position 0) and
+      // pushed a row that Bun never opens.
+      if (taken > 0 && wordWidth > 0 &&
+          !(opts.wordWrap === false &&
+            (wrap_gluedThroughout(word) || wrap_restNeedsNoRoom(word)) &&
+            (prePushed || wordWidth > columns))) {
+        rows.push("");
+        taken = 0;
+      }
+      if (opts.wordWrap === false) {
+        // The fresh row may hold the whole word, and then it is not broken at
+        // all. Measured at width 2: two spaces fill row one, and a ZWJ family
+        // - two columns as a cluster - lands WHOLE on row two. Only a word too
+        // wide for a row of its own is handed to the breaker.
+        //
+        // This is not a rule about clusters. The same family followed by "xy"
+        // splits at width 2 and at width 3, and survives whole at 4: what
+        // decides is whether the WORD fits, measured by cluster width. A
+        // cluster is split whenever the word around it has to be.
+        if (wordWidth > columns) {
+          wrap_breakWord(rows, word, columns);
+          continue;
+        }
+      }
+    }
+
+    if (taken + wordWidth > columns && opts.wordWrap === false) {
+      wrap_breakWord(rows, word, columns);
+      continue;
+    }
+
+    rows[rows.length - 1] += word;
+  }
+
+  return rows;
+}
+
+function wrap_buildRows(line, columns, opts) {
+  const rows = wrap_buildRowsRaw(line, columns, opts);
+  if (opts.trim !== false) {
+    for (let i = 0; i < rows.length; i++) rows[i] = wrap_trimRow(rows[i]);
+  }
+  return rows;
+}
+
+// Remove spaces at the row's TRAILING edge, keeping escapes - the leading edge
+// is stripped per word iteration in wrap_buildRowsRaw, not here. Walks
+// BACKWARD from the row's end, the mirror of that leading strip's forward
+// walk. An escape is REMOVED from neither side and is a stopping point on
+// neither: it never blocks removal of what precedes it (trailing), and on the
+// leading side it shelters only a TAB, and only when the LAST escape of the
+// leading run is a non-SGR CSI - see the escape-by-escape sweep in the word
+// loop above.
+//
+// The removable set is space and tab only - NBSP is NOT removable, matching
+// the leading side exactly. Measured with fromCharCode(0xa0), never typed
+// literally: a bare trailing NBSP survives alone, after visible text, and
+// with a tab after it (which then ALSO survives, since NBSP gives the row
+// nonzero visible width). An early version of this rule added NBSP to the
+// removable set from a probe script where the NBSP had been silently
+// flattened to a plain space by the file-writing tool - the two are
+// visually identical in a terminal, and only a byte-level check caught it.
+//
+// Also measured: TWO escape groups with a space between them, both
+// trailing, both go - "ab SPACE <SGR> SPACE <SGR> TAB" -> "ab<SGR><SGR>" -
+// which the three narrower rules this replaced could not reach, since none
+// of them accounted for an escape sitting BETWEEN two removable runs.
+function wrap_trimTrailing(row) {
+  const tokens = [];
+  let i = 0;
+  while (i < row.length) {
+    const esc = wrap_escapeLength(row, i);
+    if (esc) { tokens.push({ esc: true, text: row.slice(i, i + esc) }); i += esc; continue; }
+    const cp = String.fromCodePoint(row.codePointAt(i));
+    tokens.push({ esc: false, text: cp });
+    i += cp.length;
+  }
+  // If NOTHING in the row is a real glyph - only space, tab, and escapes -
+  // the whole thing collapses to just the escapes, in their original order.
+  // Generalises the single-tab case this replaced ("<SGR>\t" -> "<SGR>"):
+  // measured, "<TAB><SGR><TAB><CSI>" (no glyph anywhere) collapses to just
+  // "<SGR><CSI>" too, which the backward scan below cannot reach on its own
+  // - a tab's own predecessor being ANOTHER tab (not a space, not nothing)
+  // is not a case its per-token rule resolves.
+  if (tokens.every((t) => t.esc || t.text === " " || t.text === "\t")) {
+    return tokens.filter((t) => t.esc).map((t) => t.text).join("");
+  }
+
+  // Find where the trailing space/tab run begins, walking backward from the
+  // end and skipping escapes (NBSP is neither space nor tab, so it stops the
+  // walk exactly like any other real character).
+  let runStart = tokens.length;
+  for (let k = tokens.length - 1; k >= 0; k--) {
+    const t = tokens[k];
+    if (t.esc) continue;
+    if (t.text === " " || t.text === "\t") { runStart = k; continue; }
+    break;
+  }
+  // Within that run, read FORWARD for the first real space and cut there:
+  // everything from that space onward is removed, and any tabs before it
+  // survive. A run with no space at all is not cut anywhere - trailing tabs
+  // alone are never removed. Measured against every combination of one or
+  // two tabs and one or two spaces: "\t\t" (no space) keeps both tabs,
+  // "\t " keeps the tab and drops the space, " \t" drops both (the first
+  // space is at the very start of the run, so nothing survives it), and
+  // "\t \t\t" (tab, space, tab, tab) keeps only the FIRST tab - the point is
+  // the FIRST space in the run, not the nearest one to the cut, which is why
+  // a rule keyed on each token's immediate predecessor could not reach it:
+  // that rule looks at what is behind the CURRENT position, not at whether a
+  // space appears anywhere before it in the run.
+  let cut = tokens.length;
+  for (let k = runStart; k < tokens.length; k++) {
+    const t = tokens[k];
+    if (t.esc) continue;
+    if (t.text === " ") { cut = k; break; }
+  }
+  let out = "";
+  for (let k = 0; k < tokens.length; k++) {
+    if (k < cut || tokens[k].esc) out += tokens[k].text;
+  }
+  return out;
+}
+
+// A row that prints NOTHING but zero-width marks - joiners, variation
+// selectors, combining marks - collapses to just its escapes, wherever they
+// sit among the marks. Escapes are state, not content, so they survive; the
+// marks do not.
+//
+// Measured RAW, not the way the breaker measures: the breaker charges a
+// combining mark zero because it costs the row nothing, which is a
+// different question from whether it prints. This has to reach INTO a row
+// that also holds escapes - a lone combining mark, split by a hard break
+// onto a row of its own alongside a CSI, still vanishes (leaving just the
+// CSI) even though the row is not escape-free. An earlier version of this
+// check required the row to contain no escape at all, which was true only
+// by accident: the OLD trailing-trim peeled escapes into a side variable
+// first, so by the time this ran, a mark-only remainder genuinely HAD no
+// escape in it. Once trailing-trim stopped doing that peeling, this check
+// had to look past escapes on its own.
+function wrap_trimZeroWidthMarks(row) {
+  const tokens = [];
+  let i = 0;
+  while (i < row.length) {
+    const esc = wrap_escapeLength(row, i);
+    if (esc) { tokens.push({ esc: true, text: row.slice(i, i + esc) }); i += esc; continue; }
+    const cp = String.fromCodePoint(row.codePointAt(i));
+    tokens.push({ esc: false, text: cp });
+    i += cp.length;
+  }
+  if (tokens.length && tokens.every((t) => t.esc || wrap_pointWidthRaw(t.text) === 0)) {
+    return tokens.filter((t) => t.esc).map((t) => t.text).join("");
+  }
+  return row;
+}
+
+function wrap_trimRow(row) {
+  // Leading whitespace is handled in the word loop, per iteration. Only the
+  // trailing side is left here.
+  return wrap_trimZeroWidthMarks(wrap_trimTrailing(row));
+}
+
+// --- join-time escape pass --------------------------------------------------
+
+function wrap_render(rows) {
+  let code;
+  let link = null;
+  const out = [];
+
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r];
+    // A row that carries nothing does not re-open the style crossing it - it
+    // emits only the closer. Measured at width 1: "<41m>x<CJK>" puts a bare
+    // <49m> on the row between them, not <41m><49m>, and with <23m> - which
+    // closes with nothing - that row comes out completely empty.
+    //
+    // The LAST row is the exception and does re-open: "<41m>a " ends on a row
+    // holding just <41m>. So this is not "empty rows are bare", it is that a
+    // middle row with nothing on it has nothing to style.
+    const bare = row === "" && r !== rows.length - 1;
+    const opener = bare ? ""
+      : (code === undefined ? "" : wrap_ESC + "[" + code + "m") + (link || "");
+
+    // Update state from every escape this row contains.
+    let i = 0;
+    while (i < row.length) {
+      const esc = wrap_escapeLength(row, i);
+      if (!esc) { i += String.fromCodePoint(row.codePointAt(i)).length; continue; }
+      const text = row.slice(i, i + esc);
+      if (text.startsWith(wrap_ESC + "]8;")) {
+        const uri = text.slice(4).split(";").slice(1).join(";")
+          .replace(/(|\\)$/, "");
+        link = uri ? wrap_ESC + "]8;;" + uri + wrap_BEL : null;
+      } else if (text.startsWith(wrap_ESC + "[") && text.endsWith("m")) {
+        const params = text.slice(2, -1).split(";");
+        if (params.length === 1) {
+          const n = Number(params[0] === "" ? 0 : params[0]);
+          if (!Number.isNaN(n)) code = (n === 0 || n === 39) ? undefined : n;
+        }
+      }
+      i += esc;
+    }
+
+    let closer = "";
+    if (r !== rows.length - 1) {
+      // Link close FIRST, then the SGR closer. Measured with both in force at
+      // once: the row ends with the link's close followed by the colour reset,
+      // and the reverse order was what this emitted. The opener at row start
+      // uses the opposite order - SGR then link - so the two are not simply
+      // mirrored.
+      if (link) closer += wrap_ESC + "]8;;" + wrap_BEL;
+      if (code !== undefined) {
+        const c = wrap_closerFor(code);
+        if (c !== null && c !== code) closer += wrap_ESC + "[" + c + "m";
+      }
+    }
+    out.push(opener + row + closer);
+  }
+  return out.join("\n");
+}
+
+function wrapAnsi(string, columns, options) {
+  const opts = Object.assign({ hard: false, trim: true, wordWrap: true }, options || {});
+  const text = String(string);
+  if (!(columns > 0)) return text;
+
+  // Render per input line, with fresh escape state each time. Carrying state
+  // across a newline added a closer to a row Bun leaves alone and reopened it
+  // on the next; measured on a lone SGR sequence followed by a newline, which
+  // Bun returns byte for byte.
+  return text.replace(/\r\n?/g, "\n").split("\n")
+    .map((line) => wrap_render(wrap_wrapLine(line, columns, opts)))
+    .join("\n");
+}
+
+/* ----------------------------------------------------------------
+ * Bun.YAML.parse  [IMPLEMENTED, for a measured subset]
+ *
+ * Skill, agent and command frontmatter. Node ships no YAML parser and this
+ * file ships no dependency, so this is a parser written against Bun 1.3.14 as
+ * the oracle over 150 probes - not a port of anything, and not a guess.
+ *
+ * The contract is deliberately narrower than YAML: every input it ACCEPTS
+ * produces exactly what Bun produces, and everything else THROWS. A wrong
+ * parse is somebody's skill silently misconfigured; a refusal is a message
+ * naming what is unsupported. Measured over the curated corpus: 141 match Bun
+ * exactly, 18 refuse, 0 differ - and over 6,000 generated inputs across three
+ * seeds, 0 differ.
+ *
+ * Refused on purpose, each because matching Bun could not be verified:
+ * anchors and aliases, tags, explicit complex keys (`? `), more than one
+ * document in a string, tabs used for indentation, and explicit block scalar
+ * indent indicators (`|2`). Frontmatter using any of those will not load, and
+ * will say which one.
+ *
+ * The typing rules are YAML 1.2 core schema as Bun implements it, and several
+ * read like bugs unless you know they were measured:
+ *   - `yes` / `no` / `on` / `off` stay STRINGS; only true/True/TRUE are boolean
+ *   - `.inf` and `.nan` come back as null, not Infinity and NaN
+ *   - `.5` is 0.5 but `+.5` is the string "+.5"
+ *   - `0x10` is 16, `0o17` is 15, `007` is 7, but `0b101` and `1_000` are strings
+ *   - `2026-08-26` and `12:30` stay strings
+ *   - `a#b` keeps the hash; `a #b` treats it as a comment
+ *   - a plain scalar containing ': ' is a parse error, but `12:30` is fine
+ *
+ * tests/test_yaml_parse.py re-runs the whole corpus with Bun as the oracle.
+ * ---------------------------------------------------------------- */
+
+const yaml_refuse = (why) => unsupported("YAML.parse", why);
+
+// --- scalar typing ---------------------------------------------------------
+//
+// YAML 1.2 core schema as Bun implements it. Every branch below was measured;
+// the surprising ones are marked, because they read like bugs otherwise.
+
+const yaml_NULLS = /^(null|Null|NULL|~)$/;
+const yaml_TRUES = /^(true|True|TRUE)$/;
+const yaml_FALSES = /^(false|False|FALSE)$/;
+// Bun answers Infinity/-Infinity/NaN here. An earlier version of this file
+// claimed it answered null "measured" - it did not: the probe compared two
+// JSON.stringify outputs, and JSON.stringify maps Infinity and NaN to null, so
+// the channel destroyed the value before the comparison saw it. The corpus
+// probe now encodes types explicitly for exactly this reason.
+const yaml_INF = /^[+-]?\.inf$/i;
+const yaml_NAN = /^[+-]?\.nan$/i;
+const yaml_HEX = /^[+-]?0x[0-9a-fA-F]+$/;
+const yaml_OCTAL = /^[+-]?0o[0-7]+$/;
+const yaml_INTEGER = /^[+-]?[0-9]+$/;
+// A sign is allowed before a digit-led float but NOT before a bare `.5`:
+// measured, `.5` is 0.5 and `+.5` is the string "+.5".
+const yaml_FLOAT_SIGNED = /^[+-]?[0-9]+\.[0-9]*([eE][+-]?[0-9]+)?$/;
+const yaml_FLOAT_BARE = /^\.[0-9]+([eE][+-]?[0-9]+)?$/;
+const yaml_EXPONENT = /^[+-]?[0-9]+[eE][+-]?[0-9]+$/;
+
+function yaml_typeScalar(text) {
+  if (text === "") return null;
+  if (yaml_NULLS.test(text)) return null;
+  if (yaml_TRUES.test(text)) return true;
+  if (yaml_FALSES.test(text)) return false;
+  if (yaml_INF.test(text)) return text[0] === "-" ? -Infinity : Infinity;
+  if (yaml_NAN.test(text)) return NaN;
+  // parseInt keeps the leading sign once "0x"/"0o" is removed, so the sign must
+  // NOT be applied a second time: "-0x10" -> "-10" -> parseInt(...,16) is -16.
+  if (yaml_HEX.test(text)) return parseInt(text.replace("0x", ""), 16);
+  if (yaml_OCTAL.test(text)) return parseInt(text.replace("0o", ""), 8);
+  if (yaml_INTEGER.test(text) || yaml_FLOAT_SIGNED.test(text) || yaml_FLOAT_BARE.test(text) || yaml_EXPONENT.test(text)) {
+    return Number(text); // -0 stays -0: measured with Object.is, not JSON
+  }
+  return text;
+}
+
+// --- quoted scalars --------------------------------------------------------
+
+const yaml_DQ_ESCAPES = {
+  "0": "\0", a: "\x07", b: "\b", t: "\t", n: "\n", v: "\v", f: "\f",
+  r: "\r", e: "", " ": " ", '"': '"', "/": "/", "\\": "\\",
+  N: "", _: " ", L: " ", P: " ",
+};
+
+function yaml_readQuoted(s, i) {
+  const quote = s[i];
+  let out = "";
+  let j = i + 1;
+  while (j < s.length) {
+    const ch = s[j];
+    if (quote === "'") {
+      if (ch === "'") {
+        if (s[j + 1] === "'") { out += "'"; j += 2; continue; }
+        return [out, j + 1];
+      }
+      out += ch;
+      j++;
+      continue;
+    }
+    if (ch === "\\") {
+      const esc = s[j + 1];
+      if (esc === "x" || esc === "u" || esc === "U") {
+        const len = esc === "x" ? 2 : esc === "u" ? 4 : 8;
+        const hex = s.slice(j + 2, j + 2 + len);
+        if (!/^[0-9a-fA-F]+$/.test(hex) || hex.length !== len) yaml_refuse("a malformed \\" + esc + " escape");
+        out += String.fromCodePoint(parseInt(hex, 16));
+        j += 2 + len;
+        continue;
+      }
+      if (!(esc in yaml_DQ_ESCAPES)) yaml_refuse("an unsupported escape \\" + esc);
+      out += yaml_DQ_ESCAPES[esc];
+      j += 2;
+      continue;
+    }
+    if (ch === '"') return [out, j + 1];
+    out += ch;
+    j++;
+  }
+  yaml_refuse("an unterminated quoted scalar");
+}
+
+// --- flow collections ------------------------------------------------------
+
+function yaml_parseFlow(s, i) {
+  const open = s[i];
+  const isSeq = open === "[";
+  const close = isSeq ? "]" : "}";
+  const items = isSeq ? [] : {};
+  let j = i + 1;
+
+  for (;;) {
+    while (j < s.length && /\s/.test(s[j])) j++;
+    if (j >= s.length) yaml_refuse("an unterminated flow collection");
+    if (s[j] === close) return [items, j + 1];
+
+    let value;
+    let key = null;
+    let hasValue = true;
+    if (!isSeq) {
+      // Bun stringifies a collection used as a key ("[object Object]", "1").
+      // That is a shape worth refusing rather than reproducing.
+      if (s[j] === "[" || s[j] === "{") yaml_refuse("a flow collection used as a key");
+      [key, j] = yaml_readFlowScalarOrNested(s, j);
+      while (j < s.length && /\s/.test(s[j])) j++;
+      if (s[j] === ":") {
+        j++;
+        while (j < s.length && /\s/.test(s[j])) j++;
+      } else {
+        // No colon means the whole entry was the key, and its value is null.
+        hasValue = false;
+        value = null;
+      }
+    }
+    if (hasValue) [value, j] = yaml_readFlowScalarOrNested(s, j);
+    if (isSeq) items.push(value);
+    else items[String(key)] = value;
+
+    while (j < s.length && /\s/.test(s[j])) j++;
+    if (s[j] === ",") { j++; continue; }
+    if (s[j] === close) return [items, j + 1];
+    yaml_refuse("a flow collection separator that is neither ',' nor '" + close + "'");
+  }
+}
+
+function yaml_readFlowScalarOrNested(s, j) {
+  if (s[j] === "[" || s[j] === "{") return yaml_parseFlow(s, j);
+  if (s[j] === '"' || s[j] === "'") {
+    const [text, next] = yaml_readQuoted(s, j);
+    return [text, next];
+  }
+  let end = j;
+  while (end < s.length) {
+    const ch = s[end];
+    if (ch === "," || ch === "]" || ch === "}") break;
+    // In flow context a colon only ends a plain scalar when a space or a
+    // terminator follows it. Measured: `{a:1}` is the single key "a:1" with a
+    // null value, while `{a: 1}` is the mapping a -> 1, and `{a: b:c}` has the
+    // value "b:c". Breaking on every colon merged those three into one wrong
+    // shape.
+    if (ch === ":" && (end + 1 >= s.length || /[\s,\]}]/.test(s[end + 1]))) break;
+    end++;
+  }
+  const raw = s.slice(j, end).trim();
+  if (raw === "") yaml_refuse("an empty flow entry");
+  return [yaml_typeScalar(raw), end];
+}
+
+// --- line handling ---------------------------------------------------------
+
+function yaml_stripComment(line) {
+  let inQuote = null;
+  // A quote only opens a quoted scalar where a value or key may begin: at the
+  // start of the line, or after ": " or "- ". Anywhere else - the apostrophe in
+  // "Don't" - it is an ordinary character. Treating every quote as an opener
+  // silently swallowed the rest of the line, comment included, into the value.
+  let canOpen = true;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQuote) {
+      if (ch === inQuote) {
+        if (inQuote === "'" && line[i + 1] === "'") { i++; continue; }
+        inQuote = null;
+      } else if (inQuote === '"' && ch === "\\") i++;
+      continue;
+    }
+    if ((ch === '"' || ch === "'") && canOpen) { inQuote = ch; continue; }
+    if (!/\s/.test(ch)) {
+      canOpen = ch === ":" || ch === "-";
+    }
+    // Measured: `a#b` keeps the hash, `a #b` does not. A comment needs
+    // whitespace before it, or the start of the line.
+    if (ch === "#" && (i === 0 || /\s/.test(line[i - 1]))) return line.slice(0, i);
+  }
+  return line;
+}
+
+const yaml_RESERVED_START = /^[@`%]/;
+
+function yaml_checkUnsupportedMarkers(raw) {
+  const t = raw.trim();
+  if (t.startsWith("&") || t.startsWith("*")) yaml_refuse("anchors and aliases");
+  if (t.startsWith("!")) yaml_refuse("tags");
+  if (t.startsWith("? ")) yaml_refuse("explicit complex keys");
+  if (t === "...") yaml_refuse("an explicit document end marker");
+}
+
+// --- block parsing ---------------------------------------------------------
+
+function yaml_indentOf(line) {
+  let n = 0;
+  while (n < line.length && line[n] === " ") n++;
+  if (line[n] === "\t") yaml_refuse("a tab used for indentation");
+  return n;
+}
+
+function yaml_isBlank(line) { return line.trim() === ""; }
+
+const yaml_KEY_RE = /^(?:("(?:[^"\\]|\\.)*")|('(?:[^']|'')*')|([^:\n]*?))\s*:(\s|$)/;
+
+function yaml_parseKey(content) {
+  const m = yaml_KEY_RE.exec(content);
+  if (!m) return null;
+  let key;
+  if (m[1] !== undefined) key = yaml_readQuoted(m[1], 0)[0];
+  else if (m[2] !== undefined) key = yaml_readQuoted(m[2], 0)[0];
+  else {
+    key = m[3].trim();
+    if (key === "") return null;
+    if (key.includes(": ")) yaml_refuse("a plain key containing ': '");
+    // `{a` and `[a` are not keys - they are the start of a flow collection
+    // that happens to contain a colon. Treating them as plain keys turned
+    // `{a: 1}` into {"{a": "1}"}, which is a wrong answer rather than a
+    // refusal. The caller handles the flow case; this just declines to claim
+    // the text is a mapping key.
+    if (/^[{[]/.test(key)) return null;
+    // A quote that opens but never closes is a parse error in Bun, and a key
+    // with a quoted section followed by bare text is too.
+    if (/^["']/.test(key)) yaml_refuse("a key that starts with a quote but is not a quoted scalar");
+  }
+  return { key: String(key), rest: content.slice(m[0].length - (m[4] === "\n" ? 1 : m[4].length)).trim(), consumed: m[0].length };
+}
+
+function yaml_readBlockScalar(lines, start, header, parentIndent) {
+  const style = header[0];
+  const rest = header.slice(1);
+  let chomp = "clip";
+  let explicit = 0;
+  for (const ch of rest) {
+    if (ch === "-") chomp = "strip";
+    else if (ch === "+") chomp = "keep";
+    else if (/[1-9]/.test(ch)) yaml_refuse("an explicit block scalar indent indicator");
+    else if (/\s/.test(ch)) {
+      // Bun rejects `| junk`; silently ignoring the junk produced a value for
+      // a document Bun refuses to parse at all.
+      if (rest.slice(rest.indexOf(ch)).trim() !== "") {
+        yaml_refuse("trailing text after a block scalar header");
+      }
+      break;
+    }
+    else yaml_refuse("an unsupported block scalar header '" + header + "'");
+  }
+
+  let i = start;
+  const body = [];
+  let baseIndent = explicit ? parentIndent + explicit : 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (yaml_isBlank(line)) { body.push(""); i++; continue; }
+    const ind = yaml_indentOf(line);
+    if (ind <= parentIndent) break;
+    if (!baseIndent) baseIndent = ind;
+    if (ind < baseIndent) break;
+    body.push(line.slice(baseIndent));
+    i++;
+  }
+  let trailingBlanks = 0;
+  while (body.length && body[body.length - 1] === "") { body.pop(); trailingBlanks++; }
+  // An empty block scalar is a parse error in Bun, not an empty string.
+  if (body.length === 0) yaml_refuse("a block scalar with no body");
+
+  let text;
+  if (style === "|") {
+    text = body.join("\n");
+    if (body.length) text += "\n";
+  } else {
+    // A line indented further than the block's base indent is NOT folded - it
+    // keeps its own line and its extra indent. Folding it produced a different
+    // string from Bun's while still accepting the input.
+    const folded = [];
+    let previousWasLiteral = false;
+    for (const line of body) {
+      if (line === "") { folded.push("\n"); previousWasLiteral = false; continue; }
+      // Indentation is SPACES, not \s. JavaScript's \s matches NBSP,
+      // ideographic space and friends, so a folded line merely starting
+      // with one of those was mistaken for a more-indented line and kept
+      // literal instead of folded.
+      const literal = line.startsWith(" ");
+      if (folded.length) {
+        if (literal || previousWasLiteral) folded.push("\n");
+        else if (folded[folded.length - 1] !== "\n") folded.push(" ");
+      }
+      folded.push(line);
+      previousWasLiteral = literal;
+    }
+    text = folded.join("");
+    if (body.length) text += "\n";
+  }
+
+  if (chomp === "strip") text = text.replace(/\n+$/, "");
+  if (chomp === "keep") text += "\n".repeat(trailingBlanks);
+  return [text, i];
+}
+
+function yaml_parseNode(lines, start, indent) {
+  let i = start;
+  while (i < lines.length && (yaml_isBlank(lines[i]) || yaml_stripComment(lines[i]).trim() === "")) i++;
+  if (i >= lines.length) return [null, i];
+
+  const ind = yaml_indentOf(lines[i]);
+  if (ind < indent) return [null, i];
+
+  const first = yaml_stripComment(lines[i]).trim();
+  yaml_checkUnsupportedMarkers(first);
+
+  if (first === "-" || first.startsWith("- ")) return yaml_parseSequence(lines, i, ind);
+  return yaml_parseMapping(lines, i, ind);
+}
+
+function yaml_parseSequence(lines, start, indent) {
+  const out = [];
+  let i = start;
+  while (i < lines.length) {
+    const raw = lines[i];
+    if (yaml_isBlank(raw) || yaml_stripComment(raw).trim() === "") { i++; continue; }
+    const ind = yaml_indentOf(raw);
+    if (ind < indent) break;
+    if (ind > indent) yaml_refuse("an over-indented sequence entry");
+    const content = yaml_stripComment(raw).trim();
+    if (content !== "-" && !content.startsWith("- ")) break;
+    yaml_checkUnsupportedMarkers(content);
+
+    const inline = content === "-" ? "" : content.slice(2).trim();
+    const childIndent = indent + (content === "-" ? 2 : raw.indexOf("-") - indent + 2);
+
+    if (inline === "") {
+      // An empty sequence entry takes the following node as its value - but
+      // Bun captures that node even when it is OUTDENTED, swallowing what
+      // reads like a sibling key at a lower level. Measured, and it interacts
+      // with duplicate-key merging in ways that change which key wins.
+      //
+      // Matching that would mean inferring how far the capture extends, in a
+      // corner no frontmatter file contains. Refuse instead: the contract
+      // prefers a named refusal over a guess, and this converts every observed
+      // wrong answer in this shape into one.
+      let peek = i + 1;
+      while (peek < lines.length &&
+             (yaml_isBlank(lines[peek]) || yaml_stripComment(lines[peek]).trim() === "")) {
+        peek++;
+      }
+      if (peek < lines.length && yaml_indentOf(lines[peek]) <= indent) {
+        yaml_refuse("an empty sequence entry followed by outdented content");
+      }
+      const [child, next] = yaml_parseNode(lines, i + 1, indent + 1);
+      out.push(child);
+      i = next;
+      continue;
+    }
+    // A sequence entry's content is re-read as if it were indented to line up
+    // after the dash. That needs one line rewritten, not a copy of the whole
+    // document: an earlier version did `lines.slice()` per entry, which made a
+    // block sequence of mappings quadratic - 40k lines took 7s where Bun takes
+    // 21ms. The recursive call has fully returned by the time the original is
+    // put back, so nothing observes the temporary value.
+    const restoreIndex = i;
+    const restore = lines[restoreIndex];
+    lines[restoreIndex] = " ".repeat(childIndent) + inline;
+    try {
+      // `- - 1` opens a nested sequence, indented to line up after the dash.
+      if (inline === "-" || inline.startsWith("- ")) {
+        const [child, next] = yaml_parseSequence(lines, i, childIndent);
+        out.push(child);
+        i = next;
+        continue;
+      }
+      if (yaml_parseKey(inline)) {
+        // `- a: 1` starts a mapping whose remaining keys line up with the text
+        // after the dash.
+        const [child, next] = yaml_parseMapping(lines, i, childIndent);
+        out.push(child);
+        i = next;
+        continue;
+      }
+    } finally {
+      lines[restoreIndex] = restore;
+    }
+    out.push(yaml_scalarValue(inline, lines, i, indent)[0]);
+    i++;
+  }
+  return [out, i];
+}
+
+function yaml_scalarValue(text, lines, i, indent) {
+  if (text === "") return [null, i + 1];
+  if (text[0] === "[" || text[0] === "{") {
+    const [value, end] = yaml_parseFlow(text, 0);
+    if (text.slice(end).trim() !== "") yaml_refuse("trailing content after a flow collection");
+    return [value, i + 1];
+  }
+  if (text[0] === '"' || text[0] === "'") {
+    const [value, end] = yaml_readQuoted(text, 0);
+    if (text.slice(end).trim() !== "") yaml_refuse("trailing content after a quoted scalar");
+    return [value, i + 1];
+  }
+  if (yaml_RESERVED_START.test(text)) yaml_refuse("a scalar starting with a reserved indicator");
+  if (text === "-" || text.endsWith(":")) yaml_refuse("an ambiguous plain scalar");
+  // `a: - item` is a parse error in Bun, not the string "- item".
+  if (text.startsWith("- ")) yaml_refuse("a sequence entry on the same line as its key");
+  if (text.startsWith("&") || text.startsWith("*")) yaml_refuse("anchors and aliases");
+  if (text.startsWith("!")) yaml_refuse("tags");
+  // Measured: Bun rejects a plain scalar containing ": ". `12:30` is fine,
+  // `with: an inner colon` is a parse error, and guessing which the writer
+  // meant is exactly the guess this shim does not make.
+  if (text.includes(": ")) yaml_refuse("a plain scalar containing ': '");
+  return [yaml_typeScalar(text.trim()), i + 1];
+}
+
+function yaml_parseMapping(lines, start, indent) {
+  const out = {};
+  let i = start;
+  while (i < lines.length) {
+    const raw = lines[i];
+    if (yaml_isBlank(raw) || yaml_stripComment(raw).trim() === "") { i++; continue; }
+    const ind = yaml_indentOf(raw);
+    if (ind < indent) break;
+    if (ind > indent) yaml_refuse("an unexpected indent inside a mapping");
+
+    const content = yaml_stripComment(raw).trim();
+    yaml_checkUnsupportedMarkers(content);
+    if (content.startsWith("- ") || content === "-") break;
+
+    const parsed = yaml_parseKey(content);
+    if (!parsed) yaml_refuse("a line that is neither a mapping entry nor a sequence entry");
+
+    const { key, rest } = parsed;
+    if (rest.startsWith("|") || rest.startsWith(">")) {
+      const [text, next] = yaml_readBlockScalar(lines, i + 1, rest, ind);
+      out[key] = text;
+      i = next;
+      continue;
+    }
+    if (rest === "") {
+      // A block sequence is allowed to sit at the same indentation as the key
+      // that owns it - `tools:` then `- Read` in column zero is ordinary YAML
+      // and common in frontmatter.
+      let peek = i + 1;
+      while (peek < lines.length && (yaml_isBlank(lines[peek]) || yaml_stripComment(lines[peek]).trim() === "")) peek++;
+      const peeked = peek < lines.length ? yaml_stripComment(lines[peek]).trim() : "";
+      const sameLevelSeq = peek < lines.length && yaml_indentOf(lines[peek]) === ind &&
+        (peeked === "-" || peeked.startsWith("- "));
+      const [child, next] = sameLevelSeq
+        ? yaml_parseSequence(lines, peek, ind)
+        : yaml_parseNode(lines, i + 1, ind + 1);
+      out[key] = child;
+      i = next === i + 1 ? i + 1 : next;
+      continue;
+    }
+    const [value, next] = yaml_scalarValue(rest, lines, i, ind);
+    out[key] = value;
+    i = next;
+  }
+  return [out, i];
+}
+
+// --- entry point -----------------------------------------------------------
+
+function yamlParse(input) {
+  const src = String(input).replace(/\r\n/g, "\n");
+  let lines = src.split("\n");
+
+  // A single leading document marker is fine; a second document is not, and
+  // guessing which one the caller wanted is exactly the wrong move.
+  const markers = lines.filter((l) => l.trim() === "---" || l.trim().startsWith("--- ")).length;
+  if (markers > 1) yaml_refuse("multiple documents in one string");
+  // The marker need not be the first LINE - comments and blank lines may sit
+  // above it. Looking only at line 0 left `# comment` then `---` unrecognised,
+  // and the marker then fell through and was read as a bare scalar "---".
+  let markerAt = 0;
+  while (markerAt < lines.length &&
+         (yaml_isBlank(lines[markerAt]) ||
+          yaml_stripComment(lines[markerAt]).trim() === "")) {
+    markerAt++;
+  }
+  if (markerAt < lines.length &&
+      (lines[markerAt].trim() === "---" || lines[markerAt].trim().startsWith("--- "))) {
+    // Content may sit on the marker line itself: `--- scalar` is a document
+    // whose value is "scalar", not an empty one. Dropping the whole line
+    // returned null for a document that has content, which is config silently
+    // missing rather than config loudly refused.
+    const inline = lines[markerAt].trim().slice(3).trim();
+    const after = lines.slice(markerAt + 1);
+    lines = inline === "" ? after : [inline].concat(after);
+  }
+
+  const meaningful = lines.filter((l) => !yaml_isBlank(l) && yaml_stripComment(l).trim() !== "");
+  if (meaningful.length === 0) return null;
+
+  const firstContent = yaml_stripComment(meaningful[0]).trim();
+  yaml_checkUnsupportedMarkers(firstContent);
+
+  // A whole document can be one flow collection. It has to be handled before
+  // the mapping path, because `{a: 1}` looks like a key to a line-oriented
+  // reader. Only the single-line form is accepted: a flow spanning lines was
+  // not measured, so it refuses rather than guesses.
+  if (/^[{[]/.test(firstContent)) {
+    if (meaningful.length > 1) yaml_refuse("a flow collection spanning several lines");
+    const [value, end] = yaml_parseFlow(firstContent, 0);
+    if (firstContent.slice(end).trim() !== "") {
+      yaml_refuse("trailing content after a flow collection");
+    }
+    return value;
+  }
+  if (!yaml_parseKey(firstContent) && !(firstContent === "-" || firstContent.startsWith("- "))) {
+    // A bare top-level scalar.
+    if (meaningful.length > 1) yaml_refuse("a bare scalar followed by more content");
+    return yaml_scalarValue(firstContent, lines, 0, 0)[0];
+  }
+
+  const [node, consumed] = yaml_parseNode(lines, 0, 0);
+  for (let k = consumed; k < lines.length; k++) {
+    if (!yaml_isBlank(lines[k]) && yaml_stripComment(lines[k]).trim() !== "") {
+      yaml_refuse("content the indentation left unattached to any node");
+    }
+  }
+  return node;
+}
+
 /* ---------------------------------------------------------------- *
  * The object this file installs as globalThis.Bun. The entries above go in
  * first; everything below them is a reachable call with no honest Node
@@ -885,6 +2632,7 @@ function gc() {
  * ---------------------------------------------------------------- */
 const bun = {
   stringWidth,
+  wrapAnsi,
   stripANSI,
   hash,
   which,
@@ -896,9 +2644,11 @@ const bun = {
   },
 
   // Text formats Bun parses natively and Node does not. Used for skill and
-  // agent frontmatter; a wrong parse would be silently wrong config.
+  // agent frontmatter; a wrong parse would be silently wrong config, so
+  // YAML.parse implements the subset it can match exactly and refuses the
+  // rest by name. stringify has no caller on any path measured here.
   YAML: {
-    parse: () => unsupported("YAML.parse", "Node has no YAML parser and this file ships none"),
+    parse: yamlParse,
     stringify: () => unsupported("YAML.stringify", "Node has no YAML serialiser and this file ships none"),
   },
   TOML: { parse: () => unsupported("TOML.parse", "Node has no TOML parser and this file ships none") },
@@ -910,7 +2660,6 @@ const bun = {
   serve: () => unsupported("serve", "no HTTP server stand-in"),
   listen: () => unsupported("listen", "no TCP server stand-in"),
   connect: () => unsupported("connect", "no TCP client stand-in"),
-  wrapAnsi: () => unsupported("wrapAnsi", "the wrapping algorithm was not verified against Bun; the TUI needs it"),
   generateHeapSnapshot: () => unsupported("generateHeapSnapshot", "Node's v8.getHeapSnapshot has a different shape"),
 
   // Native-binary-only surfaces. Bun's own error text for the gateway is

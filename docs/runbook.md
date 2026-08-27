@@ -245,8 +245,15 @@ before real use.
 **Under Node instead of Bun.** Node **≥ 24** only — the bundle's `using`
 declarations do not parse before it. `make node-deps && make node-run NODE_BIN=<node24>`
 runs the artifact under `node --require ./scripts/bun-shim.cjs` (the `./` is
-load-bearing - a bare path is a package specifier); the command surface is
-byte-identical to Bun, the agentic path untested ([findings.md](./findings.md) §11).
+load-bearing - a bare path is a package specifier, resolved in node_modules and
+never against the cwd); the command surface is byte-identical to Bun
+([findings.md](./findings.md) §11). The **interactive TUI also works** - driven
+through a pty here on 2026-08-26 it painted the banner, took a keystroke at the
+theme picker, rendered the syntax preview and reached the login selector - that
+part on **Linux**, with a scratch config dir. The **authenticated REPL** works
+too, once `Bun.wrapAnsi` and `Bun.YAML.parse` were implemented: confirmed
+2026-08-26 on Apple Silicon with a real authenticated config, which is where it
+had been failing. The troubleshooting row below records what it was.
 
 **Run it by full path.** Do not create a `claude` shim on `PATH`; it would shadow
 your real installation, and every command in this repo is written to be run by
@@ -383,13 +390,67 @@ Two things to expect:
 | `TypeError: … is not a function` naming a `Bun.*` property | **This** is the missing-API signal — findings §9's risk | Pin to an older Claude version, or shim the API |
 | Images are refused with *"Unable to resize image…"* | **Not expected in a default build.** It means the artifact predates the shim, was built with `NRC_NO_IMAGE_SHIM` non-empty, or the shim refused on this Claude release | `grep -o 'if(true)try' build/extract/cli.original.cjs \| wc -l` prints **1** for a shimmed build and **0** for an as-shipped one (measured on all three real binaries). If 0, rebuild without the env var and read the `image shim` lines: a refusal names which of three things drifted — the gate **declaration**'s minified shape, the **anchor** string, or the `if(<gate>())try{` branch shape (findings §10). Never "fix" it by flipping `Bun.isStandaloneExecutable` globally: measured, that silently breaks `Grep` |
 | `ripgrep not found on PATH` | Embedded ripgrep needs a standalone; this build uses a system `rg` (findings §10) | Install `ripgrep` |
+| Missing `rg` does **not** always announce itself | Observed 2026-08-26 on a Mac with no ripgrep: the file-scan spawns fail with `ENOENT` and the TUI simply never paints - no message, no error, no exit. The failure is silent because the spawn error arrives asynchronously; `scripts/node-trace.cjs` is what made it visible, and only after it learned to follow children to their exit | `command -v rg` before blaming the runtime. Note `USE_BUILTIN_RIPGREP` cannot substitute: the embedded copy is gated behind standalone mode, which this build is not |
 | `postprocess.py` exits non-zero and writes nothing | one of `check()`'s **six** fatal conditions (findings §6) | The error names which. Shape problems (IIFE, `(function`) mean the entry module changed — read its last ~200 bytes and re-measure before editing a regex. A surviving reference means a `/$bunfs/` shape the rewriter does not cover. A missing asset means `extract_bun.py` dropped a loader kind. Zero rewrites with populated assets means a different VFS prefix ([status.md](./status.md) § Windows/PE). Failed shim arithmetic means the one-site rewrite spread, and nothing is written deliberately, because the site it would reach next is embedded ripgrep. `not counted (no gate identified)` is not an error on its own — it is the honest reading when no gate declaration matched |
 | `Cannot find module '.../assets/X.node'` | asset not extracted, or its path not rewritten | Should be unreachable from a build that succeeded: `check()` fails when the rewritten code references an asset that is not on disk. If you see it anyway, the artifact and its `assets/` came from different runs — rebuild |
 | A mermaid/highlight/chart feature breaks | a `file`-loader asset still referenced via `/$bunfs/`, or an unverified runtime path | The rewritten path shape is verified to work, but no command here has exercised these three features — [status.md](./status.md) remaining work #3 |
 | `error: PE (Windows) executable detected` | you pointed the extractor at `claude.exe` | Not supported by design — [status.md](./status.md) § Windows/PE |
 | `error: ELF has no section headers (stripped?)` | the binary was stripped | Get an unstripped build; the shipped one is not stripped |
 | `input is only 0 bytes` from the extractor, with no path given to `build.sh` | auto-discovery picked a stub: an interrupted `claude` auto-update leaves a 0-byte entry in `versions/`, and it sorts **newest** | Fixed as of 2026-08-24 — discovery walks newest-first, skips anything under 1 MiB and names what it skipped. On an older checkout, pass the working binary explicitly |
+| Under Node the TUI paints nothing, sits idle, and Ctrl-C does not exit | **Solved 2026-08-26.** The REPL calls `Bun.YAML.parse` and `Bun.wrapAnsi`; the shim refused both, and a React error boundary swallowed the throws - so the process idled, painted nothing and never crashed. Onboarding was unaffected because it calls neither, which is why a scratch `CLAUDE_CONFIG_DIR` always appeared to work and sent the investigation after the config for hours | Fixed: both are implemented and verified against Bun, and the fix was confirmed on the reporting machine - Apple Silicon, Node 24.19.0, real authenticated config. If a TUI still will not paint, run with `scripts/node-trace.cjs` and grep the log for `THREW`: the line names the API and the reason. See [Diagnosing a Node hang](#diagnosing-a-node-hang) |
 | On exit the TUI does not clear or restore the terminal | **Unknown.** Observed once on macOS (Apple Silicon, 2026-08-24), not reproduced, cause not investigated. The native binary does not behave this way | Nothing to do; cosmetic. Recorded in [status.md](./status.md) § Known unknowns so a second sighting has something to attach to — please report one, with the terminal emulator named |
+
+---
+
+## Diagnosing a Node hang
+
+`scripts/node-trace.cjs` is a diagnostic preload. It writes to `NRC_TRACE`
+(default `/tmp/nrc-node-trace.log`) and never to stdout, because stdout belongs
+to the TUI. Every call it wraps logs both before and after, so **a line with no
+matching `<` is the call that never returned**, and a 500 ms heartbeat runs
+alongside: ticks continuing means the process is idle and waiting; ticks
+stopping means the main thread is blocked. It is unbuffered `fs.writeSync`, so
+the last line survives `kill -9`, and its timer is `unref`'d so it cannot keep a
+finished process alive. `tests/test_node_trace.py` pins all of that.
+
+Load it **before** the shim, and run these three in order — the first that
+misbehaves is the answer:
+
+```bash
+cd /path/to/not-rusty-claude
+export NODE_PATH="$HOME/.cache/not-rusty-claude/node/node_modules"
+
+# A. do the preloads even complete?
+node --require "$PWD/scripts/node-trace.cjs" \
+     --require "$PWD/scripts/bun-shim.cjs" -e 'console.log("preloads ok")'
+
+# B. a non-interactive command: if THIS hangs, it is startup, not the TUI
+NRC_TRACE=/tmp/nrc-b.log DISABLE_AUTOUPDATER=1 \
+  node --require "$PWD/scripts/node-trace.cjs" \
+       --require "$PWD/scripts/bun-shim.cjs" \
+       build/extract/cli.original.cjs mcp list
+
+# C. the TUI. Leave it in the FOREGROUND; do not background it - a backgrounded
+#    TUI gets SIGTTOU and tells you nothing.
+NRC_TRACE=/tmp/nrc-c.log DISABLE_AUTOUPDATER=1 \
+  node --require "$PWD/scripts/node-trace.cjs" \
+       --require "$PWD/scripts/bun-shim.cjs" \
+       build/extract/cli.original.cjs
+```
+
+While C is stuck, from a **second** terminal, macOS's own sampling profiler
+gives the native stack of every thread with no code change at all:
+
+```bash
+sample $(pgrep -n -f cli.original.cjs) 5 -f /tmp/nrc-sample.txt
+pkill -f cli.original.cjs
+```
+
+`/tmp/nrc-c.log` and `/tmp/nrc-sample.txt` together say where it stopped.
+
+For reference, a healthy Linux run reaches first paint at ~1.8 s: `setRawMode`,
+then the 710-byte welcome banner, then a `\e[c` device-attributes query, then
+the theme picker. A log that ends before the banner never got to the renderer.
 
 ---
 

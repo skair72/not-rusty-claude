@@ -185,13 +185,6 @@ def _run(argv, env, cwd=None):
                           timeout=TIMEOUT)
 
 
-@pytest.fixture(scope="session")
-def node_env(node_bin, ws_module, undici_module, built_artifact):
-    """Everything the Node side needs, or a skip naming what is missing."""
-    assert ws_module == undici_module, "ws and undici must share one node_modules"
-    return {"node": node_bin, "modules": ws_module, "artifact": built_artifact}
-
-
 def _both(node_env, bun_bin, tmp_path, args):
     """Run the same CLI command under Bun and under Node + shim.
 
@@ -587,12 +580,20 @@ def test_which_reads_the_path_the_process_started_with(node_bin, bun_bin, which_
 # Every Bun API the artifact can reach, and what the shim must do about it.
 # A stub that returned a plausible value instead of throwing is the failure
 # this repo exists to prevent, so the two lists are asserted, not documented.
+#
+# wrapAnsi left this list on 2026-08-26. It is implemented and verified
+# byte-equal to Bun over 2,800 cases (tests/test_wrap_ansi.py), because the
+# renderer cannot draw a frame without it and the refusal was reaching a React
+# error boundary that swallowed the throw - the TUI painted nothing and never
+# said why.
 THROWING = [
-    ("YAML.parse", "Bun.YAML.parse('a: 1')"),
+    # YAML.parse answers ordinary frontmatter now; what it still refuses is
+    # the constructs it could not verify against Bun. An anchor is one, so the
+    # entry keeps its place in this list rather than leaving it.
+    ("YAML.parse", "Bun.YAML.parse('a: &x 1')"),
     ("YAML.stringify", "Bun.YAML.stringify({})"),
     ("TOML.parse", "Bun.TOML.parse('a = 1')"),
     ("semver.satisfies", "Bun.semver.satisfies('1.2.3', '^1.0.0')"),
-    ("wrapAnsi", "Bun.wrapAnsi('a b c', 3)"),
     ("spawn", "Bun.spawn(['true'])"),
     ("file", "Bun.file('/etc/hostname')"),
     ("serve", "Bun.serve({})"),
@@ -687,6 +688,20 @@ def test_absent_apis_stay_undefined(node_bin):
         f"them and a stub sends it down a path that has no working answer")
 
 
+def _recipe_of(makefile, target):
+    """The tab-indented recipe lines of one Makefile target, as one string."""
+    out, collecting = [], False
+    for line in makefile.splitlines(keepends=True):
+        if collecting:
+            if not line.startswith("\t"):
+                break
+            out.append(line)
+        elif re.match(rf"^{re.escape(target)}\s*:", line):
+            collecting = True
+    assert out, f"no recipe found for target {target!r}"
+    return "".join(out)
+
+
 def test_the_shim_path_make_node_run_prints_is_the_one_it_runs():
     """`make node-run` used to ECHO a different --require argument than it ran.
 
@@ -703,17 +718,29 @@ def test_the_shim_path_make_node_run_prints_is_the_one_it_runs():
     property directly - the printed argument and the executed one are the same
     string, and it is one Node can resolve (absolute, or explicitly relative).
     """
-    recipe = (ROOT / "Makefile").read_text()
+    makefile = (ROOT / "Makefile").read_text()
+
+    # Scope the printed-vs-executed property to node-run's own recipe. Other
+    # targets run `node --require` too (wrap-bench), but print no
+    # copy-pasteable command, so they cannot carry this defect. Counting
+    # `--require` across the whole file made this test go red the moment a
+    # second such target was added - a property of the count, not of the bug.
+    recipe = _recipe_of(makefile, "node-run")
     echoed = re.findall(r'echo "==> \$\$node --require (\S+)', recipe)
     executed = re.findall(r'"\$\$node" --require (\S+)', recipe)
-    assert len(echoed) == 1, f"expected one echoed --require, got {echoed}"
-    assert len(executed) == 1, f"expected one executed --require, got {executed}"
+    assert len(echoed) == 1, f"expected one echoed --require in node-run, got {echoed}"
+    assert len(executed) == 1, f"expected one executed --require in node-run, got {executed}"
 
     assert echoed[0] == executed[0], (
         f"make node-run prints --require {echoed[0]} but runs "
         f"--require {executed[0]}")
 
-    path = echoed[0].strip("'\"")
-    assert path.startswith("$(ROOT)/") or path.startswith("./"), (
-        f"--require {path!r} is a bare specifier: node resolves it in "
-        f"node_modules, not against the cwd, so the printed command cannot run")
+    # The resolvable-form rule binds every --require the Makefile executes,
+    # not just node-run's: a bare specifier is broken wherever it appears.
+    everywhere = re.findall(r'"\$\$node" --require (\S+)', makefile)
+    assert everywhere, "no executed --require found in the Makefile at all"
+    for raw in everywhere:
+        path = raw.strip("'\"")
+        assert path.startswith("$(ROOT)/") or path.startswith("./"), (
+            f"--require {path!r} is a bare specifier: node resolves it in "
+            f"node_modules, not against the cwd, so the printed command cannot run")

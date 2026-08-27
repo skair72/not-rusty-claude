@@ -145,10 +145,39 @@ make node-run NODE_BIN=/path/to/node24  # node --require ./scripts/bun-shim.cjs 
 Measured 2026-08-25, Bun 1.3.14 against Node 24.0.0 and 26.7.0: `--version`,
 `--help`, `mcp list` and `config ls` print **byte-identical stdout with equal
 exit codes**; `doctor` differs in one line, the `Path:` naming the interpreter
-actually running. **A real agentic conversation under Node has never been run** —
-that is the command surface only, and where the shim cannot match Bun (`YAML`,
-`wrapAnsi`, `spawn`, …) it throws naming the API rather than guessing. Detail:
-[`docs/findings.md`](docs/findings.md) §11.
+actually running. Where the shim cannot match Bun (`spawn`, `file`, `SQL`, …)
+it throws naming the API rather than guessing. Detail:
+[`docs/findings.md`](docs/findings.md) §11, whose "command surface only" line predates
+the interactive runs described next.
+
+The **interactive TUI works too**. Onboarding ✅ was driven through a pty here on
+2026-08-26 under Node 24.19.0 — welcome banner, a keystroke at the theme picker, syntax
+preview, login selector, all responsive. The **authenticated REPL** 🍎 was confirmed on
+Apple Silicon with the reporter's own `~/.claude`, same date. Those are different code
+paths and different machines, which is the whole story below.
+
+Finding out why the REPL would not paint took a day. On that Mac it drew nothing,
+ignored Ctrl-C and looked idle rather than stuck, while the same machine and binary
+rendered onboarding perfectly with a scratch `CLAUDE_CONFIG_DIR`. Seven explanations
+were raised and killed by evidence — native addons, `Bun.Terminal`, a fullscreen
+renderer, a keychain freeze, MCP servers, a missing `ripgrep`, an eight-version bundle
+gap — before `scripts/node-trace.cjs` watched the object the shim installs and named it
+in one line: the REPL calls **`Bun.YAML.parse`** and **`Bun.wrapAnsi`**, the shim refused
+both, and a React error boundary swallowed every throw. Refusing loudly only helps if
+something can hear it.
+
+Both are implemented now, measured against Bun as oracle rather than written from memory
+— `wrapAnsi` byte-equal over 4,900 cases, `YAML.parse` matching on 141 of 178 and
+refusing 18 by name, with **zero** inputs accepted and parsed differently. A first
+version of both passed a smaller corpus and still carried thirteen real defects, found
+by review: the corpora were extended until they covered the shapes that had hidden them
+(multi-parameter SGR, `#` after an apostrophe, top-level flow collections).
+
+⚠️ **Still refused**, by name rather than by silent misparse: frontmatter using an
+anchor, a tag, a complex key, several documents, tab indentation, an explicit block
+scalar indent or an over-indented sequence entry. If a TUI will not paint,
+`scripts/node-trace.cjs` prints `THREW` with the API and the reason
+([`docs/runbook.md`](docs/runbook.md) § Diagnosing a Node hang).
 
 ## macOS
 
@@ -299,6 +328,8 @@ not-rusty-claude/
 ├── scripts/
 │   ├── build.sh                    extract → post-process → print the run command
 │   ├── bun-shim.cjs                globalThis.Bun stand-in, so Node ≥ 24 can run it
+│   ├── trim-config.py              bisect a global config that breaks startup
+│   ├── node-trace.cjs              diagnostic preload: what blocked, and where
 │   ├── ab-equivalence.sh           the findings §10 A/B (Linux-only: /proc)
 │   ├── mock-messages-api.mjs       loopback-only mock of the Messages API
 │   └── syntax-check.js             fast secondary syntax check (JSC, not Bun)
@@ -316,30 +347,35 @@ run's, reconciled below rather than written out twice — the repo's convention
 being that **a measured figure is stated in one place, and appears elsewhere
 only as quoted command output labelled with the binary and date that produced
 it.** These counts *move*, in both directions, as test files are added and removed —
-which is exactly why. Every row was re-measured here on 2026-08-26
+which is exactly why. Every row was re-measured here on 2026-08-27
 by forcing it with the variables named beside it; `--collect-only` reports the
-same total, **245**, in all six configurations, because what the host has
+same total, **304**, in all six configurations, because what the host has
 changes the skips, never the collection.
 
 | host has | result | how the row was forced |
 | --- | --- | --- |
-| both binaries, Bun, Node 24 | **245 passed** | `NRC_TEST_NODE=…/v24.0.0/bin/node` (this host's own `node` is 22.23.2) |
-| …no Mach-O | 240 passed, 5 skipped | `NRC_TEST_MACHO=/nonexistent/macho` |
-| …no ELF | 240 passed, 5 skipped | `NRC_TEST_ELF=/nonexistent/elf` |
-| …neither binary | 235 passed, 10 skipped | both of those two variables at once |
-| …and no Bun | 200 passed, 45 skipped | …plus `BUN_BIN=/nonexistent/bun` and a `HOME` with no Bun under it |
-| none of them, Node 22 | 180 passed, 65 skipped | …and drop `NRC_TEST_NODE` — the command below |
+| both binaries, Bun, Node 24 | **304 passed** | `NRC_TEST_NODE=…/v24.19.0/bin/node` (this host's own `node` is 22.23.2) |
+| …no Mach-O | 299 passed, 5 skipped | `NRC_TEST_MACHO=/nonexistent/macho` |
+| …no ELF | 299 passed, 5 skipped | `NRC_TEST_ELF=/nonexistent/elf` |
+| …neither binary | 294 passed, 10 skipped | both of those two variables at once |
+| …and no Bun | 220 passed, 84 skipped | …plus `BUN_BIN=/nonexistent/bun` and a `HOME` with no Bun under it |
+| none of them, Node 22 | 191 passed, 113 skipped | …and drop `NRC_TEST_NODE` — the command below |
 
-Every row adds up to 245, and the skips decompose: **5** tests need the Mach-O
-binary, **5** the ELF one, **3** more only a Bun (5 + 5 + 3 = 13), and **52**
-need Node ≥ 24 — of which **28** also use Bun as their oracle and **4** also
-want `ws`+`undici`, which the moved `HOME` of the fifth row takes with it
-(13 + 52 = 65).
+Every row adds up to 304, and the skips decompose — counted from each run's own
+`-rs` skip reasons, not inferred from the totals. **5** tests need the Mach-O
+binary and **5** the ELF one, and the two sets are disjoint, which is why the
+fourth row skips exactly 10. Removing Bun while Node 24 is still present skips a
+further **68**, and moving `HOME` takes `ws`+`undici` with it for another **6**:
+10 + 68 + 6 = 84. Dropping to Node 22 changes which check fires first, so the
+last row is not the previous one plus a constant. **63** tests skip for Node
+≥ 24, of which **28** also want Bun and **6** also want `ws`+`undici`, leaving
+**29** that want only the newer Node; the other **40** Bun-wanting tests still
+skip for Bun. 10 + 63 + 40 = 113.
 
 **The Apple Silicon run is not reconcilable to this table, and should not be.**
 It reported **257 passed, 6 skipped, 0 failed, 263 collected** — a true
 measurement of the tree as it stood on 2026-08-24, whose test set is not
-today's. No arithmetic connects 263 to 245 and none is offered. What the Mac run
+today's. No arithmetic connects 263 to 304 and none is offered. What the Mac run
 established is in [§ macOS](#macos); its totals belong to the tree it ran on.
 
 The last two rows need care twice over. `BUN_BIN` is a *first* choice, not an

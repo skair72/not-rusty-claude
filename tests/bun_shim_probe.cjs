@@ -6,7 +6,7 @@
 // file hardcodes no expected values.
 //
 //   bun  tests/bun_shim_probe.cjs <fixture-dir>
-//   node --require scripts/bun-shim.cjs tests/bun_shim_probe.cjs <fixture-dir>
+//   node --require ./scripts/bun-shim.cjs tests/bun_shim_probe.cjs <fixture-dir>
 //
 // <fixture-dir> is created by the caller and must be the SAME path for both
 // runs: Bun.which answers with the path it was given, so the two runtimes have
