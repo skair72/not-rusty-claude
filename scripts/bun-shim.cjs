@@ -1177,6 +1177,26 @@ function wrap_restNeedsNoRoom(rest) {
   return true;
 }
 
+// Whether an ST-terminated OSC 8 open event appears anywhere in `text`.
+// wrap_restNeedsNoRoom answers true for plain trailing whitespace with
+// nothing after it too - vacuously, since an empty/all-zero-width rest never
+// hits a reason to return false. That vacuous case is not the same as glue
+// actually being on its way, and callers that mean "because glue is coming"
+// need this to tell the two apart.
+function wrap_hasGlueOpen(text) {
+  let i = 0;
+  while (i < text.length) {
+    const esc = wrap_escapeLength(text, i);
+    if (esc) {
+      if (wrap_oscGlueEvent(text.slice(i, i + esc)) === true) return true;
+      i += esc;
+      continue;
+    }
+    i += String.fromCodePoint(text.codePointAt(i)).length;
+  }
+  return false;
+}
+
 function wrap_breakWord(rows, word, columns) {
   let i = 0;
   let pending = "";
@@ -1450,9 +1470,49 @@ function wrap_wrapLine(rawLine, columns, opts) {
       // with trim left at its default, but with trim:false the SAME input
       // pre-pushes and keeps the separator space exactly as an ungated word
       // would - "k\n <link>abc</link>", not "k<link>abc</link>".
+      //
+      // The same exemption extends to a BLANK word (wordWrap_splitWords
+      // produces one whenever a tab, or a run of spaces, sits between two
+      // real words - the run's non-space characters and the empty strings
+      // either side of consumed spaces all become their own "words"). A
+      // blank word carries zero width itself, so wrap_gluedThroughout(word)
+      // is false for it even though glue is coming later. The real question
+      // is the one wrap_restNeedsNoRoom already answers elsewhere: does
+      // everything from here to the end of the line need no room, either
+      // because it is zero-width or because glue starts before anything
+      // that isn't? Measured: "e" + "  \t  " + a glued link, walked word by
+      // word ("e", "", "\t", "", <link>), fills the row to exactly full by
+      // the second blank word - and Bun does NOT push there, because the
+      // rest (the remaining blank word plus the glued word) needs no room.
+      // Restricted to wordWidth === 0 so a word with real leading content
+      // before its own later glue is untouched; that shape is already
+      // covered by wrap_gluedThroughout requiring glue at position 0.
+      //
+      // A blank word that gets this exemption also never gets PLACED - not
+      // just spared the push and space. Measured: the same input at width 1
+      // ("e" + three blank words + the glued link) drops the tab entirely,
+      // "e<link>bidi</link>" with no "\t" anywhere - so once the row is
+      // already exactly full and nothing ahead needs room, a blank word's
+      // own (whitespace) content is discarded along with its separator, not
+      // appended to the row. A glued word getting the same exemption still
+      // needs to run through the normal placement below (it has real
+      // content to break onto the row), so the skip-placement only applies
+      // to the blank-word half of the OR.
+      //
+      // wrap_restNeedsNoRoom alone is not enough: it also answers true for
+      // plain trailing whitespace with nothing after it at all (vacuously -
+      // an empty rest never finds a reason to say false), and that is NOT
+      // glue coming later. Measured: "trailing" + three trailing spaces at
+      // width 1 keeps its final row break ("...g\n"); the fix without this
+      // guard swallowed it, dropping the trailing empty row. Requiring an
+      // actual glue-open somewhere in the rest tells the two apart.
+      const rest = words.slice(index).join("");
+      const blankExempt = wordWidth === 0 && !wrap_gluedThroughout(word) &&
+          wrap_hasGlueOpen(rest) && wrap_restNeedsNoRoom(rest);
       if (taken >= columns && opts.trim !== false && opts.wordWrap === false &&
-          wrap_gluedThroughout(word)) {
+          (wrap_gluedThroughout(word) || blankExempt)) {
         // Nothing: skip both steps below entirely.
+        if (blankExempt) continue;
       } else {
         // The separator space, unless the row is empty and we are trimming.
         if (taken >= columns && (opts.wordWrap === false || opts.trim === false)) {

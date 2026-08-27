@@ -144,8 +144,8 @@ SEEDS = [1, 7, 13, 99, 1337, 20260826, 24301, 424242]
 # the aggregate count, which briefly rose by one on 7 of 8 seeds before the
 # trim:false guard landed. This dropped every seed again (30 -> 26 total).
 MAX_WRAP_DIVERGENCES = {
-    1: 4, 7: 3, 13: 4, 99: 4,
-    1337: 1, 20260826: 3, 24301: 3, 424242: 4,
+    1: 3, 7: 2, 13: 3, 99: 1,
+    1337: 0, 20260826: 3, 24301: 2, 424242: 2,
 }
 
 # YAML must be exact: it has a refusal channel, so anything it cannot match is
