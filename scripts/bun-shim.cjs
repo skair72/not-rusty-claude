@@ -1103,6 +1103,31 @@ function wrap_oscGlueEvent(text) {
   return null;
 }
 
+// Whether a BEL-terminated OSC 8 event, with something still AFTER it,
+// appears anywhere in `text` - used to decide, at the moment ST-disabled
+// mode is about to start, whether it will ever end and matter. A BEL that
+// is the last thing in the word behaves as if it were never there: nothing
+// remains to place under the resumed check, so it does not count. Measured:
+// an ST-opened link that stays open with a BEL-opened link later still
+// merges onto an already-full row with no break, when that trailing link is
+// itself the end of the word - the identical word with anything at all
+// after that trailing link's open DOES break.
+function wrap_hasLaterBel(text) {
+  let i = 0;
+  while (i < text.length) {
+    const esc = wrap_escapeLength(text, i);
+    if (esc) {
+      if (wrap_oscGlueEvent(text.slice(i, i + esc)) === false && i + esc < text.length) {
+        return true;
+      }
+      i += esc;
+      continue;
+    }
+    i += String.fromCodePoint(text.codePointAt(i)).length;
+  }
+  return false;
+}
+
 // Whether wrap_breakWord will treat this word as one raw, unbroken blob: it
 // must OPEN glued (its first escape is an ST-terminated OSC 8 event) and stay
 // glued with no BEL event anywhere later to end it. This is what the
@@ -1162,8 +1187,39 @@ function wrap_breakWord(rows, word, columns) {
     if (esc) {
       const text = word.slice(i, i + esc);
       const toggle = wrap_oscGlueEvent(text);
-      if (toggle === true) glued = true;
-      else if (toggle === false) glued = false;
+      if (toggle === true) {
+        // Entering ST-disabled mode from normal is checked against the
+        // column budget like any other token - BUT ONLY when something
+        // later in the word will ever turn it back off. Measured: "ab"
+        // (fills width 1) + an ST-opened link that stays open with no BEL
+        // anywhere for the rest of the word merges the link onto the same
+        // full row with no break; the identical prefix with a BEL-opened
+        // link somewhere later in the word DOES break before the ST-open.
+        // Once already disabled, a second ST event (its own close, or a
+        // later link's open) never re-triggers this - only the transition
+        // out of normal mode does.
+        if (!glued) {
+          if (taken === null) taken = wrap_visibleWidth(rows[rows.length - 1]);
+          if (taken === columns && wrap_hasLaterBel(word.slice(i + esc))) {
+            rows.push("");
+            taken = 0;
+          }
+        }
+        glued = true;
+      }
+      else if (toggle === false) {
+        // Leaving ST-disabled mode touches nothing: `taken` just resumes
+        // being checked from whatever value it was frozen at on entry (see
+        // the entry-side comment above - that entry check is what actually
+        // zeroes it, via an ordinary push, whenever entry happened to land
+        // on an exactly-full row). Measured at width 2: "a" (room for one
+        // more) + an ST-opened link + 2 columns of glued content + a BEL
+        // close resumes counting from 1, not 0 - the very next character
+        // fills the row the rest of the way and only the one after THAT
+        // gets pushed. An earlier attempt zeroed the counter unconditionally
+        // here and got that case wrong by one character.
+        glued = false;
+      }
       // Held back, not emitted: an escape at a break belongs to the row that
       // follows it. Measured at width 1, where the sequence opening a word
       // leads the next row instead of trailing the previous one.

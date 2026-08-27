@@ -89,9 +89,36 @@ SEEDS = [1, 7, 13, 99, 1337, 20260826, 24301, 424242]
 # combination - pre-pushed, glued throughout, AND wordWrap:false - matches
 # Bun; the curated corpus (4,900 cases) caught the second attempt within
 # one pytest run, well before either fuzz sweep was re-measured.
+#
+# Measured 2026-08-27, a fourth fix: inside wrap_breakWord, an ST-terminated
+# OSC 8 event (open or close) does not just mean "glued" - while active it
+# suppresses the column-budget check entirely, for every token, escape or
+# character, until a BEL-terminated OSC 8 event is reached. Two prior
+# attempts at a narrower version of this (see git history - a "glue just
+# started, row exactly full" heuristic, tried twice) each passed every
+# hand-picked probe and still regressed 100+ new failures on the full 8-seed
+# sweep, because they gated on the wrong condition (whether GLUE was
+# starting) instead of the real one (whether ST-DISABLED mode was starting).
+# The rule that finally held, nailed down with ~50 direct probes against the
+# real Bun binary before touching this file:
+#   - Entering ST-disabled mode from normal IS checked against the column
+#     budget like any other token, but ONLY if the rest of the word contains
+#     a BEL event with something still after it - a span that never turns
+#     disabled back off (or turns off with nothing left to place) behaves as
+#     if it were never checked at all, merging onto however-full the row
+#     already is. Once already disabled, no further ST event re-triggers
+#     this - only the transition out of normal mode does.
+# - Leaving ST-disabled mode via a BEL event touches nothing: the counter
+#     resumes being checked from whatever value it was frozen at on entry.
+#     An early version of this fix zeroed the counter unconditionally on
+#     every such exit and got a width-2 case wrong by exactly one character
+#     (see git history) - the entry-side check above is what actually zeroes
+#     it, via an ordinary push, whenever entry happened to land on a row
+#     that was already exactly full.
+# This dropped every one of the 8 seeds again (49 -> 30 total), none rose.
 MAX_WRAP_DIVERGENCES = {
-    1: 5, 7: 6, 13: 8, 99: 8,
-    1337: 5, 20260826: 6, 24301: 5, 424242: 6,
+    1: 4, 7: 4, 13: 5, 99: 5,
+    1337: 1, 20260826: 4, 24301: 3, 424242: 4,
 }
 
 # YAML must be exact: it has a refusal channel, so anything it cannot match is
