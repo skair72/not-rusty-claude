@@ -114,7 +114,7 @@ const strings = [
   // kinds that let a row gate its whitespace collapse.
   //
   // The BEL form is deliberately NOT here. It shelters too, but only when its
-  // uri contains the letter "m" - see docs/findings.md section 12. That is an
+  // uri contains the letter "m" - see docs/findings.md section 13. That is an
   // upstream parsing quirk rather than a rule, and pinning it would pin a bug.
   //
   // Like the OSC 8 adjacency cases above, the generated grammar never emits

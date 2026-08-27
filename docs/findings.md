@@ -1256,9 +1256,13 @@ implemented. Reproduce with `ESC ]8;; <uri> BEL " \t ab"` at any width:
 
 One character decides it, anywhere in the uri, at any length including one.
 `m` is the final byte of an SGR (`ESC [ 0 m`), so the likely mechanism is an
-OSC scan that also accepts a CSI final byte as a terminator — Bun ending the
-"escape" at the `m` and treating what follows as something else. This was
-first mistaken for a length rule, then for a `://` rule, then for the
+OSC scan that ends the "escape" early at an SGR terminator and treats what
+follows as something else. Note the trigger is `m` specifically, not the CSI
+final-byte class: `abcdefgh` above contains `h`, equally a valid CSI final
+byte, and does not trigger. Sweeping the whole class expecting hits will find
+none.
+
+This was first mistaken for a length rule, then for a `://` rule, then for the
 substring `exam`; each held over a dozen samples and then broke. Single-
 character bisection is what settled it, and the result reproduces in a fresh
 process, from a file and from `bun -e`, so it is neither harness state nor
