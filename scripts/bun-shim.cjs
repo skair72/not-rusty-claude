@@ -1326,11 +1326,12 @@ function wrap_breakWord(rows, word, columns) {
 
 // --- wrapping one line ------------------------------------------------------
 
-// A line that starts with a non-SGR CSI collapses every LATER whitespace run
-// that directly follows an SGR down to just its rightmost space - the tabs
-// and extra spaces before that space vanish, whatever comes after stays.
-// Measured, all with a leading "[6n" (any non-SGR CSI, e.g. [2K,
-// behaves the same) and an SGR immediately before the run:
+// A whitespace run directly following an SGR collapses down to just its
+// rightmost space when the run's ROW qualifies for it (see
+// wrap_rowGateQualifies below) - the tabs and extra spaces before that space
+// vanish, whatever comes after stays. Measured, all with a qualifying
+// leading run (e.g. a non-SGR CSI like "[6n" or "[2K") immediately
+// before the SGR:
 //   "  "      (2 spaces)      -> " "        five and six behave the same
 //   "\t "     (tab, space)    -> " "        the tab is discarded
 //   "\t\t "   (2 tabs, space) -> " "        any number of tabs, same result
@@ -1338,10 +1339,8 @@ function wrap_breakWord(rows, word, columns) {
 //                                            is touched
 //   "\t \t"   (tab,space,tab) -> " \t"      only what is BEFORE the rightmost
 //                                            space is discarded
-// A run with no space at all is untouched (nothing to anchor on), and a run
-// after a non-SGR CSI (not an SGR) is untouched too - that escape SHELTERS
-// it exactly as it shelters a tab at a row's own leading edge. Without the
-// leading CSI on the line, an adjacent SGR does nothing either: both factors
+// A run with no space at all is untouched (nothing to anchor on). Without a
+// qualifying leading run, an adjacent SGR does nothing either: both factors
 // are required. opts.trim === false disables this outright - measured, all
 // four spaces of "word<SGR>    1234" survive whole with trim:false, at any
 // width; wordWrap does not gate it either way.
@@ -1391,9 +1390,57 @@ function wrap_rowGateQualifies(row) {
 // via wrap_rowGateQualifies - is what decides this candidate. sawLink stays
 // scoped to the whole line, unchanged from before: once any link has been
 // seen, no later SGR in the line collapses its whitespace, on any row.
+//
+// Two more factors, found by regression (probes 65-77), refine this beyond
+// "every qualifying SGR's run collapses to its rightmost space":
+//
+// 1. Only the FIRST SGR encountered in a given (gate-qualifying) row is
+//    ever eligible - measured with two, then three, SGR+whitespace pairs in
+//    one row: only the first one's run is touched at all; every later SGR
+//    in that same row is left completely untouched, run and all, even when
+//    it is the row's last SGR with nothing after it. This holds regardless
+//    of whether the first SGR even HAS a run to collapse (probe75): an SGR
+//    glued straight to the next character with no adjacent whitespace still
+//    uses up the row's one slot. A fresh row (reached by wrapping, not by a
+//    literal "\n") gets its own fresh slot - each row's own leading run
+//    decides its own eligibility and its own first-SGR independently. A
+//    candidate whose OWN gate check fails does NOT use up the slot (seed3
+//    regression): only a candidate that actually collapses (or would keep
+//    its rightmost space) counts against the row.
+// 2. For the one eligible SGR's run, "collapse to the rightmost space" (or,
+//    with no space to anchor on, leave the run untouched) is only what
+//    happens absent a later space; if the ROW this candidate lands in -
+//    once the rest of the line has reflowed around the run's tentative
+//    resolution - holds a literal space anywhere after the kept text, the
+//    run collapses to NOTHING instead. This is row-scoped, not a raw scan
+//    of the rest of the line: a candidate whose row ends mid-hard-broken-
+//    word ("long"/"er", "日本"/"語") has no space anywhere in
+//    THAT row even though a later row does, and Bun leaves its run's
+//    tentative resolution alone in that case - a whole-line lookahead
+//    wrongly deletes it. Measured both ways with an otherwise-identical
+//    run: "x"+SGR+"   "+"y" (nothing later in the row) keeps one space;
+//    "x"+SGR+"   "+"y z" (a later separator space in the same row) drops
+//    it entirely; a tab-only run with no space of its own still drops to
+//    nothing when a later space is in the row, even though with no later
+//    space that same tab-only run is left completely untouched (no
+//    anchor). A trailing space at end-of-line counts even though it will
+//    itself be trimmed away; a later TAB with no accompanying space does
+//    not count, nor does a later run that is tabs-only.
+function wrap_hasLaterSpace(str, pos) {
+  let p = pos;
+  while (p < str.length) {
+    const esc = wrap_escapeLength(str, p);
+    if (esc) { p += esc; continue; }
+    if (str[p] === " ") return true;
+    p += String.fromCodePoint(str.codePointAt(p)).length;
+  }
+  return false;
+}
+
 function wrap_collapseMidlineRuns(line, columns, opts) {
   let working = line;
   let sawLink = false;
+  const consumedRows = new Set();
   let i = 0;
   while (i < working.length) {
     const esc = wrap_escapeLength(working, i);
@@ -1401,29 +1448,59 @@ function wrap_collapseMidlineRuns(line, columns, opts) {
       i += String.fromCodePoint(working.codePointAt(i)).length;
       continue;
     }
-    const text = working.slice(i, i + esc);
-    if (text.startsWith(wrap_ESC + "]8;")) { sawLink = true; i += esc; continue; }
-    if (!sawLink && text.startsWith(wrap_ESC + "[") && text.endsWith("m")) {
-      let runEnd = i + esc;
+    // Adjacent escapes with no real character between them act as ONE
+    // candidate, not one each - measured (idx278 regression): an SGR
+    // immediately followed by a second SGR, with a run right after the
+    // second, still collapses that run - the pair does not use up the row's
+    // one slot twice. Walk the whole cluster and judge only its LAST escape,
+    // the same "last one decides" rule wrap_rowGateQualifies already applies
+    // to a row's own leading run.
+    let clusterEnd = i;
+    let lastEscText = null;
+    while (clusterEnd < working.length) {
+      const e = wrap_escapeLength(working, clusterEnd);
+      if (!e) break;
+      const t = working.slice(clusterEnd, clusterEnd + e);
+      if (t.startsWith(wrap_ESC + "]8;")) sawLink = true;
+      lastEscText = t;
+      clusterEnd += e;
+    }
+    if (!sawLink && lastEscText.startsWith(wrap_ESC + "[") && lastEscText.endsWith("m")) {
+      const prefix = working.slice(0, clusterEnd);
+      const prefixRows = wrap_buildRowsRaw(prefix, columns, opts);
+      const rowIndex = prefixRows.length - 1;
+      if (consumedRows.has(rowIndex)) { i = clusterEnd; continue; }
+      if (!wrap_rowGateQualifies(prefixRows[rowIndex])) { i = clusterEnd; continue; }
+      consumedRows.add(rowIndex);
+      let runEnd = clusterEnd;
       let lastSpace = -1;
       while (runEnd < working.length && (working[runEnd] === " " || working[runEnd] === "\t")) {
         if (working[runEnd] === " ") lastSpace = runEnd;
         runEnd++;
       }
-      if (lastSpace !== -1) {
-        const prefix = working.slice(0, i + esc);
-        const prefixRows = wrap_buildRows(prefix, columns, opts);
-        if (wrap_rowGateQualifies(prefixRows[prefixRows.length - 1])) {
-          const kept = working.slice(lastSpace, runEnd);
-          working = working.slice(0, i + esc) + kept + working.slice(runEnd);
-          i = i + esc + kept.length;
-          continue;
-        }
+      if (runEnd === clusterEnd) { i = clusterEnd; continue; }
+      // The old rule's result (rightmost space, or the run untouched if it
+      // has no space to anchor on) is only a TENTATIVE resolution here: it
+      // exists so the rest of the line can be built around it to find out
+      // which row the candidate lands in, and whether that row goes on to
+      // hold a literal space after the kept text.
+      const anchoredKept = lastSpace !== -1
+        ? working.slice(lastSpace, runEnd)
+        : working.slice(clusterEnd, runEnd);
+      const tentative = working.slice(0, clusterEnd) + anchoredKept + working.slice(runEnd);
+      const tentativeRows = wrap_buildRowsRaw(tentative, columns, opts);
+      const row = tentativeRows[rowIndex];
+      const searchFrom = prefixRows[rowIndex].length + anchoredKept.length;
+      if (row !== undefined && row.startsWith(prefixRows[rowIndex]) && wrap_hasLaterSpace(row, searchFrom)) {
+        working = working.slice(0, clusterEnd) + working.slice(runEnd);
+        i = clusterEnd;
+        continue;
       }
-      i += esc;
+      working = tentative;
+      i = clusterEnd + anchoredKept.length;
       continue;
     }
-    i += esc;
+    i = clusterEnd;
   }
   return working;
 }
@@ -1438,7 +1515,11 @@ function wrap_wrapLine(rawLine, columns, opts) {
   return wrap_buildRows(line, columns, opts);
 }
 
-function wrap_buildRows(line, columns, opts) {
+// Builds rows without the final per-row edge trim - used internally by
+// wrap_collapseMidlineRuns to look ahead at a row's true trailing content
+// (a later space at end-of-line still counts even though wrap_buildRows
+// itself would go on to trim it away).
+function wrap_buildRowsRaw(line, columns, opts) {
   const words = wrap_splitWords(line);
   const rows = [""];
 
@@ -1684,10 +1765,14 @@ function wrap_buildRows(line, columns, opts) {
     rows[rows.length - 1] += word;
   }
 
+  return rows;
+}
+
+function wrap_buildRows(line, columns, opts) {
+  const rows = wrap_buildRowsRaw(line, columns, opts);
   if (opts.trim !== false) {
     for (let i = 0; i < rows.length; i++) rows[i] = wrap_trimRow(rows[i]);
   }
-
   return rows;
 }
 

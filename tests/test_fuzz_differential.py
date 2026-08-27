@@ -143,9 +143,38 @@ SEEDS = [1, 7, 13, 99, 1337, 20260826, 24301, 424242]
 # by re-diffing the exact failing case against the pre-fix answer, not by
 # the aggregate count, which briefly rose by one on 7 of 8 seeds before the
 # trim:false guard landed. This dropped every seed again (30 -> 26 total).
+#
+# Measured 2026-08-27, a sixth fix: the whitespace-collapse rule's "does a
+# later space in the rest of the line cancel the kept space" check
+# (introduced this round) was a raw scan of the whole rest of the RAW line,
+# which falsifies whenever the candidate's own row ends mid-hard-broken-word
+# ("long"/"er", "日本"/"語") - that row has no space in it at all even
+# though some LATER row does, so the raw scan wrongly deleted a space Bun
+# keeps. An interim attempt marked the collapsed run with a private
+# sentinel character (a word boundary carrying zero rendered width) to
+# preserve word-boundary semantics for wrap_splitWords/wrap_buildRows - it
+# worked but needed three follow-up fixes of its own (the marker not
+# reserving its own column, then lingering into later iterations) and still
+# left 3 of 8 originally-regressed seeds worse than baseline. Replaced
+# entirely with a row-scoped predicate: resolve the run via the OLD rule
+# (rightmost space, or untouched if it has no space to anchor on) only
+# tentatively, rebuild the line around that tentative resolution, and look
+# at the specific ROW the candidate landed in - if THAT row holds a later
+# space, delete the run outright; otherwise keep the tentative resolution.
+# This needed the row-builder's final per-row edge trim (wrap_trimRow, via
+# wrap_buildRows) split out into a raw variant (wrap_buildRowsRaw) that the
+# lookahead uses instead, since a trailing space that decides this still
+# counts even though the ordinary trimmed builder would erase it before the
+# lookahead ever saw it. Verified against all 100 seeds' cached oracle
+# answers (not just the pinned 8): zero regressions introduced anywhere,
+# six cases fixed, total 44 -> 38 divergences over 100 seeds. This also
+# fixed a related consumedRows bug: a candidate could claim its row's one
+# eligible-SGR slot even when its OWN gate check failed, starving a later
+# candidate in the same row that DID qualify - fixed by only marking a row
+# consumed once the gate has actually passed.
 MAX_WRAP_DIVERGENCES = {
     1: 1, 7: 0, 13: 2, 99: 0,
-    1337: 0, 20260826: 1, 24301: 0, 424242: 2,
+    1337: 0, 20260826: 0, 24301: 0, 424242: 1,
 }
 
 # YAML must be exact: it has a refusal channel, so anything it cannot match is
