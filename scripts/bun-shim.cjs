@@ -1336,9 +1336,15 @@ function wrap_breakWord(rows, word, columns) {
 // "[6n" or "[2K" when nothing else intervenes) - only "has an OSC 8
 // appeared yet" gates it, tracked once while scanning left to right.
 function wrap_collapseMidlineRuns(line) {
-  const firstEsc = wrap_escapeLength(line, 0);
+  // Leading spaces/tabs before the CSI do not block this - measured, " \t "
+  // + a non-SGR CSI collapses a later run exactly as the CSI alone does.
+  // A leading VISIBLE character does block it, though ("z" + the same CSI
+  // leaves the later run untouched) - only whitespace is transparent here.
+  let start = 0;
+  while (start < line.length && (line[start] === " " || line[start] === "\t")) start++;
+  const firstEsc = wrap_escapeLength(line, start);
   if (!firstEsc) return line;
-  const first = line.slice(0, firstEsc);
+  const first = line.slice(start, start + firstEsc);
   if (!(first.startsWith(wrap_ESC + "[") && !first.endsWith("m"))) return line;
 
   let out = "";
