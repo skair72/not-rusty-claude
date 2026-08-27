@@ -1171,25 +1171,38 @@ implemented for.
 
 Measured 2026-08-27 on this Linux host, `scripts/wrap-bench.cjs` under both
 runtimes (`make wrap-bench`), COLS=100, BUDGET=1000ms. The differential fuzzing
-proves the shim gives the same *answers* as Bun; nothing in the suite proves it
-gives them in time, and it does not.
+measures how closely the shim's *answers* track Bun's — closely, but not
+exactly: 38 divergences remain across the 100-seed sweep, and §13 documents a
+shape the grammar cannot even reach. Nothing in the suite measures how long
+those answers take, and that turns out to be the larger gap.
 
-Every column below is the **median of 3 reps, interleaved** — rep 1 of every
-revision, then rep 2, then rep 3 — so host drift lands on all columns equally.
-This matters: earlier single-run numbers in this branch put the 40-line frame at
-both 16.9 ms and 17.9 ms, which is run-to-run noise being read as a difference.
-Run-to-run spread at HEAD is 5-16% per row, so treat anything under ~20% as
-noise. Read the columns as a ratio, never as absolute milliseconds.
+**How to read this table, including its error bars.** Every cell is the median
+of 3 reps, interleaved — rep 1 of every revision, then rep 2, then rep 3 — so
+host drift is spread across the columns rather than landing on whichever
+revision was measured last. It is not eliminated: the driver walks the
+revisions in a fixed order within each rep, so column position stays
+confounded with any drift *inside* a rep, and n=3 is too few to separate them.
+This is better than the separate single runs it replaces, which had this branch
+carrying both 16.9 ms and 17.9 ms for the same row and reading the gap as
+signal. It is not a controlled experiment.
+
+Per-column rep-to-rep spread, `(max-min)/min`, worst row of each: shim columns
+16-19%, Bun 33%. **The Bun column is the noisy one**, because its cells are
+0.01 ms and the timer is not that sharp — so the ratios below are soft in
+their last digit and are rounded to two significant figures. The 410x cell is
+the weakest: pick a different one of the three Bun samples and it reads
+anywhere from 345x to 460x. Ratios are the portable part; absolute
+milliseconds belong to this host and this load.
 
 | case | Bun 1.3.14 | node + shim | ratio |
 |---|---|---|---|
 | plain 40-line frame (5,739 ch) | 0.287 ms | 16.0 ms | 56x |
 | plain code line (156 ch) | 0.009 ms | 0.325 ms | 36x |
 | plain paragraph, 120 words (1,038 ch) | 0.051 ms | 3.6 ms | 71x |
-| gating line, 20 words (180 ch) | 0.010 ms | 4.1 ms | 414x |
-| gating line, 60 words (523 ch) | 0.029 ms | 35.8 ms | 1,235x |
-| gating line, 120 words (1,042 ch) | 0.054 ms | 142 ms | 2,637x |
-| gating line, 240 words (2,080 ch) | 0.111 ms | 598 ms | 5,384x |
+| gating line, 20 words (180 ch) | 0.010 ms | 4.1 ms | 410x |
+| gating line, 60 words (523 ch) | 0.029 ms | 35.8 ms | 1,200x |
+| gating line, 120 words (1,042 ch) | 0.054 ms | 142 ms | 2,600x |
+| gating line, 240 words (2,080 ch) | 0.111 ms | 598 ms | 5,400x |
 
 **The split is a cliff, not a gradient.** A "plain" line carries SGRs and
 nothing else. A "gating" line carries one non-SGR CSI — a cursor query, an
@@ -1211,29 +1224,45 @@ Same benchmark, same session, the shim swapped underneath it by
 | gating line 120w | 81.5 ms | 144 ms | 142 ms | 142 ms |
 | gating line 240w | 313 ms | 601 ms | 606 ms | 598 ms |
 
-**Plain lines are linear-ish and merely slow.** `wrap_lineCanGate` proves no
-row can qualify (a row qualifies only on a non-SGR CSI or an ST-terminated
-OSC 8 at its leading edge, and rows are built from the line's own escapes), so
-the whole collapse pass is skipped in one O(n) scan. That early-out is
-`b85f9ac`, and on plain lines it more than undoes the regression: the 40-line
-frame goes 65 → 107 → 16 ms, ending ~4x faster than before `d730e94` was
-written, because the pass it skips was never free to begin with.
+HEAD equals `b85f9ac` on every row to within ±5%, against a per-row spread of
+5-16%, so `586725a`'s leading-tab shelter fix cost nothing measurable.
 
-**On gating lines the correctness fix cost 2x, and that cost is permanent.**
-This is the row of the table most easily misread. `d730e94` roughly doubled
-every gating case (18.5 → 33.7, 81.5 → 144, 313 → 601), and `b85f9ac` recovers
-none of it — an early-out that proves the pass is unnecessary cannot help a
-line where the pass *is* necessary. HEAD is still ~1.9x slower than `ba8886c`
-on gating lines. That is the price paid for the six divergences `d730e94`
-fixed, and it was worth paying, but "the regression was fixed" is true of plain
-lines only.
+**Plain lines take the early-out.** `wrap_lineCanGate` proves no row can
+qualify (a row qualifies only on a non-SGR CSI or an ST-terminated OSC 8 at its
+leading edge, and rows are built from the line's own escapes), so the whole
+collapse pass is skipped in one O(n) scan. That early-out is `b85f9ac`, and on
+plain lines it more than undoes the regression: the 40-line frame goes
+65 → 107 → 16 ms, ending ~4x faster than before `d730e94` was written, because
+the pass it now skips was never free to begin with.
 
-**Gating lines are quadratic.** `wrap_collapseMidlineRuns` must know which
-*row* each candidate SGR lands on, because the gate is per-row — so it rebuilds
-the rows from scratch, once per escape cluster, over a growing prefix. Bun
-stays linear across the same inputs (0.010 → 0.111 ms, 11.1x for 11.6x the
-length); the shim goes 4.1 → 598 ms, 146x. A single 2 KB gating line is most of
-a second of blocked main thread.
+What the plain rows do *not* establish is linearity. There is no plain-line
+length sweep here — the three plain cases are different shapes, not one shape
+at three lengths, and the 5,739-character "frame" is 40 separate lines rather
+than a long one. The only two comparable single-line points scale as
+length^1.27 (156 → 1,038 ch is 6.7x length for 11.1x time), and no fixed
+per-call overhead accounts for it. "Linear" here is a claim about the code
+path, not a measurement; if it matters, sweep it.
+
+**On gating lines the correctness fix cost ~1.8x, and that cost is permanent.**
+This is the part of the table most easily misread. `d730e94` raised every
+gating case by 1.68x, 1.82x, 1.76x and 1.92x across the four sizes (geometric
+mean 1.79x — call it ~1.8x, not "doubled"), and `b85f9ac` recovers none of it:
+an early-out that proves the collapse pass is unnecessary cannot help a line
+where the pass *is* necessary. HEAD remains 1.75-1.94x slower than `ba8886c`
+there. That is the price paid for the six divergences `d730e94` fixed, and it
+was worth paying, but "the regression was fixed" is a plain-line-only claim.
+
+**Gating lines are quadratic in escapes x length, not in length alone.**
+`wrap_collapseMidlineRuns` must know which *row* each candidate SGR lands on,
+because the gate is per-row — so it rebuilds the rows from scratch, once per
+escape cluster, over a growing prefix. Each rebuild is O(length) and there is
+one per cluster, so cost tracks the *product*. The benchmark scales both
+together (an SGR pair every third word), which is why 11.6x the length costs
+144x the time, close to 12² — that is the product moving, not length squared.
+Bun stays linear across the same inputs (0.010 → 0.111 ms, 11.1x). A long
+gating line carrying only a handful of SGRs is not shown here to be expensive,
+and should not be assumed to be: the 598 ms figure belongs to a 2 KB line with
+~160 escapes on this host at COLS=100.
 
 **This is the word-model tax, and it is the same root cause as the remaining
 divergences.** This shim splits a line into words and reconstructs separator
