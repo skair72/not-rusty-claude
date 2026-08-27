@@ -1052,10 +1052,11 @@ function wrap_pointCellWidth(cp) {
   return wrap_COMBINING_MARK.test(cp) ? 0 : stringWidth(cp);
 }
 
-// The same walk WITHOUT the mark rule, for callers asking "does this print
-// anything at all?" rather than "what does this cost the row?". The two
-// questions have different answers for the enclosing keycap U+20E3: it costs
-// the row nothing, and it very much prints.
+// A whole-string walk that does NOT apply wrap_pointCellWidth's mark rule,
+// for callers asking "does this print anything at all?" rather than "what
+// does this cost the row?". The two questions have different answers for the
+// enclosing keycap U+20E3: it costs the row nothing, and it very much
+// prints.
 function wrap_pointWidthRaw(text) {
   let total = 0;
   let i = 0;
@@ -1064,19 +1065,6 @@ function wrap_pointWidthRaw(text) {
     if (esc) { i += esc; continue; }
     const cp = String.fromCodePoint(text.codePointAt(i));
     total += stringWidth(cp);
-    i += cp.length;
-  }
-  return total;
-}
-
-function wrap_pointWidth(text) {
-  let total = 0;
-  let i = 0;
-  while (i < text.length) {
-    const esc = wrap_escapeLength(text, i);
-    if (esc) { i += esc; continue; }
-    const cp = String.fromCodePoint(text.codePointAt(i));
-    total += wrap_pointCellWidth(cp);
     i += cp.length;
   }
   return total;

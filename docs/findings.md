@@ -1167,6 +1167,61 @@ implemented for.
 
 ---
 
+## 12. `Bun.wrapAnsi` answers like Bun, but not in Bun's time ⚠️
+
+Measured 2026-08-27 on this Linux host, `scripts/wrap-bench.cjs` under both
+runtimes (`make wrap-bench`), COLS=100. The differential fuzzing proves the
+shim gives the same *answers* as Bun; nothing in the suite proves it gives
+them in time, and it does not.
+
+Read the columns as a ratio, never as absolute milliseconds: the host and its
+load move both together, so only Bun-vs-shim on the *same* run carries across
+machines.
+
+| case | Bun 1.3.14 | node + shim | ratio |
+|---|---|---|---|
+| plain 40-line frame (5,739 ch) | 0.34 ms | 17.9 ms | 52x |
+| plain code line (156 ch) | 0.009 ms | 0.33 ms | 37x |
+| plain paragraph, 120 words | 0.058 ms | 4.36 ms | 75x |
+| gating line, 20 words (180 ch) | 0.011 ms | 4.01 ms | 365x |
+| gating line, 60 words (523 ch) | 0.030 ms | 36.3 ms | 1,200x |
+| gating line, 120 words (1,042 ch) | 0.062 ms | 147 ms | 2,400x |
+| gating line, 240 words (2,080 ch) | 0.118 ms | 610 ms | 5,200x |
+
+**The split is a cliff, not a gradient.** A "plain" line carries SGRs and
+nothing else. A "gating" line carries one non-SGR CSI — a cursor query, an
+erase-line, anything a TUI emits — and that single escape is enough to make
+every row of the line eligible for the midline whitespace collapse.
+
+**Plain lines are linear-ish and merely slow.** `wrap_lineCanGate` proves no
+row can qualify (a row qualifies only on a non-SGR CSI or an ST-terminated
+OSC 8 at its leading edge, and rows are built from the line's own escapes), so
+the whole collapse pass is skipped in one O(n) scan. This early-out landed as
+`b85f9ac` and took the 40-line frame from 120 ms to 17 ms.
+
+**Gating lines are quadratic.** `wrap_collapseMidlineRuns` must know which
+*row* each candidate SGR lands on, because the gate is per-row — so it rebuilds
+the rows from scratch, once per escape cluster, over a growing prefix. Bun
+stays linear across the same inputs (0.011 → 0.118 ms for 11.6x the length);
+the shim goes 4.0 → 610 ms, 152x. A single 2 KB gating line is over half a
+second of blocked main thread.
+
+**This is the word-model tax, and it is the same root cause as the remaining
+divergences.** This shim splits a line into words and reconstructs separator
+spaces during placement; Bun almost certainly walks characters once, carrying
+per-row state as it goes. A streaming walk would not need to rebuild anything
+to answer "which row am I on" — it would already know. Both the 38 residual
+`wrapAnsi` divergences and this quadratic are that one mismatch, seen from two
+sides. Patching either further without the rewrite is buying inches.
+
+**Not yet load-bearing, but do not assume that holds.** No agentic session has
+run under Node at all (§11), so nothing has profiled a real render loop. The
+plain-line numbers are the common case and are survivable; whether real Claude
+Code output puts non-SGR CSIs on long lines is unmeasured, and that question
+decides whether this is a footnote or a blocker.
+
+---
+
 ## Appendix: exact commands used ✅
 
 Every command below was run on **this host**. `/usr/bin/claude` was only ever

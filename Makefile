@@ -174,7 +174,7 @@ CLAUDE_BINARY ?=
 # directories it is about to remove one line later.
 KEEP_NOTICE ?= 1
 
-.PHONY: help doctor setup binary build smoke node-deps node-run test ab clean distclean first-run
+.PHONY: help doctor setup binary build smoke node-deps node-run test wrap-bench ab clean distclean first-run
 
 help:
 	@printf '%s\n' \
@@ -189,6 +189,7 @@ help:
 	  '  node-deps   download ws + undici into $(NODE_MODULES) (needs npm)' \
 	  '  node-run    run the built artifact under node + scripts/bun-shim.cjs' \
 	  '  test        run the pytest suite, saying up front what will run vs skip' \
+	  '  wrap-bench  time Bun.wrapAnsi under bun and under node+shim, side by side' \
 	  '  ab          scripts/ab-equivalence.sh, the three-way A/B (Linux only)' \
 	  '  first-run   setup + binary + build + smoke + test, in that order' \
 	  '  clean       delete build artifacts and python caches; keeps downloads' \
@@ -558,6 +559,34 @@ test:
 	if [ -n "$$node" ]; then NRC_TEST_NODE="$$node"; export NRC_TEST_NODE; fi; \
 	NRC_TEST_NODE_MODULES="$$mods"; export NRC_TEST_NODE_MODULES; \
 	$$runner tests/ $(PYTEST_ARGS)
+
+# Timing, not correctness - `make test` covers the latter. Runs the same
+# benchmark under both runtimes, because a millisecond count means nothing on
+# its own: the host and its current load move the shim and Bun together, and
+# only the ratio between the two columns carries across machines. Skips a
+# runtime it cannot find rather than failing, so it stays useful on a host
+# with only one of them.
+wrap-bench:
+	@set -eu; \
+	cd '$(ROOT)'; \
+	ran=0; \
+	if [ -x '$(BUN_BIN)' ]; then \
+	  echo '==> bun ($(BUN_BIN))'; \
+	  '$(BUN_BIN)' scripts/wrap-bench.cjs; \
+	  ran=1; \
+	else \
+	  echo 'skip: no bun at $(BUN_BIN) - run `make setup`, or set BUN_BIN='; \
+	fi; \
+	node='$(NODE_BIN)'; \
+	if [ -n "$$node" ] && [ -x "$$node" ]; then \
+	  echo; \
+	  echo "==> node + shim ($$node)"; \
+	  "$$node" --require '$(ROOT)/scripts/bun-shim.cjs' scripts/wrap-bench.cjs; \
+	  ran=1; \
+	else \
+	  echo 'skip: no node found - install Node >= $(MIN_NODE_MAJOR), or set NODE_BIN='; \
+	fi; \
+	[ "$$ran" = 1 ] || { echo 'error: neither runtime available' >&2; exit 1; }
 
 ab:
 	@set -eu; \
