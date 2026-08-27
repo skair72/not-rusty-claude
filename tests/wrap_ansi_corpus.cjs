@@ -3,7 +3,7 @@
 // drift, and deliberately escape-free in source - a literal control byte in a
 // repo file is unreviewable.
 //
-// 49 inputs x 10 widths x 10 option combinations = 4,900 cases, covering SGR
+// 51 inputs x 10 widths x 10 option combinations = 5,100 cases, covering SGR
 // colour, OSC 8 hyperlinks, CJK, emoji, combining marks, tabs and embedded
 // newlines. Bun is the oracle; nothing here hardcodes an expected answer.
 
@@ -102,6 +102,27 @@ const strings = [
   // The mark has to vanish THROUGH the escape, not just when the row is
   // otherwise escape-free - the gap an earlier version of this rule had.
   "e" + MARK + ESC + "[H" + "\u4e2d",
+
+  // Leading-edge tab shelter, 2026-08-27. A leading escape does not protect
+  // the whitespace behind it from the per-row leading trim - except that a
+  // non-SGR CSI shelters a TAB, and only a tab. That exception turns out to
+  // cover an ST-terminated OSC 8 as well, opener or closer, which the
+  // original escape-by-escape sweep recorded the other way round ("with
+  // either OSC 8 form, ' \t ab' trims to 'ab'"). The two below pin the ST
+  // form, empty uri and non-empty, which shelters unconditionally - making
+  // the shelter test literally wrap_rowGateQualifies's, the same two escape
+  // kinds that let a row gate its whitespace collapse.
+  //
+  // The BEL form is deliberately NOT here. It shelters too, but only when its
+  // uri contains the letter "m" - see docs/findings.md section 12. That is an
+  // upstream parsing quirk rather than a rule, and pinning it would pin a bug.
+  //
+  // Like the OSC 8 adjacency cases above, the generated grammar never emits
+  // this shape - it puts no whitespace run directly behind a leading OSC 8 -
+  // so all 100 fuzz seeds move by exactly zero either way, and this corpus is
+  // the only thing holding it.
+  ESC + "]8;;https://x.example" + ESC + "\\" + " \t ab",
+  ESC + "]8;;" + ESC + "\\" + " \t ab",
 ];
 
 const widths = [0, 1, 2, 3, 4, 5, 6, 10, 20, 80];

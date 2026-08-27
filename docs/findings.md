@@ -1222,6 +1222,58 @@ decides whether this is a footnote or a blocker.
 
 ---
 
+## 13. An OSC 8 hyperlink whose uri contains the letter `m` wraps differently ⚠️
+
+Measured 2026-08-27 against Bun 1.3.14, found while auditing a stale comment
+rather than by fuzzing — the generated grammar never puts a whitespace run
+directly behind a leading OSC 8, so all 800,000 cases are blind to it.
+
+A leading escape does not shelter the whitespace behind it from the per-row
+leading trim, with one documented exception: a non-SGR CSI shelters a **tab**,
+and only a tab. Sweeping that rule again turned up two things the original
+sweep had recorded wrongly.
+
+**An ST-terminated OSC 8 shelters the tab too**, opener or closer, empty uri or
+not. The original sweep recorded both OSC 8 forms as non-sheltering, which is
+true only of the BEL form. Fixed: the shelter test is now literally
+`wrap_rowGateQualifies`'s test, and not by coincidence — the same two escape
+kinds that let a row gate its whitespace collapse are the ones that shelter a
+tab at its leading edge. Pinned by two new corpus cases.
+
+**The BEL form shelters if and only if its uri contains the letter `m`.** Not
+implemented. Reproduce with `ESC ]8;; <uri> BEL " \t ab"` at any width:
+
+| uri | Bun keeps the tab? |
+|---|---|
+| `z` | no |
+| `m` | **yes** |
+| `zzzzzzzz` | no |
+| `zzzmzzzz` | **yes** |
+| `abcdefgh` | no |
+| `abcdefgm` | **yes** |
+| `http://x` | no |
+| `https://x.example` | **yes** |
+
+One character decides it, anywhere in the uri, at any length including one.
+`m` is the final byte of an SGR (`ESC [ 0 m`), so the likely mechanism is an
+OSC scan that also accepts a CSI final byte as a terminator — Bun ending the
+"escape" at the `m` and treating what follows as something else. This was
+first mistaken for a length rule, then for a `://` rule, then for the
+substring `exam`; each held over a dozen samples and then broke. Single-
+character bisection is what settled it, and the result reproduces in a fresh
+process, from a file and from `bun -e`, so it is neither harness state nor
+transpiler cache.
+
+**Deliberately not matched.** The shim's contract is byte-equality with Bun,
+which in principle includes Bun's bugs — but reimplementing this one means
+deciding how far bug-compatibility goes, and that is a design call rather than
+a fix. It affects zero of the 800,000 fuzzed cases and no plausible real uri
+policy. Recorded so the next person to sweep this rule does not spend the
+afternoon rediscovering it. The corpus deliberately pins the ST behavior and
+deliberately omits the BEL one, with a comment saying why.
+
+---
+
 ## Appendix: exact commands used ✅
 
 Every command below was run on **this host**. `/usr/bin/claude` was only ever

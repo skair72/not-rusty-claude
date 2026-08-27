@@ -1141,7 +1141,7 @@ function wrap_hasLaterBel(text) {
 // Whether wrap_breakWord will treat this word as one raw, unbroken blob: it
 // must OPEN glued (its first escape is an ST-terminated OSC 8 event) and stay
 // glued with no BEL event anywhere later to end it. This is what the
-// row-count pre-push math in wrap_wrapLine needs to know - that math answers
+// row-count pre-push math in wrap_buildRowsRaw needs to know - that math answers
 // "how many times will this word be broken", which is meaningless for a word
 // wrap_breakWord never breaks at all.
 function wrap_gluedThroughout(word) {
@@ -1415,8 +1415,9 @@ function wrap_rowGateQualifies(row) {
 //    literal "\n") gets its own fresh slot - each row's own leading run
 //    decides its own eligibility and its own first-SGR independently. A
 //    candidate whose OWN gate check fails does NOT use up the slot (seed3
-//    regression): only a candidate that actually collapses (or would keep
-//    its rightmost space) counts against the row.
+//    regression): what spends the row's slot is passing the gate check, not
+//    collapsing anything - a candidate with no run to collapse at all
+//    (probe75 above) spends it just the same.
 // 2. For the one eligible SGR's run, "collapse to the rightmost space" (or,
 //    with no space to anchor on, leave the run untouched) is only what
 //    happens absent a later space; if the ROW this candidate lands in -
@@ -1576,11 +1577,18 @@ function wrap_buildRowsRaw(line, columns, opts) {
       // does, so the strip has to step over the escapes first rather than
       // anchor at the row's very start.
       // ...but a NON-SGR CSI in that leading run shelters a tab, and only a
-      // tab. Swept escape by escape: with no escape, with any SGR, and with
-      // either OSC 8 form, " \t ab" trims to "ab". With \u001b[H, \u001b[6n,
-      // \u001b[2K or \u001b[?25l it trims to "\tab" - the spaces still go and
-      // the tab stays. The other five whitespace shapes are identical across
-      // all ten escapes, so the CSI is the whole of the difference.
+      // tab. Swept escape by escape: with no escape, with any SGR, and with a
+      // BEL-terminated OSC 8, " \t ab" trims to "ab". With \u001b[H,
+      // \u001b[6n, \u001b[2K or \u001b[?25l it trims to "\tab" - the spaces
+      // still go and the tab stays. The other five whitespace shapes are
+      // identical across all ten escapes.
+      // An ST-terminated OSC 8 shelters the tab too, open or close - measured
+      // 2026-08-27, and the reason this is not simply "a non-SGR CSI": the
+      // sweep above originally recorded BOTH OSC 8 forms as non-sheltering,
+      // which is true only of the BEL one. That makes the test here exactly
+      // wrap_rowGateQualifies's, and not by coincidence - the same two escape
+      // kinds that let a row gate its whitespace collapse are the ones that
+      // shelter a tab at its leading edge.
       // Only the LAST escape in the leading run decides it, not "any of
       // them" - measured with a non-SGR CSI immediately followed by an SGR
       // reset, the tab is NOT sheltered and goes, same as if the CSI were
@@ -1594,7 +1602,8 @@ function wrap_buildRowsRaw(line, columns, opts) {
         const esc = wrap_escapeLength(row, head);
         if (!esc) break;
         const text = row.slice(head, head + esc);
-        sheltersTab = text.startsWith(wrap_ESC + "[") && !text.endsWith("m");
+        sheltersTab = (text.startsWith(wrap_ESC + "[") && !text.endsWith("m")) ||
+            wrap_oscGlueEvent(text) === true;
         head += esc;
       }
       rows[rows.length - 1] = row.slice(0, head) +
@@ -1620,7 +1629,7 @@ function wrap_buildRowsRaw(line, columns, opts) {
       // pre-pushes and keeps the separator space exactly as an ungated word
       // would - "k\n <link>abc</link>", not "k<link>abc</link>".
       //
-      // The same exemption extends to a BLANK word (wordWrap_splitWords
+      // The same exemption extends to a BLANK word (wrap_splitWords
       // produces one whenever a tab, or a run of spaces, sits between two
       // real words - the run's non-space characters and the empty strings
       // either side of consumed spaces all become their own "words"). A
@@ -1811,13 +1820,14 @@ function wrap_buildRows(line, columns, opts) {
   return rows;
 }
 
-// Remove spaces at the row's edges, keeping escapes. A trailing escape does not
-// shelter the spaces in front of it.
-// Trailing whitespace, stripped by walking BACKWARD from the row's end - the
-// mirror of the leading strip's forward walk. An escape is transparent in
-// both directions: it never shelters what follows it (leading) and never
-// blocks removal of what precedes it (trailing). It is REMOVED from neither
-// side; it just does not count as a stopping point.
+// Remove spaces at the row's TRAILING edge, keeping escapes - the leading edge
+// is stripped per word iteration in wrap_buildRowsRaw, not here. Walks
+// BACKWARD from the row's end, the mirror of that leading strip's forward
+// walk. An escape is REMOVED from neither side and is a stopping point on
+// neither: it never blocks removal of what precedes it (trailing), and on the
+// leading side it shelters only a TAB, and only when the LAST escape of the
+// leading run is a non-SGR CSI - see the escape-by-escape sweep in the word
+// loop above.
 //
 // The removable set is space and tab only - NBSP is NOT removable, matching
 // the leading side exactly. Measured with fromCharCode(0xa0), never typed
