@@ -3,7 +3,9 @@
  * nrc-bun-shim - a globalThis.Bun stand-in so Claude Code's extracted bundle
  * runs under stock Node.js. Load it with `node --require`.
  *
- *   node --require scripts/bun-shim.cjs build/extract/cli.original.cjs --version
+ *   node --require ./scripts/bun-shim.cjs build/extract/cli.original.cjs --version
+ * The `./` is load-bearing: `--require scripts/bun-shim.cjs` is a PACKAGE
+ * specifier to Node and resolves in node_modules, never against the cwd.
  *
  * Node >= 24 only. The bundle uses ES explicit resource management - 33 `using`
  * declarations in the 2.1.231 artifact - and that is a PARSE error before Node

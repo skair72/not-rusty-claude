@@ -138,7 +138,7 @@ are installed `--ignore-scripts`.
 
 ```bash
 make node-deps                          # ws + undici from npm into ~/.cache, not this repo
-make node-run NODE_BIN=/path/to/node24  # node --require scripts/bun-shim.cjs …
+make node-run NODE_BIN=/path/to/node24  # node --require ./scripts/bun-shim.cjs …
 #   → No MCP servers configured. Use `claude mcp add` to add a server.
 ```
 
@@ -318,19 +318,19 @@ only as quoted command output labelled with the binary and date that produced
 it.** These counts *move*, in both directions, as test files are added and removed —
 which is exactly why. Every row was re-measured here on 2026-08-26
 by forcing it with the variables named beside it; `--collect-only` reports the
-same total, **244**, in all six configurations, because what the host has
+same total, **245**, in all six configurations, because what the host has
 changes the skips, never the collection.
 
 | host has | result | how the row was forced |
 | --- | --- | --- |
-| both binaries, Bun, Node 24 | **244 passed** | `NRC_TEST_NODE=…/v24.0.0/bin/node` (this host's own `node` is 22.23.2) |
-| …no Mach-O | 239 passed, 5 skipped | `NRC_TEST_MACHO=/nonexistent/macho` |
-| …no ELF | 239 passed, 5 skipped | `NRC_TEST_ELF=/nonexistent/elf` |
-| …neither binary | 234 passed, 10 skipped | both of those two variables at once |
-| …and no Bun | 199 passed, 45 skipped | …plus `BUN_BIN=/nonexistent/bun` and a `HOME` with no Bun under it |
-| none of them, Node 22 | 179 passed, 65 skipped | …and drop `NRC_TEST_NODE` — the command below |
+| both binaries, Bun, Node 24 | **245 passed** | `NRC_TEST_NODE=…/v24.0.0/bin/node` (this host's own `node` is 22.23.2) |
+| …no Mach-O | 240 passed, 5 skipped | `NRC_TEST_MACHO=/nonexistent/macho` |
+| …no ELF | 240 passed, 5 skipped | `NRC_TEST_ELF=/nonexistent/elf` |
+| …neither binary | 235 passed, 10 skipped | both of those two variables at once |
+| …and no Bun | 200 passed, 45 skipped | …plus `BUN_BIN=/nonexistent/bun` and a `HOME` with no Bun under it |
+| none of them, Node 22 | 180 passed, 65 skipped | …and drop `NRC_TEST_NODE` — the command below |
 
-Every row adds up to 244, and the skips decompose: **5** tests need the Mach-O
+Every row adds up to 245, and the skips decompose: **5** tests need the Mach-O
 binary, **5** the ELF one, **3** more only a Bun (5 + 5 + 3 = 13), and **52**
 need Node ≥ 24 — of which **28** also use Bun as their oracle and **4** also
 want `ws`+`undici`, which the moved `HOME` of the fifth row takes with it
@@ -339,7 +339,7 @@ want `ws`+`undici`, which the moved `HOME` of the fifth row takes with it
 **The Apple Silicon run is not reconcilable to this table, and should not be.**
 It reported **257 passed, 6 skipped, 0 failed, 263 collected** — a true
 measurement of the tree as it stood on 2026-08-24, whose test set is not
-today's. No arithmetic connects 263 to 244 and none is offered. What the Mac run
+today's. No arithmetic connects 263 to 245 and none is offered. What the Mac run
 established is in [§ macOS](#macos); its totals belong to the tree it ran on.
 
 The last two rows need care twice over. `BUN_BIN` is a *first* choice, not an
