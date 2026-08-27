@@ -941,6 +941,28 @@ const wrap_BEL = "\u0007";
 
 // --- scanning ---------------------------------------------------------------
 
+// Roughly nineteen places below walk a string as a sequence of tokens, each
+// either an escape sequence or a single code point, with the same four lines:
+//
+//   const esc = wrap_escapeLength(text, i);
+//   if (esc) { ...; i += esc; continue; }
+//   const cp = String.fromCodePoint(text.codePointAt(i));
+//   ...; i += cp.length;
+//
+// That repetition is deliberate, and hoisting it into a shared walker is a
+// measured regression, not a cleanup. Benchmarked on the hottest of the
+// sites (wrap_visibleWidth's walk, 1,711 characters of colorized prose,
+// three runs each): the inline idiom costs 27 us per call, a shared walker
+// taking a per-token callback costs 32 us (+18%), and a generator costs 72 us
+// (2.7x). Making the shared walker's call site megamorphic - which is what
+// nineteen different callbacks would actually do to it - changed nothing
+// measurable, so the cost is the closure call itself, not the polymorphism.
+//
+// wrapAnsi is a TUI hot path already 50x slower than the Bun it stands in for
+// (docs/findings.md section 12), so an 18% tax on its innermost loop buys
+// tidier source at a price this shim cannot afford. Each copy also sits under
+// its own measured-behavior comment; merging them would orphan those.
+//
 // Length of the escape sequence starting at i, or 0 if there is none.
 function wrap_escapeLength(text, i) {
   if (text[i] !== wrap_ESC) return 0;
