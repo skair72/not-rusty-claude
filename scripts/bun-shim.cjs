@@ -1250,12 +1250,79 @@ function wrap_breakWord(rows, word, columns) {
 
 // --- wrapping one line ------------------------------------------------------
 
+// A line that starts with a non-SGR CSI collapses every LATER whitespace run
+// that directly follows an SGR down to just its rightmost space - the tabs
+// and extra spaces before that space vanish, whatever comes after stays.
+// Measured, all with a leading "[6n" (any non-SGR CSI, e.g. [2K,
+// behaves the same) and an SGR immediately before the run:
+//   "  "      (2 spaces)      -> " "        five and six behave the same
+//   "\t "     (tab, space)    -> " "        the tab is discarded
+//   "\t\t "   (2 tabs, space) -> " "        any number of tabs, same result
+//   " \t\t"   (space, 2 tabs) -> " \t\t"    nothing after the rightmost space
+//                                            is touched
+//   "\t \t"   (tab,space,tab) -> " \t"      only what is BEFORE the rightmost
+//                                            space is discarded
+// A run with no space at all is untouched (nothing to anchor on), and a run
+// after a non-SGR CSI (not an SGR) is untouched too - that escape SHELTERS
+// it exactly as it shelters a tab at a row's own leading edge. Without the
+// leading CSI on the line, an adjacent SGR does nothing either: both factors
+// are required. opts.trim === false disables this outright - measured, all
+// four spaces of "word<SGR>    1234" survive whole with trim:false, at any
+// width; wordWrap does not gate it either way.
+//
+// A third factor, found by a regression: an OSC 8 link ANYWHERE earlier in
+// the line - even fully closed well before the run in question - turns the
+// whole mechanism off for the rest of the line. Measured with the identical
+// leading CSI and adjacent SGR that collapse on their own: inserting a
+// closed "link" word between the CSI and the word carrying the SGR leaves
+// the later three-space run completely untouched. The CSI's final letter
+// does not matter either way (cursor-up "[1A" behaves exactly like
+// "[6n" or "[2K" when nothing else intervenes) - only "has an OSC 8
+// appeared yet" gates it, tracked once while scanning left to right.
+function wrap_collapseMidlineRuns(line) {
+  const firstEsc = wrap_escapeLength(line, 0);
+  if (!firstEsc) return line;
+  const first = line.slice(0, firstEsc);
+  if (!(first.startsWith(wrap_ESC + "[") && !first.endsWith("m"))) return line;
+
+  let out = "";
+  let i = 0;
+  let sawLink = false;
+  while (i < line.length) {
+    const esc = wrap_escapeLength(line, i);
+    if (esc) {
+      const text = line.slice(i, i + esc);
+      out += text;
+      i += esc;
+      if (text.startsWith(wrap_ESC + "]8;")) { sawLink = true; continue; }
+      if (!sawLink && text.startsWith(wrap_ESC + "[") && text.endsWith("m")) {
+        let j = i;
+        let lastSpace = -1;
+        while (j < line.length && (line[j] === " " || line[j] === "\t")) {
+          if (line[j] === " ") lastSpace = j;
+          j++;
+        }
+        if (lastSpace !== -1) {
+          out += line.slice(lastSpace, j);
+          i = j;
+        }
+      }
+      continue;
+    }
+    const cp = String.fromCodePoint(line.codePointAt(i));
+    out += cp;
+    i += cp.length;
+  }
+  return out;
+}
+
 function wrap_wrapLine(rawLine, columns, opts) {
   let line = rawLine;
   // A line made only of spaces and tabs collapses to one empty row when
   // trimming. NOT JS trim(): that counts NBSP as whitespace, and measured, a
   // lone NBSP survives (it is width 1 and prints) while a lone space does not.
   if (opts.trim !== false && /^[ \t]*$/.test(line)) return [""];
+  if (opts.trim !== false) line = wrap_collapseMidlineRuns(line);
 
   const words = wrap_splitWords(line);
   const rows = [""];
@@ -1283,6 +1350,12 @@ function wrap_wrapLine(rawLine, columns, opts) {
       // \u001b[2K or \u001b[?25l it trims to "\tab" - the spaces still go and
       // the tab stays. The other five whitespace shapes are identical across
       // all ten escapes, so the CSI is the whole of the difference.
+      // Only the LAST escape in the leading run decides it, not "any of
+      // them" - measured with a non-SGR CSI immediately followed by an SGR
+      // reset, the tab is NOT sheltered and goes, same as if the CSI were
+      // never there. Reassigning on every escape (not OR-ing) gets this
+      // right without disturbing the single-escape cases above, since for
+      // those the last escape and the only escape are the same one.
       const row = rows[rows.length - 1];
       let head = 0;
       let sheltersTab = false;
@@ -1290,7 +1363,7 @@ function wrap_wrapLine(rawLine, columns, opts) {
         const esc = wrap_escapeLength(row, head);
         if (!esc) break;
         const text = row.slice(head, head + esc);
-        if (text.startsWith(wrap_ESC + "[") && !text.endsWith("m")) sheltersTab = true;
+        sheltersTab = text.startsWith(wrap_ESC + "[") && !text.endsWith("m");
         head += esc;
       }
       rows[rows.length - 1] = row.slice(0, head) +

@@ -62,9 +62,22 @@ SEEDS = [1, 7, 13, 99, 1337, 20260826, 24301, 424242]
 # would be reintroducing the exact defect class this file exists to catch -
 # fix the divergence instead, or pin the input as a refusal if it cannot be
 # matched.
+#
+# Measured 2026-08-27, later the same day: a line that starts with a non-SGR
+# CSI collapses every LATER whitespace run that directly follows an SGR down
+# to just its rightmost character - tabs and extra spaces before that space
+# vanish. A regression during this fix (seed 20260826 briefly rose to 8)
+# showed a third factor: an OSC 8 link ANYWHERE earlier in the line, even one
+# already closed, turns the whole mechanism off for the rest of the line -
+# found by diffing the new failures against the old shim on that seed
+# specifically, not by trusting the aggregate count. Separately, the same
+# leading-run scan that decides whether a CSI shelters a tab was OR-ing every
+# escape in the run instead of keying on the LAST one, so a CSI immediately
+# followed by an SGR reset kept sheltering a tab the SGR should have
+# unsheltered. Both fixes dropped every seed or held it even; none rose.
 MAX_WRAP_DIVERGENCES = {
-    1: 7, 7: 7, 13: 11, 99: 11,
-    1337: 5, 20260826: 7, 24301: 5, 424242: 8,
+    1: 6, 7: 6, 13: 9, 99: 9,
+    1337: 5, 20260826: 7, 24301: 5, 424242: 7,
 }
 
 # YAML must be exact: it has a refusal channel, so anything it cannot match is
