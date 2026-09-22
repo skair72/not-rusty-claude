@@ -1391,6 +1391,69 @@ a shared chunk, from 19 call sites — and still undefined outside a standalone.
 Image resizing no longer depends on it: the Read tool calls `new Bun.Image(…)`
 directly.
 
+**The runtime inside the binary is Bun 1.4.3.** Asked from a preloaded probe:
+`Bun.version` 1.4.3, revision `f08e57be…`, WebKit `000c4899…`, ICU 78.3,
+Unicode 17.0 — a post-Zig Bun, where stock 1.3.14 is WebKit `5488984d…`. So
+Claude Code itself now ships on the Rust-era runtime, and this project runs it
+on the Zig one. The embedded JSC bytecode is tied to that WebKit build and is
+unusable by 1.3.14, which is why startup is slower (medians of five,
+interleaved, same host): `--version` 0.02 s native against 0.06 s, `--help`
+0.16 s against 1.22 s, `doctor` 0.37 s against 1.77 s.
+
+**`CellSegmenter`, measured through the oracle.** The contract Claude relies on
+(`scripts/bun-ant-cell-segmenter.mjs` is the port):
+
+- `segment(text, cells, runs, reordered)` returns the number of cells written,
+  or minus the capacity it needs. Each cell is a pair: a grapheme id and a word
+  holding the width (bits 0–7), a tab flag (bit 8), a substituted flag (bit 9)
+  and the run index (bits 10 and up). Each run is a pair of an `sgrKeys` index
+  and a `uris` index. `graphemes` is pre-seeded with 98 entries — `" "`, `""`,
+  the printable ASCII, `"\t"` and `"�"` — and grows as clusters are first
+  seen. A code point in the `substitute` ranges (Claude passes U+061C,
+  U+202A–202E and U+2066–2069, the bidi controls) becomes U+FFFD with bit 9 set.
+- `reordered` is **UAX #9 visual reordering**, and it matches ICU 78.3's
+  `ubidi` — the ICU the runtime ships — case for case.
+- `paint(...)` writes into Claude's screen buffer, handling wide chars, their
+  spacer cells, clipping, and orphaned halves of a wide char it overwrites.
+  `setCell(...)` does the same for a single cell. Both return the damaged
+  column span packed as `start·2²⁰ + end·2³⁶`, with the new column in the low
+  20 bits.
+- The table arrays are the **same objects** across calls: Claude caches
+  `native.graphemes` once and reads it later.
+
+Grapheme clusters follow a uucode-style state machine that differs from
+`Intl.Segmenter` in both Bun 1.3.14 and Node, so the port carries its own.
+Widths come from a per-code-point scan of the native class over all of
+0–0x10FFFF.
+
+The port was fuzzed against the native class to equality. After that, 32,696
+generated cases in two index windows nobody had tuned against gave 0
+mismatches. The golden record the suite replays is 5,904 cases.
+
+**A latent gap: built-in plugin hooks.** Outside a standalone, a built-in
+plugin registers its hooks module as `{module, folder: import.meta.dir}`
+rather than a pre-scanned bundle. The loader then resolves
+`join(folder, "hooks/register.ts")` — a TypeScript source path from
+Anthropic's development tree that no extracted build contains. It is reached
+only when a built-in plugin with its own hooks module is seated. In every
+configuration the harness can create, including `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`,
+both sides seat the same plugins and send byte-identical requests, so the
+branch is recorded here rather than rewritten blind.
+
+**Node ≥ 24 does not run a code-split build**, measured with Node 24.21.0.
+There are three walls, in the order a run meets them:
+
+1. Node gives ES modules no `import.meta.require`, which the bundle calls at
+   445 sites.
+2. Node's ESM resolver ignores `NODE_PATH`, which is how `ws` and `undici`
+   arrive.
+3. `ERR_REQUIRE_CYCLE_MODULE`: Node refuses `require()` of an ES module inside
+   an import cycle that is still evaluating, and Bun allows it.
+
+A preload hook (`module.registerHooks`) clears the first two. The third means
+changing module evaluation order. Separately, the shim would also need
+`Bun.sliceAnsi` (Ink's clipping path) and `Bun.Image` (Read of images).
+
 ---
 
 ## Appendix: exact commands used ✅
