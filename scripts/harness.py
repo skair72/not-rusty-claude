@@ -201,6 +201,20 @@ class Mock:
                             out.append(block)
         return out
 
+    def post_bodies(self):
+        """Every POST body the client sent, parsed (the HEAD probe has none)."""
+        out = []
+        if not os.path.exists(self.bodies):
+            return out
+        for line in open(self.bodies):
+            try:
+                rec = json.loads(line)
+                if rec.get("method") == "POST" and rec.get("body"):
+                    out.append(json.loads(rec["body"]))
+            except ValueError:
+                continue
+        return out
+
     def stop(self):
         self.proc.terminate()
         try:
@@ -556,6 +570,25 @@ def image_dims(b64, media):
     return media, None
 
 
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+_DEVICE = re.compile(r'(\\"device_id\\":\\")[0-9a-f]+')
+
+
+def normalize_bodies(bodies, ctx, paths):
+    """Request bodies as comparable text: per-run paths (and the slug form
+    Claude derives from them for its memory directory), session uuids and the
+    random per-config device id replaced. What is left is everything the model
+    would see - system prompt, tools, messages - and must be equal."""
+    out = []
+    for body in bodies:
+        text = json.dumps(body, sort_keys=True, ensure_ascii=False)
+        for path, token in paths:
+            text = text.replace(path, token).replace(path.replace("/", "-"), token)
+        text = _UUID.sub("<UUID>", _DEVICE.sub(r"\1<DEVICE>", text))
+        out.append(normalize(text, ctx, []))
+    return out
+
+
 def summarize_tool_result(block, ctx, paths):
     content = block.get("content")
     parts = content if isinstance(content, list) else [{"type": "text", "text": content or ""}]
@@ -572,14 +605,18 @@ def summarize_tool_result(block, ctx, paths):
 
 
 AGENTIC_CASES = [
-    # name, tool, tool_input(work-relative placeholders), allowedTools, setup
-    ("text", "none", None, None),
-    ("bash", "bash", None, None),
-    ("read-text", "Read", {"file_path": "<WORK>/note.txt"}, None),
-    ("read-png", "Read", {"file_path": "<WORK>/big.png"}, None),
-    ("grep", "grep", None, "Grep,Bash,Read"),
-    ("write", "Write", {"file_path": "<WORK>/out.txt", "content": "WRITTEN-BY-HARNESS\n"}, None),
-    ("glob", "Glob", {"pattern": "**/*.txt"}, "Glob,Bash,Read"),
+    # name, tool, tool_input (<WORK> is substituted), --allowedTools, extra env
+    ("text", "none", None, None, None),
+    ("bash", "bash", None, None, None),
+    ("read-text", "Read", {"file_path": "<WORK>/note.txt"}, None, None),
+    ("read-png", "Read", {"file_path": "<WORK>/big.png"}, None, None),
+    ("grep", "grep", None, "Grep,Bash,Read", None),
+    ("write", "Write", {"file_path": "<WORK>/out.txt", "content": "WRITTEN-BY-HARNESS\n"}, None, None),
+    ("glob", "Glob", {"pattern": "**/*.txt"}, "Glob,Bash,Read", None),
+    # the plugin hooks-modules rollout, forced on: GrowthBook is off in this
+    # sandbox, and outside a standalone the built-in plugins' hooks resolve
+    # to <chunk dir>/hooks/register.ts instead (docs/findings.md 14)
+    ("bash-function-hooks", "bash", None, None, {"CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1"}),
 ]
 
 
@@ -594,7 +631,7 @@ def check_agentic(ctx):
     ctx.png = os.path.join(ctx.scratch("png"), "big.png")
     make_png(ctx.png)
     results = []
-    for name, tool, tool_input, allowed in AGENTIC_CASES:
+    for name, tool, tool_input, allowed, extra_env in AGENTIC_CASES:
         sides = {}
         for side in ("native", "artifact"):
             home = ctx.scratch("agentic", name, side)
@@ -604,7 +641,7 @@ def check_agentic(ctx):
             ti = json.loads(json.dumps(tool_input).replace("<WORK>", work)) if tool_input else None
             mock = Mock(ctx, "%s-%s" % (name, side), tool=tool, tool_input=ti)
             try:
-                env = ctx.base_env(home, mock.port)
+                env = ctx.base_env(home, mock.port, extra_env)
                 argv = ctx.argv(side) + ["-p", "run the harness case", "--output-format",
                                          "stream-json", "--verbose", "--dangerously-skip-permissions"]
                 if allowed:
@@ -623,6 +660,7 @@ def check_agentic(ctx):
                 sides[side] = {
                     "rc": r["rc"], "secs": r["secs"], "final": final,
                     "requests": mock.requests(),
+                    "bodies": normalize_bodies(mock.post_bodies(), ctx, paths),
                     "tool_results": [summarize_tool_result(b, ctx, paths) for b in mock.tool_results()],
                     "files": sorted(os.listdir(work)),
                     "written": open(os.path.join(work, "out.txt")).read()
@@ -632,6 +670,17 @@ def check_agentic(ctx):
             finally:
                 mock.stop()
         n, a = sides["native"], sides["artifact"]
+        nb, ab = n.pop("bodies"), a.pop("bodies")
+        bodies_equal = nb == ab
+        body_diff = None
+        if not bodies_equal:
+            for i, (x, y) in enumerate(zip(nb, ab)):
+                if x != y:
+                    k = next(j for j in range(min(len(x), len(y)) + 1)
+                             if j == min(len(x), len(y)) or x[j] != y[j])
+                    body_diff = {"request": i, "native": x[max(0, k - 150):k + 150],
+                                 "artifact": y[max(0, k - 150):k + 150]}
+                    break
         same = (n["rc"] == a["rc"] and n["final"] == a["final"]
                 and n["tool_results"] == a["tool_results"] and n["written"] == a["written"]
                 and len(n["requests"]) == len(a["requests"]))
@@ -645,13 +694,18 @@ def check_agentic(ctx):
             if (n["rc"] == a["rc"] and n["final"] == a["final"] and shape(n) == shape(a)):
                 same, note = True, " (image bytes differ, dimensions and type equal)"
         ok_turn = a["final"] is not None and a["final"].get("result") == "MOCK-DONE"
-        status = "PASS" if same and ok_turn else "FAIL"
+        # the read-png turn sends the image back up, so its second body carries
+        # the resized bytes: judged by the dimension rule above, not verbatim
+        bodies_ok = bodies_equal or (name == "read-png" and same and nb[:1] == ab[:1])
+        status = "PASS" if same and ok_turn and bodies_ok else "FAIL"
         results.append(Result("agentic:" + name, status,
-                              "rc %s/%s, %d/%d requests, results %s%s" % (
+                              "rc %s/%s, %d/%d requests, results %s, request bodies %s%s" % (
                                   n["rc"], a["rc"], len(n["requests"]), len(a["requests"]),
-                                  "equal" if same else "DIFFER", note),
+                                  "equal" if same else "DIFFER",
+                                  "equal" if bodies_equal else ("equal bar the image" if bodies_ok else "DIFFER"),
+                                  note),
                               {"native": {k: v for k, v in n.items() if k != "stderr"},
-                               "artifact": a}))
+                               "artifact": a, "body_diff": body_diff}))
     return results
 
 
