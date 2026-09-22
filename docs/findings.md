@@ -1336,6 +1336,63 @@ deliberately omits the BEL one, with a comment saying why.
 
 ---
 
+## 14. 2.1.280: a code-split ESM build on a private Bun ✅
+
+Measured 2026-09-22 on `/usr/bin/claude` **2.1.280** (linux-x64, 233,709,640
+bytes, `.bun` section at offset 88,842,240, 144,806,548 bytes). The design of
+record is
+[the 2026-09-22 spec](superpowers/specs/2026-09-22-esm-split-build-design.md).
+
+**The graph changed shape.** 2,196 modules, entry id 5 (`/$bunfs/root/cli`,
+21,310 bytes). The module-format byte at record offset 50 is `1` (esm) for all
+1,975 JavaScript modules; the last cached legacy binary, linux-x64 2.1.231, has
+11 modules and an entry of format `2` (cjs). The other kinds: 84 `text`, 135
+`file`, 2 `napi` (`audio-capture.node`, `clipboard-napi.node` — there is no
+`image-processor.node` any more). Every JavaScript module also carries JSC
+bytecode (`// @bun @bytecode`), which stock Bun ignores outside a standalone.
+
+**The content-encoding byte (offset 48) is 0, 1 or 2**, and 2 is UTF-16LE:
+all 20 text modules that carry it decode to readable Markdown as UTF-16LE,
+and 16 of them are rejected outright as UTF-8. 1 marks ASCII-only content
+(1,975 JS, 64 text), 0 raw bytes.
+
+**How chunks reach each other**, counted over all 1,975 modules: 119,359
+`import"/$bunfs/root/…"`, 17,195 `from"…"`, 1,196 `import("…")`, 445
+`import.meta.require("…")`, 264 `HOOKS_WORKER_URL:"…"` values, 135 `file`-asset
+constants, and `Re("…")` 86 times — 84 text modules and the 2 addons — where
+`Re` is `import.meta.require` **of the shared helper chunk**, so a relative
+path passed to it would resolve against that chunk, not the caller.
+
+**A text module is a string.** Inside the native runtime, `require()` of a
+`text` module returns the raw string. Stock Bun 1.3.14 and 1.4.0 return
+`{default: …}`, and for a `.md` file the default is the Markdown **rendered to
+HTML**. `postprocess.py` therefore writes each as `module.exports = "…"`;
+after the rewrite all 84 compare equal to native by sha256 and length.
+
+**`Bun.ant`.** The native runtime exposes 18 members; the bundle calls five:
+`CellSegmenter` (Ink's cell writer, 3 sites, unguarded), `getPeerPid` and
+`getPeerUid` (daemon socket checks, guarded), `setDumpable` (guarded) and
+`memoryPressureLevel` (macOS only, guarded). Without `CellSegmenter`, `mcp
+list` prints nothing and dies of `SIGKILL`: Ink's unmount throws inside
+`process.exit()`, and Claude's `forceExit()` answers a throwing
+`process.exit()` with `process.kill(process.pid, "SIGKILL")`. Every other
+`Bun.*` API the bundle names exists in stock 1.3.14.
+
+**The oracle.** The native binary honours `BUN_OPTIONS=--preload <file>`: the
+preloaded file runs inside Anthropic's runtime, with the real `Bun.ant`, and
+can `process.exit()` before Claude's own main starts. On Linux, measured
+there: `getPeerPid`/`getPeerUid` answer the peer's pid/uid on a connected unix
+socket and `null` for an fd that is not one; `setDumpable(x)` answers `true`;
+`memoryPressureLevel()` throws `Bun.ant.memoryPressureLevel() is only supported
+on macOS`.
+
+**`Bun.isStandaloneExecutable`** is still asked — through one gate function in
+a shared chunk, from 19 call sites — and still undefined outside a standalone.
+Image resizing no longer depends on it: the Read tool calls `new Bun.Image(…)`
+directly.
+
+---
+
 ## Appendix: exact commands used ✅
 
 Every command below was run on **this host**. `/usr/bin/claude` was only ever

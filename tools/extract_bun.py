@@ -16,15 +16,29 @@ Only reads the binary; never modifies or signs it. Runs on the stock
 Format (see docs/bun-section-format.md): the Bun standalone embeds a serialized
 module graph in a platform section (Mach-O __BUN,__bun; ELF/PE .bun), ending
 with the trailer magic '\\n---- Bun! ----\\n'. This tool implements the Mach-O
-and ELF cases, and refuses PE. Entry module -> cli.original.js; napi/base64/file
-modules -> assets/<name> written as RAW bytes. Every .node addon on both shipped
-binaries carries loader id 10 = napi. Ids are Bun's, see LOADERS below.
+and ELF cases, and refuses PE. Ids are Bun's, see LOADERS below.
+
+The graph comes in two shapes, told apart by the ENTRY module's own format
+byte (record offset 50), never by counting modules or matching names:
+
+  cjs / none  every build up to at least 2.1.241: ONE CommonJS entry module
+              with everything inlined. Entry -> cli.original.js; napi/base64/
+              file modules -> assets/<name> written as RAW bytes. Every .node
+              addon on those binaries carries loader id 10 = napi.
+  esm         2.1.280 (docs/findings.md section 14): a code-split ESM build,
+              ~2000 modules importing each other by /$bunfs/root/ path. Every
+              module is written verbatim under original/<its VFS path>, and
+              manifest.json records what each one is, for postprocess.py to
+              rewire. Nothing is inlined, so nothing may be dropped.
 
 Usage:
   ./extract_bun.py <binary> <out-dir>
 """
 
+import hashlib
+import json
 import os
+import posixpath
 import struct
 import sys
 
@@ -56,6 +70,33 @@ WRITTEN_LOADERS = ("napi", "base64", "file")
 # the entry module and dropped here. Anything else being dropped is a signal,
 # not a routine event - see the warning in extract().
 JS_LOADERS = ("js", "jsx", "ts", "tsx")
+
+# The module-format byte at record offset 50 - Bun's ModuleFormat enum. Only
+# the ENTRY module's value picks the extraction shape. Measured on this host:
+# the entry is 2 (cjs) on linux-x64 2.1.231 and 1 (esm) on linux-x64 2.1.280,
+# where all 1975 JavaScript modules are esm and every other kind is 0.
+# Synthetic fixtures leave the byte at 0, which is the legacy shape by design.
+MODULE_FORMATS = {0: "none", 1: "esm", 2: "cjs"}
+FORMAT_ESM = 1
+
+# The content-encoding byte at record offset 48: how the runtime turns a
+# module's stored bytes into a JavaScript string. MEASURED on linux-x64
+# 2.1.280, not transcribed: every .node/file module is 0 and is raw bytes; all
+# 1975 JavaScript and 64 text modules are 1 and are pure ASCII; the other 20
+# text modules are 2 and are UTF-16LE (each decodes to readable Markdown, e.g.
+# "# Claude Code Configuration Guide"). Decoding a 2 as UTF-8 fails outright -
+# 16 of the 20 contain byte sequences UTF-8 rejects.
+ENCODINGS = {0: "binary", 1: "latin1", 2: "utf16le"}
+
+# The one VFS prefix a POSIX standalone uses. In the esm shape every module
+# name must carry it, because postprocess.py rewires references by their path
+# under it; a module outside it could not be referenced consistently.
+VFS_ROOT = "/$bunfs/root/"
+
+# The esm shape's on-disk layout, shared with postprocess.py.
+TREE_DIR = "original"
+MANIFEST_NAME = "manifest.json"
+MANIFEST_KIND = "esm-tree"
 
 # Sanity ceilings for Mach-O header counts. A real Mach-O has tens of load
 # commands and tens of sections; these are ~1000x that, so they reject the
@@ -267,9 +308,19 @@ def extract(binary, out_dir):
     print(f"Payload: {len(payload)} bytes, trailer OK")
     print(f"Modules: {count} (entry id={entry_point_id})")
 
+    table = payload[modules_offset:modules_offset + modules_size]
+    entry_rec = table[entry_point_id * MODULE_RECORD_SIZE:
+                      (entry_point_id + 1) * MODULE_RECORD_SIZE]
+    # An entry id past the table (only reachable if parse_payload's range
+    # check is ever relaxed) leaves entry_rec empty; the legacy loop below then
+    # matches no module and refuses to claim success, which is the diagnosis
+    # that state needs - not an IndexError here.
+    if len(entry_rec) == MODULE_RECORD_SIZE and entry_rec[50] == FORMAT_ESM:
+        extract_tree(payload, table, count, entry_point_id, out_dir)
+        return
+
     assets_dir = os.path.join(out_dir, "assets")
     os.makedirs(out_dir, exist_ok=True)
-    table = payload[modules_offset:modules_offset + modules_size]
 
     asset_count = shim_count = 0
     entry_dest = None   # set when the entry module actually reaches disk
@@ -361,6 +412,107 @@ def extract(binary, out_dir):
             "no cli.original.js was written, so this extraction failed")
     print(f"Extracted: 1 cli.js + {asset_count} assets "
           f"({shim_count} loader shims left inlined in cli.js)")
+
+
+def _tree_path(i, name):
+    """The module's path under VFS_ROOT, or die() if it cannot be one.
+
+    Everything here is attacker-controlled on an untrusted input, and unlike
+    the legacy shape - which reduces every name to a basename - this shape
+    keeps subdirectories (2.1.280 has
+    /$bunfs/root/src/plugins/functionHooks/hooks-worker/hooks-worker.js), so a
+    `..` segment would be a real traversal out of original/. Refuse anything
+    that is not already a clean relative POSIX path.
+    """
+    if not name.startswith(VFS_ROOT):
+        die(f"module {i} ({name!r}) is not under {VFS_ROOT} - this graph uses "
+            "a VFS prefix postprocess.py cannot rewire (a Windows B:/~BUN/ "
+            "build? see docs/status.md's Windows/PE section)")
+    rel = name[len(VFS_ROOT):]
+    if (not rel or "\0" in rel or "\\" in rel or rel.startswith("/")
+            or posixpath.normpath(rel) != rel
+            or any(part in ("", ".", "..") for part in rel.split("/"))):
+        die(f"module {i} ({name!r}) is not a clean relative path under "
+            f"{VFS_ROOT} - refusing to write it under {TREE_DIR}/")
+    return rel
+
+
+def extract_tree(payload, table, count, entry_point_id, out_dir):
+    """The esm shape: write EVERY module verbatim, plus a manifest.
+
+    Nothing is inlined in a code-split build, so there is no module this
+    function may skip: a chunk left out is an import that fails at runtime,
+    and a text module left out is a skill or a prompt that silently
+    disappears (2.1.280 carries 84 of those). Loaders only tell postprocess.py
+    how a module is REACHED - the bytes on disk are the section's raw bytes,
+    exactly as in the legacy shape.
+    """
+    tree = os.path.join(out_dir, TREE_DIR)
+    os.makedirs(tree, exist_ok=True)
+    modules = []
+    seen = {}
+    kinds = {}
+    for i in range(count):
+        rec = table[i * MODULE_RECORD_SIZE:(i + 1) * MODULE_RECORD_SIZE]
+        name_off, name_size, content_off, content_size = struct.unpack_from("<IIII", rec, 0)
+        encoding, loader_id, fmt_id = rec[48], rec[49], rec[50]
+        if name_off + name_size > len(payload) or content_off + content_size > len(payload):
+            die(f"module {i} points past the end of the {len(payload)}-byte "
+                "payload (truncated or corrupt graph)")
+        name = payload[name_off:name_off + name_size].decode("utf-8", "replace")
+        content = payload[content_off:content_off + content_size]
+        rel = _tree_path(i, name)
+        # A path that is a prefix-directory of another (`a` and `a/b`) would
+        # have one write fail with an OSError traceback half-way through.
+        key = rel.lower() if sys.platform == "darwin" else rel
+        if key in seen:
+            die(f"module {i} ({name!r}) has the same path as module {seen[key]} "
+                "- one of the two would be silently lost")
+        seen[key] = i
+        loader = LOADERS.get(loader_id, f"unknown({loader_id})")
+        if loader.startswith("unknown"):
+            sys.stderr.write(
+                f"warning: module {i} ({name!r}) has loader id {loader_id}, "
+                "which is not in LOADERS - written verbatim; postprocess.py "
+                "will refuse to rewire references to it\n")
+        dest = os.path.join(tree, *rel.split("/"))
+        parent = os.path.dirname(dest)
+        if os.path.isfile(parent):
+            die(f"module {i} ({name!r}) needs {parent} to be a directory, but "
+                "another module was written there")
+        os.makedirs(parent, exist_ok=True)
+        if os.path.isdir(dest):
+            die(f"module {i} ({name!r}) collides with a directory another "
+                "module's path created")
+        with open(dest, "wb") as fh:
+            fh.write(content)
+        modules.append({
+            "id": i,
+            "path": rel,
+            "loader": loader,
+            "format": MODULE_FORMATS.get(fmt_id, f"unknown({fmt_id})"),
+            "encoding": ENCODINGS.get(encoding, f"unknown({encoding})"),
+            "size": content_size,
+            "sha256": hashlib.sha256(content).hexdigest(),
+        })
+        kinds[loader] = kinds.get(loader, 0) + 1
+
+    entry = modules[entry_point_id]
+    manifest = {
+        "kind": MANIFEST_KIND,
+        "vfs_root": VFS_ROOT,
+        "tree": TREE_DIR,
+        "entry": entry["path"],
+        "modules": modules,
+    }
+    with open(os.path.join(out_dir, MANIFEST_NAME), "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, indent=1, sort_keys=True)
+        fh.write("\n")
+    print(f"  entry   {entry['loader']:7} {entry['size']/1024:7.0f} KB -> "
+          f"{os.path.join(tree, entry['path'])}  (esm, code-split)")
+    print("  loaders: " + ", ".join(f"{k}={v}" for k, v in sorted(kinds.items())))
+    print(f"Extracted: {count} modules verbatim under {tree} "
+          f"(esm graph; manifest {os.path.join(out_dir, MANIFEST_NAME)})")
 
 
 def main():

@@ -71,9 +71,12 @@ Usage:
       cli.js shim beside it.
 """
 
+import hashlib
 import json
 import os
+import posixpath
 import re
+import shutil
 import sys
 
 # A /$bunfs/root/<name> string literal. This single pattern covers BOTH shapes
@@ -503,10 +506,325 @@ def die(msg):
     sys.exit(1)
 
 
+# --- the esm tree (2.1.280 and later) ----------------------------------------
+#
+# A code-split build is ~2000 ES modules that import each other by
+# /$bunfs/root/<path>. extract_bun.py writes them verbatim under original/ with
+# a manifest; this half rewrites every reference so the tree runs from real
+# disk under root/, and puts an entry of ours in front of it. See
+# docs/findings.md section 14 for every shape measured on 2.1.280.
+
+TREE_SRC = "original"      # extract_bun.TREE_DIR
+TREE_OUT = "root"
+MANIFEST_NAME = "manifest.json"
+MANIFEST_KIND = "esm-tree"
+ENTRY_NAME = "cli.js"
+# The Bun.ant polyfill (scripts/), copied beside the entry under the same
+# names: bun-ant.mjs imports its sibling by relative path.
+BUN_ANT_NAME = "bun-ant.mjs"
+BUN_ANT_FILES = ("bun-ant.mjs", "bun-ant-cell-segmenter.mjs")
+
+# A quoted /$bunfs/root/ path. Deliberately NOT restricted to basenames the way
+# BUNFS_LITERAL is: 2.1.280 keeps one module in a subdirectory
+# (src/plugins/functionHooks/hooks-worker/hooks-worker.js).
+TREE_REF = re.compile(r"""(["'])/\$bunfs/root/([^"'\s`\\]+)\1""")
+
+# What precedes a reference decides how it may be rewritten. A static
+# `import`/`export ... from` specifier must stay a string literal, so it becomes
+# a RELATIVE specifier; so do import() and a require() that resolves against
+# the module it is written in. Everything else - a path constant later handed
+# to fs, a Worker URL, or a call to `Re`, which is `import.meta.require` of the
+# shared helper chunk and so resolves relative to THAT chunk rather than the
+# caller - becomes an expression that is absolute at runtime.
+# Measured on 2.1.280 (docs/findings.md 14): 119359 `import"`, 17195 `from"`,
+# 1196 `import("`, 445 `import.meta.require("`, 84 text + 2 napi `Re("`, 135
+# file-asset constants and 264 HOOKS_WORKER_URL values.
+_SPEC_BEFORE = re.compile(
+    r"(?:(?<![\w$.])from|(?<![\w$.])import|(?<![\w$.])import\s*\(|"
+    r"(?<![\w$.])require\s*\(|(?<![\w$])import\.meta\.require\s*\()\s*$")
+_CALL_BEFORE = re.compile(r"[\w$]\s*\(\s*$")
+
+# Loaders whose modules are JavaScript source this half rewrites, and loaders
+# that are copied through untouched. `text` is neither: see _text_module().
+TREE_JS_LOADERS = ("js", "jsx", "ts", "tsx")
+TREE_COPY_LOADERS = ("file", "napi", "base64", "wasm", "json", "sqlite",
+                     "sqlite_embedded")
+
+
+def _out_path(mod):
+    """Where a manifest module lands under root/.
+
+    The entry module of 2.1.280 is `/$bunfs/root/cli`, extensionless. Node
+    will not load an extensionless file as an ES module, so JavaScript with no
+    extension gains `.js` (and every reference to it follows). A text module
+    becomes a CommonJS wrapper, see _text_module().
+    """
+    rel = mod["path"]
+    if mod["loader"] in TREE_JS_LOADERS and "." not in posixpath.basename(rel):
+        return rel + ".js"
+    if mod["loader"] == "text":
+        return rel + ".cjs"
+    return rel
+
+
+def _text_module(content):
+    """A text-loader module as a CommonJS file whose exports ARE the string.
+
+    Measured inside the native 2.1.280 runtime: require() of a text module
+    returns the raw string. Stock Bun 1.3.14 returns {default: ...} for a .txt
+    file and, for .md, {default: <the markdown RENDERED TO HTML>} - so leaving
+    the 84 skills and prompts as plain files would silently feed Claude HTML.
+    module.exports = "<text>" is the one shape that returns the same string
+    under Bun and Node alike. ensure_ascii keeps U+2028/2029 and lone
+    surrogates out of the source text.
+    """
+    return ("// not-rusty-claude: a text-loader module; require() returns the string.\n"
+            "module.exports = " + json.dumps(content, ensure_ascii=True) + ";\n")
+
+
+# extract_bun.ENCODINGS, by name: how the runtime decodes a module's bytes.
+_DECODERS = {"latin1": "latin-1", "utf16le": "utf-16-le", "binary": "utf-8"}
+
+# A string literal that is nothing but a VFS prefix is a constant the code
+# compares paths against, not a reference to a module, e.g. 2.1.280's hooks
+# worker resolver: var xdt="B:/~BUN/root/";function Cdt(e){return
+# O()==="windows"&&e.startsWith(xdt)?e:new URL(`file://${e}`)}. Left alone and
+# counted; anything LONGER is a module path and must have been rewired.
+PREFIX_CONSTANT = re.compile(r"""(["'])(?:/\$bunfs/root/|B:/~BUN/root/)\1""")
+
+
+def _decode(data, mod):
+    """A module's bytes as the runtime would read them, or raise ValueError."""
+    codec = _DECODERS.get(mod.get("encoding"))
+    if codec is None:
+        raise ValueError("unknown content encoding %r" % mod.get("encoding"))
+    if codec == "utf-16-le" and len(data) % 2:
+        raise ValueError("odd byte count for UTF-16LE")
+    return data.decode(codec)
+
+
+def _relative_specifier(from_dir, target):
+    rel = posixpath.relpath(target, from_dir or ".")
+    return rel if rel.startswith("../") else "./" + rel
+
+
+def transform_module(code, rel, by_path):
+    """Rewrite every /$bunfs/root/ reference in one ES module.
+
+    `rel` is the module's own OUTPUT path under root/; `by_path` maps each VFS
+    path to its manifest entry. Returns (code, counts); counts["missing"] and
+    counts["bad_text"] are what check_tree() turns into fatal errors.
+    """
+    here = posixpath.dirname(rel)
+    counts = {"specifier": 0, "expression": 0, "text": 0,
+              "missing": set(), "bad_text": set()}
+
+    def sub(m):
+        quote, target = m.group(1), m.group(2)
+        mod = by_path.get(target)
+        if mod is None:
+            counts["missing"].add(target)
+            return m.group(0)
+        out = _out_path(mod)
+        before = code[max(0, m.start() - 32):m.start()]
+        if mod["loader"] == "text":
+            # Only ever reached through a require-like call (84 of 84 on
+            # 2.1.280). A text path used any other way would be handed to fs
+            # and read the WRAPPER's source instead of the text - refuse.
+            if not _CALL_BEFORE.search(before):
+                counts["bad_text"].add(target)
+                return m.group(0)
+            counts["text"] += 1
+        if _SPEC_BEFORE.search(before) and mod["loader"] != "text":
+            counts["specifier"] += 1
+            return quote + _relative_specifier(here, out) + quote
+        counts["expression"] += 1
+        up = posixpath.relpath(out, here or ".")
+        return "(import.meta.dirname+" + json.dumps("/" + up) + ")"
+
+    code = TREE_REF.sub(sub, code)
+    counts["prefix_constants"] = len(PREFIX_CONSTANT.findall(code))
+    counts["leftovers"] = sorted(set(LEFTOVER_BUNFS.findall(PREFIX_CONSTANT.sub("", code))))
+    counts["build_paths"] = sorted(set(BUILD_PATH_LEAK.findall(code)))
+    return code, counts
+
+
+def _entry_source(entry_out):
+    return (
+        "// not-rusty-claude: the entry for a code-split (ESM) Claude Code build.\n"
+        "// Claude's own entry module is " + TREE_OUT + "/" + entry_out + "; this\n"
+        "// file only makes sure Bun.ant exists before any of Claude's modules\n"
+        "// evaluate. Bun.ant is a namespace of Anthropic's private Bun build and\n"
+        "// stock Bun has none (docs/findings.md 14). Imports evaluate in order.\n"
+        'import "./' + BUN_ANT_NAME + '";\n'
+        'import "./' + TREE_OUT + "/" + entry_out + '";\n')
+
+
+def _bun_ant_source_dir():
+    """Where the polyfill's files are read from: scripts/, or NRC_BUN_ANT_DIR."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.environ.get("NRC_BUN_ANT_DIR") or os.path.join(here, "..", "scripts")
+
+
+def transform_tree(d):
+    """Build root/, the entry and the polyfill from original/ + manifest.json.
+
+    Returns (totals, errors). Writes into d; on errors the caller must not
+    treat d as an artifact (build.sh only swaps a staged dir in on success).
+    """
+    with open(os.path.join(d, MANIFEST_NAME), encoding="utf-8") as fh:
+        manifest = json.load(fh)
+    errors = []
+    if manifest.get("kind") != MANIFEST_KIND:
+        return {}, ["%s is not an %s manifest" % (MANIFEST_NAME, MANIFEST_KIND)]
+    modules = manifest["modules"]
+    by_path = {m["path"]: m for m in modules}
+    src_root = os.path.join(d, manifest.get("tree", TREE_SRC))
+    out_root = os.path.join(d, TREE_OUT)
+    if os.path.isdir(out_root):
+        shutil.rmtree(out_root)
+    os.makedirs(out_root)
+
+    totals = {"modules": len(modules), "js": 0, "text": 0, "copied": 0,
+              "specifier": 0, "expression": 0, "text_refs": 0,
+              "prefix_constants": 0,
+              "leftovers": [], "build_paths": set()}
+    missing, bad_text, undecodable, unknown = set(), set(), [], []
+    for mod in modules:
+        src = os.path.join(src_root, *mod["path"].split("/"))
+        try:
+            with open(src, "rb") as fh:
+                data = fh.read()
+        except OSError as e:
+            errors.append("module %s is in the manifest but cannot be read (%s)"
+                          % (mod["path"], e.strerror))
+            continue
+        if hashlib.sha256(data).hexdigest() != mod["sha256"]:
+            errors.append("%s does not match the manifest's sha256 - original/ "
+                          "and manifest.json come from different extractions"
+                          % mod["path"])
+            continue
+        out = _out_path(mod)
+        dest = os.path.join(out_root, *out.split("/"))
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        if mod["loader"] in TREE_JS_LOADERS:
+            try:
+                code = _decode(data, mod)
+            except ValueError as e:
+                undecodable.append("%s (%s)" % (mod["path"], e))
+                continue
+            code, c = transform_module(code, out, by_path)
+            totals["prefix_constants"] += c["prefix_constants"]
+            missing |= c["missing"]
+            bad_text |= c["bad_text"]
+            totals["specifier"] += c["specifier"]
+            totals["expression"] += c["expression"]
+            totals["text_refs"] += c["text"]
+            totals["leftovers"] += ["%s: %s" % (out, x) for x in c["leftovers"]]
+            totals["build_paths"] |= set(c["build_paths"])
+            with open(dest, "w", encoding="utf-8") as fh:
+                fh.write(code)
+            totals["js"] += 1
+        elif mod["loader"] == "text":
+            try:
+                text = _decode(data, mod)
+            except ValueError as e:
+                undecodable.append("%s (%s)" % (mod["path"], e))
+                continue
+            with open(dest, "w", encoding="utf-8") as fh:
+                fh.write(_text_module(text))
+            totals["text"] += 1
+        elif mod["loader"] in TREE_COPY_LOADERS:
+            with open(dest, "wb") as fh:
+                fh.write(data)
+            totals["copied"] += 1
+        else:
+            unknown.append("%s (loader %s)" % (mod["path"], mod["loader"]))
+
+    entry = by_path.get(manifest.get("entry"))
+    entry_out = _out_path(entry) if entry else None
+    if entry is None or entry["loader"] not in TREE_JS_LOADERS:
+        errors.append("the manifest's entry %r is not a JavaScript module in it"
+                      % manifest.get("entry"))
+    if undecodable:
+        errors.append("%d module(s) could not be decoded with their recorded "
+                      "content encoding and were not written: %s"
+                      % (len(undecodable), ", ".join(sorted(undecodable))))
+    if unknown:
+        errors.append("%d module(s) have a loader this tool does not know how "
+                      "to place, so they were not written: %s. Add the loader "
+                      "to TREE_COPY_LOADERS once it is known to be read as raw "
+                      "bytes." % (len(unknown), ", ".join(sorted(unknown))))
+    if missing:
+        errors.append("%d /$bunfs/root/ reference(s) name a module the graph "
+                      "does not contain: %s - they would fail at runtime"
+                      % (len(missing), ", ".join(sorted(missing))))
+    if bad_text:
+        errors.append("text module(s) referenced other than through a "
+                      "require()-like call: %s - rewiring them to the .cjs "
+                      "wrapper would hand fs a JavaScript file instead of the "
+                      "text" % ", ".join(sorted(bad_text)))
+    if totals["leftovers"]:
+        errors.append("%d /$bunfs/ reference(s) survived the rewrite: %s. "
+                      "Widen TREE_REF to cover the new shape."
+                      % (len(totals["leftovers"]), "; ".join(totals["leftovers"][:20])))
+    written = totals["js"] + totals["text"] + totals["copied"]
+    if not errors and written != len(modules):
+        errors.append("wrote %d of %d modules" % (written, len(modules)))
+
+    src_dir = _bun_ant_source_dir()
+    for name in BUN_ANT_FILES:
+        if not os.path.isfile(os.path.join(src_dir, name)):
+            errors.append("the Bun.ant polyfill file %s is missing from %s - "
+                          "without it the TUI cannot render (docs/findings.md "
+                          "13)" % (name, src_dir))
+    if errors:
+        return totals, errors
+
+    for name in BUN_ANT_FILES:
+        shutil.copyfile(os.path.join(src_dir, name), os.path.join(d, name))
+    with open(os.path.join(d, ENTRY_NAME), "w", encoding="utf-8") as fh:
+        fh.write(_entry_source(entry_out))
+    # Node decides .js module type from the nearest package.json; Bun does not
+    # need it. Scoped to this directory, and .cjs files stay CommonJS.
+    with open(os.path.join(d, "package.json"), "w", encoding="utf-8") as fh:
+        fh.write('{\n  "private": true,\n  "type": "module"\n}\n')
+    totals["entry"] = TREE_OUT + "/" + entry_out
+    return totals, errors
+
+
+def main_tree(d):
+    totals, errors = transform_tree(d)
+    if totals:
+        print("graph shape            : esm (code-split)")
+        print(f"modules                : {totals['modules']} "
+              f"({totals['js']} js rewritten, {totals['text']} text wrapped, "
+              f"{totals['copied']} copied)")
+        print(f"specifiers made relative: {totals['specifier']}")
+        print(f"paths made runtime-abs : {totals['expression']} "
+              f"(of which text-module requires: {totals['text_refs']})")
+        print(f"VFS prefix constants   : {totals['prefix_constants']} "
+              "(left alone: prefixes compared against, not module paths)")
+        print("image shim applied     : 0  (not applicable: this build has no "
+              "native image processor to gate; images go through Bun.Image)")
+        for path in sorted(totals["build_paths"]):
+            sys.stderr.write(f"note: build-machine path still present: {path}\n")
+    if errors:
+        for e in errors:
+            sys.stderr.write(f"error: {e}\n")
+        sys.exit(1)
+    print(f"wrote: {os.path.join(d, ENTRY_NAME)}  (entry: Bun.ant polyfill, "
+          f"then {totals['entry']})")
+    print(f"wrote: {os.path.join(d, TREE_OUT)}/")
+
+
 def main():
     if len(sys.argv) != 2:
         die("usage: postprocess.py <extract-dir>")
     d = sys.argv[1]
+    if os.path.isfile(os.path.join(d, MANIFEST_NAME)):
+        main_tree(d)
+        return
     src = os.path.join(d, "cli.original.js")
     if not os.path.isfile(src):
         die(f"{src} not found - run extract_bun.py first")

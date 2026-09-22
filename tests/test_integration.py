@@ -21,6 +21,7 @@ Measured on 2026-08-22 against the binaries named below; the gate counts on
 2026-08-23, when they were added.
 """
 
+import re
 import struct
 
 import pytest
@@ -37,12 +38,27 @@ pytestmark = pytest.mark.integration
 # call sites shows up as drift here instead of passing silently, and
 # image_shim dropping to 0 is how a renamed anchor announces itself (that
 # refusal is deliberately NOT fatal in postprocess.py, so nothing else fails).
+#
+# Keyed by the Claude version the entry module declares, so a host whose
+# binary moves between recorded releases keeps passing, and one that reaches
+# an UNRECORDED release says so instead of reporting drift against the wrong
+# release's numbers. 2.1.231 was measured 2026-09-22 on the cached download
+# (~/.cache/not-rusty-claude/claude-linux-x64-2.1.231.bin), once
+# /usr/bin/claude had become a code-split build the legacy tests cannot take.
 MEASURED = {
-    "elf": {"version": "linux-x64 2.1.222", "assets": 5, "file_urls": 7,
-            "gate_calls_before": 21, "gate_calls_after": 20, "image_shim": 1},
-    "macho": {"version": "darwin-arm64 2.1.239", "assets": 9, "file_urls": 8,
-              "gate_calls_before": 23, "gate_calls_after": 22, "image_shim": 1},
+    "elf": {
+        "2.1.222": {"version": "linux-x64 2.1.222", "assets": 5, "file_urls": 7,
+                    "gate_calls_before": 21, "gate_calls_after": 20, "image_shim": 1},
+        "2.1.231": {"version": "linux-x64 2.1.231", "assets": 7, "file_urls": 7,
+                    "gate_calls_before": 24, "gate_calls_after": 23, "image_shim": 1},
+    },
+    "macho": {
+        "2.1.239": {"version": "darwin-arm64 2.1.239", "assets": 9, "file_urls": 8,
+                    "gate_calls_before": 23, "gate_calls_after": 22, "image_shim": 1},
+    },
 }
+
+VERSION_RE = re.compile(r'VERSION:"(\d+\.\d+\.\d+)"')
 
 
 def _entry_source(extract_bun, path):
@@ -66,14 +82,24 @@ def _assert_invariants(postprocess, code):
     return counts
 
 
-def _assert_no_drift(counts, key, binary):
+def _assert_no_drift(counts, key, binary, code):
     """Report EVERY drifted measurement at once, with what to do about it.
 
     Asserting them one at a time short-circuits: a Claude release that shifts
     both counts shows only the first, so the maintainer fixes one number, re-runs,
     and is told about the next one.
     """
-    expected = MEASURED[key]
+    m = VERSION_RE.search(code)
+    version = m.group(1) if m else None
+    if version not in MEASURED[key]:
+        raise AssertionError(
+            "no measurement is recorded for Claude %s (%s). The invariants passed; "
+            "record this release's counts in MEASURED[%r][%r] once its artifact "
+            "has been smoke-tested (docs/runbook.md). Measured now: %s"
+            % (version, binary, key, version,
+               {k: counts[k] for k in ("assets", "file_urls", "gate_calls_before",
+                                       "gate_calls_after", "image_shim")}))
+    expected = MEASURED[key][version]
     drifted = {name: (want, counts[name])
                for name, want in expected.items()
                if name != "version" and counts[name] != want}
@@ -114,9 +140,10 @@ def test_real_elf_transform_invariants_hold(extract_bun, postprocess, real_elf_b
 
 def test_real_elf_measured_counts_have_not_drifted(extract_bun, postprocess,
                                                    real_elf_binary):
-    counts = _assert_invariants(postprocess, _entry_source(extract_bun, real_elf_binary))
+    code = _entry_source(extract_bun, real_elf_binary)
+    counts = _assert_invariants(postprocess, code)
 
-    _assert_no_drift(counts, "elf", real_elf_binary)
+    _assert_no_drift(counts, "elf", real_elf_binary, code)
 
 
 def test_real_macho_binary_extracts(extract_bun, real_macho_binary, tmp_path):
@@ -138,7 +165,7 @@ def test_real_macho_transform_invariants_hold(extract_bun, postprocess,
 
 def test_real_macho_measured_counts_have_not_drifted(extract_bun, postprocess,
                                                      real_macho_binary):
-    counts = _assert_invariants(postprocess,
-                                _entry_source(extract_bun, real_macho_binary))
+    code = _entry_source(extract_bun, real_macho_binary)
+    counts = _assert_invariants(postprocess, code)
 
-    _assert_no_drift(counts, "macho", real_macho_binary)
+    _assert_no_drift(counts, "macho", real_macho_binary, code)
