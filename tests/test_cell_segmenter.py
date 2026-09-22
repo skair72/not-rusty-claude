@@ -8,12 +8,14 @@ honours BUN_OPTIONS=--preload, so tests/cell_segmenter_oracle.cjs can run inside
 it.
 
 tests/data/cell_segmenter_golden.json.gz records what the native class
-answered on 2026-09-22 for 5,904 cases, as one sha256 prefix per case:
-3,904 hand-built by the characterisation (grapheme and width rules, SGR and
-OSC 8 parsing, bidi reordering, paint and setCell against pre-filled screens,
-capacity overflow), plus the generated window 900000000..900001999 of
-tests/cell_segmenter_fuzz.cjs, which is deterministic per index. Here the
-port answers the same cases under stock Bun and every line must hash the same.
+answered on 2026-09-22 for 4,204 cases - each case verbatim, each answer as a
+sha256 prefix: 3,904 hand-built by the characterisation (grapheme and width
+rules, SGR and OSC 8 parsing, bidi reordering, paint and setCell against
+pre-filled screens, capacity overflow) and 300 generated ones. The generated
+ones are stored rather than regenerated: tests/cell_segmenter_fuzz.cjs keeps
+growing new families, and a record that depended on it would drift with it
+(it did, once - 586 "mismatches" that were the generator's). Here the port
+answers the same cases under stock Bun and every line must hash the same.
 A mismatch names its case; `scripts/harness.py --only segmenter` shows the
 diff live against the binary.
 """
@@ -31,14 +33,8 @@ GOLDEN = os.path.join(TESTS, "data", "cell_segmenter_golden.json.gz")
 
 def test_the_port_answers_every_recorded_case_as_the_native_class_did(bun_bin, tmp_path):
     golden = json.loads(gzip.decompress(open(GOLDEN, "rb").read()))
-    window = golden["random_window"]
-    rand = tmp_path / "random.json"
-    r = subprocess.run([bun_bin, os.path.join(TESTS, "cell_segmenter_fuzz.cjs"),
-                        str(window["start"]), str(window["count"]), str(rand)],
-                       capture_output=True, text=True, timeout=300, env={"PATH": "/usr/bin:/bin"})
-    assert r.returncode == 0, r.stderr
-    cases = golden["hand_cases"] + json.load(open(rand))
-    assert len(cases) == len(golden["sha256_24"]) == 5904
+    cases = golden["cases"]
+    assert len(cases) == len(golden["sha256_24"]) == 4204
 
     case_file, out_file = tmp_path / "cases.json", tmp_path / "port.jsonl"
     case_file.write_text(json.dumps(cases))

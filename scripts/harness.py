@@ -910,8 +910,14 @@ def check_segmenter(ctx):
 
 
 def check_pytest(ctx):
+    env = dict(os.environ, BUN_BIN=ctx.bun)
+    # The Node tests drive a LEGACY artifact (cli.original.cjs); hand them the
+    # one just built only if that is what it is.
+    legacy = os.path.join(ctx.extract_dir, "cli.original.cjs") if ctx.artifact else ""
+    if legacy and os.path.isfile(legacy):
+        env["NRC_TEST_ARTIFACT"] = legacy
     r = run([sys.executable, "-m", "pytest", os.path.join(REPO, "tests"), "-q", "-p", "no:cacheprovider"],
-            dict(os.environ, NRC_TEST_ARTIFACT=ctx.artifact or ""), cwd=REPO, timeout=1800)
+            env, cwd=REPO, timeout=1800)
     tail = r["stdout"].strip().splitlines()[-1:] or [""]
     return [Result("pytest", "PASS" if r["rc"] == 0 else "FAIL", tail[0],
                    {"failures": [l for l in r["stdout"].splitlines() if l.startswith("FAILED")][:30]})]

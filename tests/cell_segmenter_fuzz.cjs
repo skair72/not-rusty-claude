@@ -357,7 +357,40 @@ FAMILIES.bidigate = (R) => {
   steps.push({ op: "tables" });
   return steps;
 };
-const WEIGHTS = [[5, "text"], [3, "escapes"], [2, "bidi"], [4, "paint"], [1, "setCell"], [2, "capacity"], [2, "lifecycle"], [2, "claude"], [2, "kernelcap"], [1, "long256"], [1, "bidiexplicit"], [1, "bidigate"]];
+// Paint with wide and extra-wide cells (a base + U+302E sums to width 3, CJK + U+302E to 4) at
+// negative / edge x over screens full of WIDE/TAIL/HEAD pairs: clipping and orphan cleanup.
+const WIDE_ATOMS = ["a\u302e", "\u4e2d\u302e", "\u4e2d", "\u6587", "a", "b", "\u302e\u302e", "x\u302e\u302e", "\t", "\u{1f600}", " ", "\u0301", "\x1b[31m", "\x1b[0m"];
+function wideScreen(R, w, h) {
+  const out = [];
+  for (let row = 0; row < h; row++) {
+    let c = 0;
+    while (c < w) {
+      const k = R.weighted([[5, "w"], [2, "n"], [1, "t"], [1, "h"], [1, "e"]]);
+      if (k === "w" && c + 1 < w) { out.push(R.range(100, 900), (R.int(20) << 17) | 1, 1, 2); c += 2; continue; }
+      if (k === "t") out.push(1, 2); else if (k === "h") out.push(0, 3); else if (k === "e") out.push(0, 0);
+      else out.push(R.range(100, 900), R.int(20) << 17);
+      c++;
+    }
+  }
+  return out;
+}
+FAMILIES.paintwide = (R) => {
+  const steps = [];
+  let prev = false;
+  for (let k = R.range(1, 4); k > 0; k--) {
+    let text = "";
+    for (let q = R.range(1, 8); q > 0; q--) text += R.pick(WIDE_ATOMS);
+    steps.push({ op: "segment", text, reordered: false });
+    const w = R.range(1, 16), h = R.range(1, 2);
+    const st = { op: "paint", w, h, x: R.weighted([[4, () => R.range(-8, -1)], [3, () => R.range(0, w)], [1, () => R.range(w - 4, w + 2)]])(), y: R.range(0, h - 1),
+      charMap: R.pick(["offset", "identity"]), wordMode: R.pick(["distinct", "zero"]) };
+    if (prev && R.chance(0.3)) st.keep = true; else st.init = wideScreen(R, w, h);
+    steps.push(st);
+    prev = true;
+  }
+  return steps;
+};
+const WEIGHTS = [[5, "text"], [3, "escapes"], [2, "bidi"], [4, "paint"], [1, "setCell"], [2, "capacity"], [2, "lifecycle"], [2, "claude"], [2, "kernelcap"], [1, "long256"], [1, "bidiexplicit"], [1, "bidigate"], [1, "paintwide"]];
 
 function genCase(i, family) {
   const R = rngFor(i);
