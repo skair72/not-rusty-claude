@@ -169,3 +169,57 @@ def test_real_macho_measured_counts_have_not_drifted(extract_bun, postprocess,
     counts = _assert_invariants(postprocess, code)
 
     _assert_no_drift(counts, "macho", real_macho_binary, code)
+
+
+# --- the code-split shape (2.1.280+, docs/findings.md 14) ---------------------
+#
+# Same split as above: the invariants are tool contracts, MEASURED_ESM is what a
+# particular release happens to contain. Measured 2026-09-22 on the host's
+# /usr/bin/claude.
+MEASURED_ESM = {
+    "2.1.280": {"modules": 2196, "js": 1975, "text": 84, "copied": 137,
+                "specifier": 138195, "expression": 485, "text_refs": 84,
+                "prefix_constants": 1},
+}
+
+
+def _tree_version(out):
+    entry = (out / "original" / "cli").read_text(encoding="latin-1")
+    m = VERSION_RE.search(entry) or re.search(r"// Version: (\d+\.\d+\.\d+)", entry)
+    return m.group(1) if m else None
+
+
+def test_real_esm_binary_extracts_to_a_tree(extract_bun, real_esm_binary, tmp_path):
+    out = tmp_path / "x"
+    extract_bun.extract(real_esm_binary, str(out))
+
+    manifest = __import__("json").loads((out / "manifest.json").read_text())
+    loaders = {m["loader"] for m in manifest["modules"]}
+    assert {"js", "text", "file", "napi"} <= loaders
+    assert manifest["entry"] == "cli"
+    # every module on disk, byte count as recorded
+    for m in manifest["modules"]:
+        assert (out / "original" / m["path"]).stat().st_size == m["size"], m["path"]
+    # findings 5a still holds: stored content is raw bytes - an ELF addon
+    addon = next(m for m in manifest["modules"] if m["loader"] == "napi")
+    assert (out / "original" / addon["path"]).read_bytes()[:4] == b"\x7fELF"
+
+
+def test_real_esm_tree_rewires_cleanly_and_counts_have_not_drifted(
+        extract_bun, postprocess, real_esm_binary, tmp_path):
+    out = tmp_path / "x"
+    extract_bun.extract(real_esm_binary, str(out))
+    totals, errors = postprocess.transform_tree(str(out))
+
+    assert errors == [], errors                       # invariant
+    assert totals["leftovers"] == []                  # invariant
+    assert (out / "cli.js").is_file() and (out / "root" / "cli.js").is_file()
+
+    version = _tree_version(out)
+    if version not in MEASURED_ESM:
+        raise AssertionError(
+            "no measurement recorded for code-split Claude %s; invariants passed. "
+            "Record it in MEASURED_ESM once the harness is green: %s"
+            % (version, {k: totals[k] for k in MEASURED_ESM["2.1.280"]}))
+    drifted = {k: (v, totals[k]) for k, v in MEASURED_ESM[version].items() if totals[k] != v}
+    assert not drifted, "Claude %s changed shape (expected, measured): %s" % (version, drifted)
