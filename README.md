@@ -18,6 +18,41 @@ never modified, never executed by this pipeline.
 
 ## Status — what works, and exactly how far that goes
 
+### Claude Code 2.1.280: a new shape, verified against the native binary ✅
+
+From **2.1.280** Claude Code is no longer one CommonJS file. It is a
+**code-split ES-module graph** of 2,196 modules, built on Anthropic's *private*
+Bun 1.4.3 (`@anthropic-ai/bun-internal`). That Bun adds a `Bun.ant` namespace
+which stock Bun does not have, and Ink cannot draw a single cell without
+`Bun.ant.CellSegmenter`. The pipeline now handles both shapes. It tells them
+apart by the entry module's own format byte, rewires every
+`/$bunfs/root/` reference by context, and puts an entry of its own in front
+that installs a `Bun.ant` polyfill. The details are in
+[`docs/findings.md`](docs/findings.md) §14.
+
+**How it is verified: `make harness`.** `scripts/harness.py` builds the
+artifact, then runs the same scenario through the native binary and the
+artifact, and compares what each one did. Measured on this host on 2026-09-22
+against `/usr/bin/claude` 2.1.280, under stock Bun 1.3.14:
+
+| check | artifact vs native |
+|---|---|
+| structure, parse | 138,198 specifiers and 485 runtime paths resolve; 2,062 modules parse |
+| text modules | all 84 `require()` to the native string (sha256 + length) |
+| `--version`, `--help`, `mcp list`, `mcp add`/`get`/`remove`, `plugin list`, `auth status` | stdout and exit code **equal** |
+| `doctor` | equal bar the install-identity lines, which are the [equivalence gap](docs/findings.md) |
+| 8 mock-API agentic turns: text, Bash, Read, Read of a 3000×3000 PNG, Grep, Write, Glob, function hooks | tool results **and the full request bodies** byte-equal |
+| TUI under a pty: onboarding, a REPL turn, a REPL turn full of CJK, emoji, bidi text, a table and a code block | **whole screens identical**; exit code 0; terminal restored |
+| `Bun.ant` members, probed inside the native runtime | identical answers |
+
+**What it is not.** The same gaps apply as before: the sandbox is off, ripgrep
+is the system `rg` and install identity reads `unknown`. On top of that,
+startup is **4–7× slower** than native (`--help` takes 1.2 s against 0.16 s),
+because the native runtime runs JSC bytecode that a different WebKit build
+cannot load. A code-split build does **not** run under Node yet
+([§ Under Node](#under-node-instead-of-bun)). The table below is the record for
+the legacy (single-file) builds up to 2.1.241.
+
 Verified on Linux x86_64 (Debian 12, glibc 2.36); commands and output in
 [`docs/verification-2026-08-22.md`](docs/verification-2026-08-22.md) and
 [`docs/findings.md`](docs/findings.md). The table is measured **on this Linux
@@ -100,8 +135,13 @@ BUN_BIN="$HOME/.bun-1.3.14/bun" scripts/build.sh /usr/bin/claude
 #    install a different, npm-based Claude Code onto your machine. See
 #    docs/runbook.md § Surviving Claude updates.
 DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \
-  "$HOME/.bun-1.3.14/bun" build/extract/cli.original.cjs mcp list
+  "$HOME/.bun-1.3.14/bun" build/extract/cli.js mcp list
 #   → No MCP servers configured. Use `claude mcp add` to add a server.
+#   cli.js is the entry for both shapes: the code-split build's own entry
+#   (2.1.280+), or the sibling that requires cli.original.cjs (legacy builds).
+
+# 4. optional: judge the artifact against the native binary, check by check
+make harness
 ```
 
 **Three safety properties, all deliberate.** `build.sh` **installs nothing on
@@ -128,7 +168,17 @@ section below first.
 
 ### Under Node instead of Bun
 
-Yes — **Node ≥ 24 only**: the bundle's `using` declarations (ES explicit
+**A code-split build (2.1.280+) does not run under Node yet**, and `make
+node-run` refuses one and says why. There are three walls, measured with Node
+24.21.0. Node has no `import.meta.require`, which the bundle calls at 445
+sites. Node's ES-module resolver ignores `NODE_PATH`, which is how `ws` and
+`undici` are supplied. The third is structural: Node refuses to `require()` an
+ES module inside an import cycle that is still evaluating
+(`ERR_REQUIRE_CYCLE_MODULE`), and Bun allows it. A preload hook gets past the
+first two; the third would mean changing module evaluation order. What follows
+is the record for legacy builds.
+
+Legacy builds: yes — **Node ≥ 24 only**: the bundle's `using` declarations (ES explicit
 resource management) are a parse error before that — `node --check` fails on
 22.23.2 and 23.11.1, passes on 24.0.0 and 26.7.0. Node also has no `ws`, no
 `undici` and no `Bun` global; the targets below and `scripts/bun-shim.cjs`
@@ -324,9 +374,14 @@ not-rusty-claude/
 ├── tools/
 │   ├── extract_bun.py              extract cli.js + assets from the Bun section
 │   └── postprocess.py              make cli.js runnable under an external Bun,
-│                                   plus the scoped image shim (findings §10)
+│                                   plus the scoped image shim (findings §10);
+│                                   rewires a code-split tree (findings §14)
 ├── scripts/
 │   ├── build.sh                    extract → post-process → print the run command
+│   ├── harness.py                  artifact-vs-native verification (make harness)
+│   ├── vtscreen.py                 a small terminal emulator the harness reads TUIs with
+│   ├── bun-ant.mjs                 Bun.ant polyfill for the code-split (2.1.280+) builds
+│   ├── bun-ant-cell-segmenter.mjs  …its CellSegmenter, fuzzed against the native class
 │   ├── bun-shim.cjs                globalThis.Bun stand-in, so Node ≥ 24 can run it
 │   ├── trim-config.py              bisect a global config that breaks startup
 │   ├── node-trace.cjs              diagnostic preload: what blocked, and where

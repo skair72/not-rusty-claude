@@ -35,6 +35,34 @@ surface ([findings.md](./findings.md) §9).
 transforms; [verification-2026-08-22.md](./verification-2026-08-22.md) is the
 evidence record.
 
+**As of 2026-09-22 the host's binary is Claude Code 2.1.280**, and that is a
+different kind of binary: a code-split ES-module graph on Anthropic's private
+Bun 1.4.3, whose `Bun.ant` namespace stock Bun lacks ([findings.md](./findings.md)
+§14). The pipeline builds it, and [§ 2.1.280](#claude-code-21280-code-split)
+below records how it was verified against the native binary. Everything
+between here and there is the record of the legacy single-file builds.
+
+---
+
+## Claude Code 2.1.280 (code-split)
+
+Verified 2026-09-22 on linux-x64 `/usr/bin/claude` 2.1.280 under stock Bun
+1.3.14 by `scripts/harness.py` (`make harness`), which runs every scenario
+through the native binary **and** the artifact and compares them.
+
+| Capability | linux-x64 · ELF · 2.1.280 |
+|---|---|
+| Extract (esm tree + manifest) | ✅ 2,196 modules: 1,975 js, 84 text (20 of them UTF-16LE), 135 file, 2 napi |
+| Rewire + parse | ✅ 138,198 relative specifiers and 485 runtime-absolute paths, all resolving; 2,062 modules parsed by Bun |
+| Text modules | ✅ 84/84 `require()` to the native string |
+| Non-interactive commands | ✅ `--version`, `--help`, `mcp list`, `mcp add/get/remove`, `plugin list`, `auth status` byte-equal; `doctor` bar install identity |
+| Agentic turns through a loopback mock | ✅ 8 turns: tool results and full request bodies byte-equal, the 3000×3000 PNG resized to the same 2000×2000 bytes |
+| Interactive TUI (pty, screens through `scripts/vtscreen.py`) | ✅ onboarding, a REPL turn, and a REPL turn full of CJK/emoji/bidi/table/code — whole screens identical; clean exit |
+| `Bun.ant` polyfill | ✅ `CellSegmenter` fuzzed against the native class; `getPeerPid`/`getPeerUid`/`setDumpable` via `bun:ffi`; `memoryPressureLevel` throws as native does off macOS |
+| Runs under Node ≥ 24 | ⛔ not yet: `import.meta.require`, ESM ignoring `NODE_PATH`, and `ERR_REQUIRE_CYCLE_MODULE` (findings §14) |
+| Behaves the same as the native binary | ⚠️ the legacy gaps (sandbox, ripgrep, install identity), plus 4–7× slower startup, plus one latent gap: built-in plugin hooks resolve to a dev-tree `hooks/register.ts` outside a standalone — not reachable in any configuration the harness can create (findings §14) |
+| darwin / win32 2.1.280 | not measured: no code-split Mach-O or PE has been examined |
+
 ---
 
 ## Legend
@@ -227,6 +255,8 @@ mysterious.
 ### 1. Re-measure when Claude Code updates
 
 The counts in this repo are facts about **specific versions**, not constants.
+From 2.1.280 on, `make harness` is the verdict: it builds the new release and
+compares it against its own native binary, check by check.
 
 - **Verify:** re-run `scripts/build.sh <native-binary>` and
   `python3 -m pytest tests/ -q`. The integration tests hardcode the measured

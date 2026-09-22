@@ -193,6 +193,40 @@ artifact, not a complaint about it.
 `build.sh` needs Bun only to *report* its version — extraction and
 post-processing are pure Python. Without `BUN_BIN` it warns and continues.
 
+### A code-split build (2.1.280 and later)
+
+From 2.1.280 the binary carries a **code-split ES-module graph** built on
+Anthropic's private Bun, not one CommonJS file ([findings.md](./findings.md)
+§14). `build.sh` recognises it from the entry module's own format byte and
+builds a different artifact:
+
+```
+Modules: 2196 (entry id=5)
+  entry   js           21 KB -> .../original/cli  (esm, code-split)
+  loaders: file=135, js=1975, napi=2, text=84
+graph shape            : esm (code-split)
+modules                : 2196 (1975 js rewritten, 84 text wrapped, 137 copied)
+specifiers made relative: 138195
+paths made runtime-abs : 485 (of which text-module requires: 84)
+VFS prefix constants   : 1 (left alone: prefixes compared against, not module paths)
+image shim applied     : 0  (not applicable: this build has no native image processor to gate; images go through Bun.Image)
+```
+
+(linux-x64 2.1.280, 2026-09-22.) The artifact is a directory, not a file:
+
+| path | what it is |
+|---|---|
+| `build/extract/cli.js` | **the entry** — ours: installs the `Bun.ant` polyfill, then imports Claude's own entry |
+| `build/extract/root/` | the rewired module tree, 2,196 files |
+| `build/extract/bun-ant.mjs`, `bun-ant-cell-segmenter.mjs` | the polyfill (`scripts/`), copied beside the entry |
+| `build/extract/original/`, `manifest.json` | the verbatim extraction, kept so a re-run of `postprocess.py` is reproducible |
+
+**Always run `cli.js`, never `root/cli.js`.** Claude's own entry module does
+not install `Bun.ant`, and without `Bun.ant.CellSegmenter` Ink cannot render —
+`mcp list` then prints nothing and exits by `SIGKILL` (exit 137). `cli.js` is
+also the run command for a legacy build (there it is the one-line sibling that
+requires `cli.original.cjs`), so `build/extract/cli.js` works in both shapes.
+
 ---
 
 ## 3. Check the output parses
@@ -201,6 +235,10 @@ post-processing are pure Python. Without `BUN_BIN` it warns and continues.
 "$BUN_BIN" build --no-bundle --target=bun \
   build/extract/cli.original.cjs --outfile=/dev/null
 ```
+
+For a code-split build there are 2,062 modules to check, not one file:
+`scripts/harness.py --only structure,parse` parses every one of them with Bun's
+own transpiler and resolves every rewritten specifier and runtime path.
 
 This is Bun's **own** parser/transpiler, the same one that will load the file —
 the authoritative syntax check (~2 s). `scripts/syntax-check.js` is a faster
@@ -352,8 +390,21 @@ BUN_BIN="$HOME/.bun-1.3.14/bun" scripts/build.sh "$NATIVE"
 python3 -m pytest tests/ -q     # what this prints depends on what the host has;
                                 # the per-host counts are README's table alone
 DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \
-  "$BUN_BIN" build/extract/cli.original.cjs mcp list   # not --version
+  "$BUN_BIN" build/extract/cli.js mcp list   # not --version
+make harness                    # the release's definition of done, below
 ```
+
+**`make harness`** (`scripts/harness.py`) is how a new release is judged. It
+builds from the native binary, then runs the same scenario through the native
+binary and the artifact and compares them: module structure and parse, text
+modules, the non-interactive commands, mock-API agentic turns (tool results
+**and** the full request bodies), the TUI under a pty (whole screens, through
+the stdlib emulator `scripts/vtscreen.py`), `Bun.ant` probes run inside the
+native runtime, a `CellSegmenter` fuzz and the suite. It prints PASS/FAIL per
+check and writes `build/harness/report.json`; the loop is run it, fix the first
+failure, run it again. It **executes** the native binary, which the build
+pipeline never does — every run gets a throwaway `HOME`, `DISABLE_AUTOUPDATER`,
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` and a loopback mock as its API.
 
 A failed rebuild is safe: `build.sh` extracts into a staging directory and swaps
 it in only after post-processing succeeds, so `build/extract/` still holds the
@@ -388,6 +439,8 @@ Two things to expect:
 |---|---|---|
 | `Expected CommonJS module to have a function wrapper` | **Ambiguous** — Bun older than 1.3.14, *or* the pragma/IIFE transform did not apply, *or* the pragma was kept **and** the IIFE appended (findings §6's 2×2). Not a reliable "Claude needs a newer Bun" canary | Confirm `bun --version` ≥ 1.3.14; confirm `cli.original.cjs` starts with `(function` and ends with the `(exports, require, module, …)` call |
 | `TypeError: … is not a function` naming a `Bun.*` property | **This** is the missing-API signal — findings §9's risk | Pin to an older Claude version, or shim the API |
+| `mcp list` prints nothing and exits 137 (`SIGKILL`); or `This build of @anthropic-ai/bun-internal has no Bun.ant.CellSegmenter` | A code-split build run **without** its `Bun.ant` polyfill: Ink throws on unmount inside `process.exit()`, and Claude's `forceExit()` answers that with `SIGKILL` (findings §14) | Run `build/extract/cli.js`, not `root/cli.js`; rebuild if `bun-ant.mjs` is missing beside it |
+| `import.meta.require is not a function` / `ERR_REQUIRE_CYCLE_MODULE` under Node | A code-split (2.1.280+) build under Node. Not supported yet: Node has no `import.meta.require`, and refuses `require()` of an ES module inside an import cycle that Bun allows (findings §14) | Run it under Bun; `make node-run` refuses a code-split build for this reason |
 | Images are refused with *"Unable to resize image…"* | **Not expected in a default build.** It means the artifact predates the shim, was built with `NRC_NO_IMAGE_SHIM` non-empty, or the shim refused on this Claude release | `grep -o 'if(true)try' build/extract/cli.original.cjs \| wc -l` prints **1** for a shimmed build and **0** for an as-shipped one (measured on all three real binaries). If 0, rebuild without the env var and read the `image shim` lines: a refusal names which of three things drifted — the gate **declaration**'s minified shape, the **anchor** string, or the `if(<gate>())try{` branch shape (findings §10). Never "fix" it by flipping `Bun.isStandaloneExecutable` globally: measured, that silently breaks `Grep` |
 | `ripgrep not found on PATH` | Embedded ripgrep needs a standalone; this build uses a system `rg` (findings §10) | Install `ripgrep` |
 | Missing `rg` does **not** always announce itself | Observed 2026-08-26 on a Mac with no ripgrep: the file-scan spawns fail with `ENOENT` and the TUI simply never paints - no message, no error, no exit. The failure is silent because the spawn error arrives asynchronously; `scripts/node-trace.cjs` is what made it visible, and only after it learned to follow children to their exit | `command -v rg` before blaming the runtime. Note `USE_BUILTIN_RIPGREP` cannot substitute: the embedded copy is gated behind standalone mode, which this build is not |
