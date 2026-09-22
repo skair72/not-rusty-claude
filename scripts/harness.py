@@ -745,20 +745,54 @@ def check_tui(ctx):
                            "rc": [screens["native"]["rc"], screens["artifact"]["rc"]],
                            "artifact_screen": screens["artifact"]["picker"][-3000:]}))
 
-    # 2. the REPL: one turn through the mock, then Ctrl-C twice
+    # 2. the REPL: one turn through the mock, then Ctrl-C twice - once with a
+    #    plain answer, once with an answer built to exercise every class of
+    #    text the Bun.ant.CellSegmenter port handles, rendered by Ink the way a
+    #    real reply is (markdown, a table, a code block, a link)
+    for name, text in (("repl", "MOCK-DONE"), ("repl-unicode", UNICODE_REPLY)):
+        results.append(_tui_repl(ctx, name, text))
+    return results
+
+
+# An answer that leaves the ASCII fast path everywhere: CJK (wide), a ZWJ
+# family and a flag (multi-code-point graphemes), a precomposed and a
+# combining e-acute, Arabic and Hebrew (bidi reordering), a tab, markdown
+# emphasis, a table, a fenced code block, a link, and a line long enough to
+# wrap at 100 columns. MOCK-DONE stays on its own line so the harness can
+# tell the answer has arrived.
+UNICODE_REPLY = (
+    "MOCK-DONE\n\n"
+    "Wide: \u4e2d\u6587\u5b57\u7b26 \uff21\uff22 | emoji: \U0001F469\u200d\U0001F469\u200d\U0001F467\u200d\U0001F466 "
+    "\U0001F1FA\U0001F1E6 \u2764\ufe0f | caf\u00e9 cafe\u0301 | tab\tafter\n\n"
+    "Bidi: \u0645\u0631\u062d\u0628\u0627 \u05e9\u05dc\u05d5\u05dd and back to LTR (123)\n\n"
+    "**bold** *italic* `inline code` and a [link](https://example.com/path?q=1)\n\n"
+    "| col | \u5217 |\n|---|---|\n| a | \u4e2d |\n| \U0001F600 | b |\n\n"
+    "```python\nprint(\"\u4e2d\u6587\")  # comment\n```\n\n"
+    + "A long line that must wrap: " + " ".join("word%d" % i for i in range(40)) + "\n")
+
+# The one line two identical runs still draw differently: the spinner verb is
+# chosen at random ("Brewed", "Churned", ...) and the clock is the clock.
+_TUI_VOLATILE = re.compile(r"^(\s*\S)\s+\w+ for [0-9hms ]+(?: · done \d{1,2}:\d{2}(?: [AP]M)?)?\s*$")
+
+
+def _tui_normalize(text):
+    return "\n".join(_TUI_VOLATILE.sub(r"\1 <STATUS>", l) for l in (text or "").splitlines())
+
+
+def _tui_repl(ctx, name, reply):
     screens = {}
     for side in ("native", "artifact"):
-        home = ctx.scratch("tui", "repl", side)
+        home = ctx.scratch("tui", name, side)
         work = os.path.join(home, "work")
         os.makedirs(work)
-        mock = Mock(ctx, "tui-" + side, tool="none", text="MOCK-DONE")
+        mock = Mock(ctx, "tui-%s-%s" % (name, side), tool="none", text=reply)
         try:
             env = ctx.base_env(home, mock.port)
             _seed_repl_config(env, work)
             rc, scr, snaps, tl = pty_session(ctx.argv(side), env, work, [
                 ("until", "for shortcuts", 40), ("wait", 1.0), ("snap", "ready"),
                 ("send", "say hi"), ("wait", 0.5), ("send", "\r"),
-                ("until", "MOCK-DONE", 40), ("wait", 1.5), ("snap", "answered"),
+                ("until", "MOCK-DONE", 40), ("wait", 2.0), ("snap", "answered"),
                 ("send", "\x03"), ("wait", 0.5), ("send", "\x03"), ("wait", 2)], total_timeout=120)
             screens[side] = {"rc": rc, "snaps": snaps, "found": tl, "final": scr.text(),
                              "requests": mock.requests(), "alt": scr.alt_active,
@@ -766,26 +800,23 @@ def check_tui(ctx):
         finally:
             mock.stop()
     n, a = screens["native"], screens["artifact"]
-
-    def core(text):
-        # the answer block: from the prompt echo down to the MOCK-DONE line
-        lines = [l for l in (text or "").splitlines() if l.strip()]
-        keep = [l for l in lines if "say hi" in l or "MOCK-DONE" in l]
-        return keep
-    answered = "MOCK-DONE" in a["snaps"].get("answered", "")
-    same_core = core(n["snaps"].get("answered")) == core(a["snaps"].get("answered"))
+    ns, as_ = _tui_normalize(n["snaps"].get("answered")), _tui_normalize(a["snaps"].get("answered"))
+    answered = "MOCK-DONE" in as_
+    same = ns == as_
+    ready_same = _tui_normalize(n["snaps"].get("ready")) == _tui_normalize(a["snaps"].get("ready"))
     clean_exit = a["rc"] == n["rc"] == 0 and a["cursor_visible"] and not a["alt"]
     resume = "--resume" in a["final"]
-    ok = answered and same_core and clean_exit and resume and len(a["requests"]) == len(n["requests"])
-    results.append(Result("tui:repl", "PASS" if ok else "FAIL",
-                          "answered=%s same=%s exit rc %s/%s restored=%s resume-hint=%s" % (
-                              answered, same_core, n["rc"], a["rc"], clean_exit, resume),
-                          {"native_answered": n["snaps"].get("answered", "")[-2500:],
-                           "artifact_answered": a["snaps"].get("answered", "")[-2500:],
-                           "artifact_ready": a["snaps"].get("ready", "")[-2500:],
-                           "artifact_final": a["final"][-1500:],
-                           "requests": [n["requests"], a["requests"]]}))
-    return results
+    ok = (answered and same and ready_same and clean_exit and resume
+          and len(a["requests"]) == len(n["requests"]))
+    return Result("tui:" + name, "PASS" if ok else "FAIL",
+                  "answered=%s screen %s, ready screen %s, exit rc %s/%s restored=%s resume-hint=%s" % (
+                      answered, "identical" if same else "DIFFERS",
+                      "identical" if ready_same else "DIFFERS", n["rc"], a["rc"], clean_exit, resume),
+                  {"first_diff": first_diff(ns, as_),
+                   "native_answered": n["snaps"].get("answered", "")[-4000:],
+                   "artifact_answered": a["snaps"].get("answered", "")[-4000:],
+                   "artifact_final": a["final"][-1500:],
+                   "requests": [n["requests"], a["requests"]]})
 
 
 # ------------------------------------------------------------------ Bun.ant
