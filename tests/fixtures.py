@@ -12,27 +12,41 @@ OFFSET_STRUCT_SIZE = 32
 MODULE_RECORD_SIZE = 52
 
 
+FORMAT_ESM = 1        # record offset 50 (docs/findings.md 14)
+ENC_LATIN1, ENC_UTF16LE = 1, 2   # record offset 48
+
+
 def build_payload(modules, entry=0):
-    """modules: list of (name, content_bytes, loader_id). Returns payload bytes.
+    """modules: list of (name, content_bytes, loader_id[, format[, encoding]]).
+    Returns payload bytes.
+
+    The optional format (record offset 50) and encoding (offset 48) bytes
+    default to 0, which is how every fixture older than the code-split shape
+    was built - and what keeps them on the legacy extraction path.
 
     Layout: [names+contents blob][modules table][32-byte offsets][trailer]
     """
     blob = bytearray()
     slots = []
-    for name, content, loader in modules:
+    for spec in modules:
+        name, content, loader = spec[:3]
+        fmt = spec[3] if len(spec) > 3 else 0
+        enc = spec[4] if len(spec) > 4 else 0
         name_bytes = name.encode("utf-8")
         name_off = len(blob)
         blob += name_bytes
         content_off = len(blob)
         blob += content
-        slots.append((name_off, len(name_bytes), content_off, len(content), loader))
+        slots.append((name_off, len(name_bytes), content_off, len(content), loader, fmt, enc))
 
     modules_offset = len(blob)
     table = bytearray()
-    for name_off, name_size, content_off, content_size, loader in slots:
+    for name_off, name_size, content_off, content_size, loader, fmt, enc in slots:
         rec = bytearray(MODULE_RECORD_SIZE)
         struct.pack_into("<IIII", rec, 0, name_off, name_size, content_off, content_size)
+        rec[48] = enc
         rec[49] = loader
+        rec[50] = fmt
         table += rec
     blob += table
 
