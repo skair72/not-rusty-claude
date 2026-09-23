@@ -129,8 +129,9 @@ def _real_shaped(env_var, want_esm, magic, kind, *defaults):
             return path
         seen.append(f"{path} (entry format {fmt})")
     shape = "code-split (esm)" if want_esm else "legacy (cjs)"
-    pytest.skip(f"no {shape} {kind} Claude binary among "
-                f"{', '.join(seen) or 'the defaults'}; set {env_var}")
+    tried = ", ".join(seen) or (f"{override} (named by {env_var}; not a file)" if override
+                                else "the defaults " + ", ".join(defaults))
+    pytest.skip(f"no {shape} {kind} Claude binary among {tried}; set {env_var}")
 
 
 @pytest.fixture(scope="session")

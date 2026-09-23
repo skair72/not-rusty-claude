@@ -866,15 +866,23 @@ def check_agentic(ctx):
 # ------------------------------------------------------------------ the TUI
 
 def _seed_repl_config(env, work):
-    cfg = os.path.join(env["CLAUDE_CONFIG_DIR"], ".claude.json")
-    # prefersReducedMotion: the mascot's startup entrance is drawn at random from
-    # skip/jump/look/spin, so two identical runs would animate differently
+    """An onboarded, trusted, API-key-approved config - and no random motion.
+
+    The mascot's startup entrance is drawn at random from skip/jump/look/spin
+    whenever the config records no entrance for this version, so two
+    identical runs animate differently (measured: one side mid-jump in the
+    ready snapshot). Both switches are Claude's own: lastClawdEntranceVersion
+    in the global config says the entrance was seen, and prefersReducedMotion
+    - a SETTING, read from settings.json, not from .claude.json - turns the
+    animations off."""
+    cfg_dir = env["CLAUDE_CONFIG_DIR"]
     json.dump({"hasCompletedOnboarding": True, "theme": "dark", "numStartups": 3,
-               "prefersReducedMotion": True,
+               "lastClawdEntranceVersion": "999.0.0",
                "customApiKeyResponses": {"approved": [FAKE_KEY[-20:]], "rejected": []},
                "projects": {work: {"hasTrustDialogAccepted": True,
                                    "hasCompletedProjectOnboarding": True}}},
-              open(cfg, "w"))
+              open(os.path.join(cfg_dir, ".claude.json"), "w"))
+    json.dump({"prefersReducedMotion": True}, open(os.path.join(cfg_dir, "settings.json"), "w"))
 
 
 def _below(plain, styled, marker):

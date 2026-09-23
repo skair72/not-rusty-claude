@@ -408,35 +408,39 @@ run's, reconciled below rather than written out twice — the repo's convention
 being that **a measured figure is stated in one place, and appears elsewhere
 only as quoted command output labelled with the binary and date that produced
 it.** These counts *move*, in both directions, as test files are added and removed —
-which is exactly why. Every row was re-measured here on 2026-08-27
+which is exactly why. Every row was re-measured here on 2026-09-23
 by forcing it with the variables named beside it; `--collect-only` reports the
-same total, **304**, in all six configurations, because what the host has
-changes the skips, never the collection.
+same total, **374**, in all six configurations, because what the host has
+changes the skips, never the collection. "Binaries" are three now: a legacy
+(single-file) ELF, a code-split ELF (2.1.280+) and the Mach-O. The first row
+had all three - the cached 2.1.231 download, `/usr/bin/claude` 2.1.280 and
+`darwin-arm64` 2.1.239 - plus a legacy artifact built by `make build` for the
+Node tests.
 
 | host has | result | how the row was forced |
 | --- | --- | --- |
-| both binaries, Bun, Node 24 | **304 passed** | `NRC_TEST_NODE=…/v24.19.0/bin/node` (this host's own `node` is 22.23.2) |
-| …no Mach-O | 299 passed, 5 skipped | `NRC_TEST_MACHO=/nonexistent/macho` |
-| …no ELF | 299 passed, 5 skipped | `NRC_TEST_ELF=/nonexistent/elf` |
-| …neither binary | 294 passed, 10 skipped | both of those two variables at once |
-| …and no Bun | 220 passed, 84 skipped | …plus `BUN_BIN=/nonexistent/bun` and a `HOME` with no Bun under it |
-| none of them, Node 22 | 191 passed, 113 skipped | …and drop `NRC_TEST_NODE` — the command below |
+| all three binaries, Bun, Node 24 | **374 passed** | `NRC_TEST_NODE=…/node-v24.21.0-linux-x64/bin/node` (this host's own `node` is 22.23.2) |
+| …no Mach-O | 369 passed, 5 skipped | `NRC_TEST_MACHO=/nonexistent/macho` |
+| …no ELF | 367 passed, 7 skipped | `NRC_TEST_ELF=/nonexistent/elf NRC_TEST_ESM=/nonexistent/esm` |
+| …no binary at all | 362 passed, 12 skipped | all three of those variables at once |
+| …and no Bun | 254 passed, 120 skipped | …plus `BUN_BIN=/nonexistent/bun` and a `HOME` with no Bun under it |
+| none of them, Node 22 | 225 passed, 149 skipped | …and drop `NRC_TEST_NODE` — the command below |
 
-Every row adds up to 304, and the skips decompose — counted from each run's own
+Every row adds up to 374, and the skips decompose — counted from each run's own
 `-rs` skip reasons, not inferred from the totals. **5** tests need the Mach-O
-binary and **5** the ELF one, and the two sets are disjoint, which is why the
-fourth row skips exactly 10. Removing Bun while Node 24 is still present skips a
-further **68**, and moving `HOME` takes `ws`+`undici` with it for another **6**:
-10 + 68 + 6 = 84. Dropping to Node 22 changes which check fires first, so the
-last row is not the previous one plus a constant. **63** tests skip for Node
-≥ 24, of which **28** also want Bun and **6** also want `ws`+`undici`, leaving
-**29** that want only the newer Node; the other **40** Bun-wanting tests still
-skip for Bun. 10 + 63 + 40 = 113.
+binary, **5** a legacy ELF and **2** a code-split ELF, and the three sets are
+disjoint, which is why the fourth row skips exactly 12. Removing Bun while Node
+24 is still present skips a further **102**, and moving `HOME` takes
+`ws`+`undici` with it for another **6**: 12 + 102 + 6 = 120. Dropping to Node 22
+changes which check fires first, so the last row is not the previous one plus
+a constant. **63** tests skip for Node ≥ 24, of which **28** also want Bun and
+**6** also want `ws`+`undici`, leaving **29** that want only the newer Node; the
+other **74** Bun-wanting tests still skip for Bun. 12 + 63 + 74 = 149.
 
 **The Apple Silicon run is not reconcilable to this table, and should not be.**
 It reported **257 passed, 6 skipped, 0 failed, 263 collected** — a true
 measurement of the tree as it stood on 2026-08-24, whose test set is not
-today's. No arithmetic connects 263 to 304 and none is offered. What the Mac run
+today's. No arithmetic connects 263 to 374 and none is offered. What the Mac run
 established is in [§ macOS](#macos); its totals belong to the tree it ran on.
 
 The last two rows need care twice over. `BUN_BIN` is a *first* choice, not an
@@ -448,7 +452,8 @@ with it (here it is a `--user` install), so put it back explicitly:
 ```bash
 # the "none of them" row, as run. $(...) is evaluated before HOME is replaced.
 PYTHONPATH="$(python3 -m site --user-site)" \
-NRC_TEST_ELF=/nonexistent/elf NRC_TEST_MACHO=/nonexistent/macho \
+NRC_TEST_ELF=/nonexistent/elf NRC_TEST_ESM=/nonexistent/esm \
+NRC_TEST_MACHO=/nonexistent/macho \
 BUN_BIN=/nonexistent/bun HOME="$(mktemp -d)" \
   python3 -m pytest tests/ -q
 ```
