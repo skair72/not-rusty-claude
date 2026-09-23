@@ -216,7 +216,7 @@ def test_postprocess_is_rerunnable(extract_bun, postprocess, tmp_path):
 
 @pytest.mark.parametrize("code,fragment", [
     ('import"/$bunfs/root/chunk-gone.js";', "does not contain: chunk-gone.js"),
-    ('var p="/$bunfs/root/guide-1.md";', "other than through a require()-like call"),
+    ('var p="/$bunfs/root/guide-1.md";', "other than through a call to import.meta.require"),
     ('var s=`/$bunfs/root/tmpl-${1}`;', "survived the rewrite"),
 ])
 def test_what_cannot_be_rewired_fails_the_build(extract_bun, postprocess, tmp_path, code, fragment):
@@ -225,13 +225,22 @@ def test_what_cannot_be_rewired_fails_the_build(extract_bun, postprocess, tmp_pa
     assert any(fragment in e for e in errors), errors
 
 
-def test_a_bare_vfs_prefix_constant_is_left_alone(extract_bun, postprocess, tmp_path):
-    code = ENTRY + 'var x="B:/~BUN/root/";var y="/$bunfs/root/";\n'
+def test_the_windows_prefix_constant_is_left_alone(extract_bun, postprocess, tmp_path):
+    """2.1.280's hooks-worker resolver compares paths against "B:/~BUN/root/"."""
+    code = ENTRY + 'var x="B:/~BUN/root/";\n'
     out = extracted(extract_bun, tmp_path, graph(entry_code=code))
     totals, errors = run_post(postprocess, out)
     assert errors == []
-    assert totals["prefix_constants"] == 2
+    assert totals["prefix_constants"] == 1
     assert 'var x="B:/~BUN/root/"' in (out / "root" / "cli.js").read_text()
+
+
+def test_a_bare_posix_prefix_is_not_exempt(extract_bun, postprocess, tmp_path):
+    """On Linux/macOS it would be the stem of a path built by concatenation."""
+    code = ENTRY + 'var y="/$bunfs/root/";var z=y+"asset.txt";\n'
+    out = extracted(extract_bun, tmp_path, graph(entry_code=code))
+    _, errors = run_post(postprocess, out)
+    assert any("survived the rewrite" in e for e in errors), errors
 
 
 def test_a_tampered_original_is_refused(extract_bun, postprocess, tmp_path):
@@ -279,3 +288,91 @@ def test_the_rewired_tree_runs_under_stock_bun(extract_bun, postprocess, bun_bin
     assert r.returncode == 0, r.stderr
     got = json.loads(r.stdout.strip().splitlines()[-1])
     assert got == {"t": GUIDE, "u": WIDE, "a": "ASSET-BYTES\n", "deep": len(GUIDE), "w": True}
+
+
+def test_two_modules_bound_for_one_output_file_are_refused(extract_bun, postprocess, tmp_path):
+    """`cli` gains .js; a real `cli.js` beside it would be overwritten in silence."""
+    out = extracted(extract_bun, tmp_path, graph(extra=[js("cli.js", "console.log('CHUNK')")]))
+    _, errors = run_post(postprocess, out)
+    assert any("would both be written to root/cli.js" in e for e in errors), errors
+    assert not (out / "root").exists()
+
+
+def test_a_text_module_handed_to_anything_but_import_meta_require_is_refused(
+        extract_bun, postprocess, tmp_path):
+    code = ENTRY + 'import{readFileSync as r}from"fs";var p=r("/$bunfs/root/guide-1.md","utf8");\n'
+    out = extracted(extract_bun, tmp_path, graph(entry_code=code))
+    _, errors = run_post(postprocess, out)
+    assert any("not bound to import.meta.require: r" in e for e in errors), errors
+
+
+def test_a_file_further_up_the_path_is_refused_not_a_traceback(extract_bun, tmp_path, capsys):
+    payload = fixtures.build_payload([js("cli", "export{}"), js("a", "1"), js("a/b/c.js", "2")])
+    binary = tmp_path / "c"
+    binary.write_bytes(fixtures.build_elf(payload))
+    with pytest.raises(SystemExit):
+        extract_bun.extract(str(binary), str(tmp_path / "x"))
+    assert "needs" in capsys.readouterr().err
+
+
+def test_a_failed_rerun_leaves_the_previous_artifact_whole(extract_bun, postprocess, tmp_path):
+    out = extracted(extract_bun, tmp_path)
+    assert run_post(postprocess, out)[1] == []
+    before = {p.relative_to(out): p.read_bytes() for p in out.rglob("*")
+              if p.is_file() and "original" not in p.parts}
+    (out / "original" / "chunk-main.js").write_text("tampered")
+    assert run_post(postprocess, out)[1] != []
+    after = {p.relative_to(out): p.read_bytes() for p in out.rglob("*")
+             if p.is_file() and "original" not in p.parts}
+    assert after == before, "a failed run changed the artifact it was run over"
+
+
+def test_a_comment_between_import_and_its_specifier_keeps_it_static(postprocess):
+    by = {"a.js": {"path": "a.js", "loader": "js"}}
+    code, c = postprocess.transform_module('import/*c*/"/$bunfs/root/a.js";', "sub/m.js", by)
+    assert code == 'import/*c*/"../a.js";' and c["specifier"] == 1 and c["expression"] == 0
+
+
+def test_import_meta_require_of_a_chunk_becomes_relative(postprocess):
+    """445 sites on 2.1.280: `import.meta.require("/$bunfs/root/chunk-X.js")`."""
+    by = {"chunk-x.js": {"path": "chunk-x.js", "loader": "js"}}
+    code, c = postprocess.transform_module(
+        'var m=import.meta.require("/$bunfs/root/chunk-x.js");', "sub/dir/m.js", by)
+    assert code == 'var m=import.meta.require("../../chunk-x.js");' and c["specifier"] == 1
+
+
+def test_a_module_reached_by_path_gets_bun_ant_as_its_first_import(
+        extract_bun, postprocess, tmp_path):
+    """sub/dir/worker.js is referenced by path ({URL:...}), i.e. it starts a realm."""
+    out = extracted(extract_bun, tmp_path)
+    totals, errors = run_post(postprocess, out)
+    assert errors == []
+    assert totals["realm_entries"] == ["sub/dir/worker.js"]
+    worker = (out / "root" / "sub" / "dir" / "worker.js").read_text()
+    assert worker.startswith('import "../../../bun-ant.mjs";\n')
+    assert 'import "' not in (out / "root" / "chunk-main.js").read_text()
+
+
+def test_the_chrome_mcp_self_spawn_gains_the_entry(extract_bun, postprocess, tmp_path):
+    spawn = 'function $7e(){return{type:"stdio",command:process.execPath,args:["--claude-in-chrome-mcp"],scope:"dynamic"}}'
+    out = extracted(extract_bun, tmp_path, graph(entry_code=ENTRY + spawn + "\n"))
+    totals, errors = run_post(postprocess, out)
+    assert errors == [] and totals["self_spawns"] == 1
+    assert 'args:[process.argv[1],"--claude-in-chrome-mcp"]' in (out / "root" / "cli.js").read_text()
+
+
+def test_verify_tree_accepts_a_clean_tree_and_catches_a_demoted_import(
+        extract_bun, postprocess, bun_bin, tmp_path):
+    out = extracted(extract_bun, tmp_path)
+    assert run_post(postprocess, out)[1] == []
+    tool = os.path.join(os.path.dirname(__file__), "..", "scripts", "verify-tree.js")
+    ok = subprocess.run([bun_bin, tool, str(out)], capture_output=True, text=True, timeout=60)
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+    # a static side-effect import turned into an un-awaited dynamic one still
+    # parses - only the import records give it away
+    entry = out / "root" / "cli.js"
+    entry.write_text(entry.read_text().replace('import"./chunk-main.js"',
+                                               'import(import.meta.dirname+"/chunk-main.js")'))
+    bad = subprocess.run([bun_bin, tool, str(out)], capture_output=True, text=True, timeout=60)
+    assert bad.returncode == 1
+    assert json.loads(bad.stdout)["problemCount"] >= 1

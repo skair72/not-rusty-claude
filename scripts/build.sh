@@ -165,6 +165,22 @@ else
 fi
 [ -f "$STAGE/cli.js" ] || die "post-process failed: cli.js missing"
 
+# 4'. A code-split tree is checked with Bun's own parser before it can replace
+# anything: every rewritten module must parse and keep exactly the import
+# records it had (scripts/verify-tree.js). postprocess.py judges each
+# reference from the text around it; this is the check that does not.
+if [ "$SHAPE" = esm ]; then
+  if [ -n "$BUN_BIN" ] && [ -x "$BUN_BIN" ]; then
+    info "verifying the rewired tree with bun's parser"
+    VERIFY_OUT="$("$BUN_BIN" "$HERE/scripts/verify-tree.js" "$STAGE" 2>&1)" \
+      || die "the rewired tree failed verification - nothing was swapped in:
+       $VERIFY_OUT"
+    info "  $VERIFY_OUT"
+  else
+    warn "no bun: the rewired tree was NOT checked by a parser (scripts/verify-tree.js)"
+  fi
+fi
+
 # 4a. Say out loud which of the two artifacts this is. Measured 2026-08-23 by
 # building each real binary both ways: the shimmed and unshimmed outputs are the
 # same length and `cmp -l` reports exactly FOUR differing bytes (`CE()`/`AE()`

@@ -373,43 +373,30 @@ def check_structure(ctx):
                    % (files, specs, paths, len(missing)), {"unresolved": missing[:30]})]
 
 
-PARSE_JS = r"""
-const fs = require("fs"), path = require("path");
-const root = process.argv[2];
-const files = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
-const t = new Bun.Transpiler({ loader: "js" });
-let n = 0; const bad = [];
-for (const p of files) {
-  n++;
-  try { t.transformSync(fs.readFileSync(p, "utf8")); }
-  catch (err) { bad.push(path.relative(root, p) + ": " + String(err && err.message || err).slice(0, 200)); }
-}
-console.log(JSON.stringify({ n, bad }));
-"""
-
-
 def check_parse(ctx):
-    d = ctx.scratch("parse")
-    script = os.path.join(d, "parse.js")
-    open(script, "w").write(PARSE_JS)
+    """Bun's own parser over the whole tree: every module parses and keeps
+    exactly the import records it had before the rewrite
+    (scripts/verify-tree.js, which build.sh also runs)."""
     if not _manifest(ctx):
-        files = [os.path.join(ctx.extract_dir, "cli.original.cjs")]
-    else:
-        files = _js_modules(ctx)
-        # the text wrappers are ours and are JavaScript too
-        root = os.path.join(ctx.extract_dir, "root")
-        files += [os.path.join(dp, f) for dp, _, fs in os.walk(root) for f in fs if f.endswith(".cjs")]
-    listing = os.path.join(d, "files.json")
-    json.dump(files, open(listing, "w"))
-    r = run([ctx.bun, script, ctx.extract_dir, listing], {"PATH": "/usr/bin:/bin"}, timeout=600)
+        r = run([ctx.bun, "build", "--no-bundle", "--target=bun",
+                 os.path.join(ctx.extract_dir, "cli.original.cjs"), "--outfile=/dev/null"],
+                {"PATH": "/usr/bin:/bin"}, timeout=600)
+        return [Result("parse", "PASS" if r["rc"] == 0 else "FAIL",
+                       "legacy artifact: bun build --no-bundle rc=%s" % r["rc"],
+                       {"stderr": r["stderr"][-1500:]})]
+    r = run([ctx.bun, os.path.join(HERE, "verify-tree.js"), ctx.extract_dir],
+            {"PATH": "/usr/bin:/bin"}, timeout=600)
     try:
-        res = json.loads(r["stdout"].strip().splitlines()[-1])
+        res = json.loads(r["stdout"].strip().split("\n")[-1])
     except (ValueError, IndexError):
-        return [Result("parse", "FAIL", "parser run failed rc=%s" % r["rc"],
+        return [Result("parse", "FAIL", "verify-tree.js did not report (rc=%s)" % r["rc"],
                        {"stderr": r["stderr"][-2000:]})]
-    status = "FAIL" if res["bad"] else "PASS"
-    return [Result("parse", status, "%d files parsed by Bun, %d rejected" % (res["n"], len(res["bad"])),
-                   {"rejected": res["bad"][:20]})]
+    ok = r["rc"] == 0 and not res["problemCount"] and not res["rejectedCount"] and res["modules"] > 0
+    return [Result("parse", "PASS" if ok else "FAIL",
+                   "%d files parsed by Bun, %d import records kept across %d modules, "
+                   "%d problems, %d rejected" % (res["parsed"], res["records"], res["modules"],
+                                                 res["problemCount"], res["rejectedCount"]),
+                   {"problems": res["problems"], "rejected": res["rejected"]})]
 
 
 TEXT_JS = r"""

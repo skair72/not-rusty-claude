@@ -1352,8 +1352,9 @@ record is
 bytecode (`// @bun @bytecode`), which stock Bun ignores outside a standalone.
 
 **The content-encoding byte (offset 48) is 0, 1 or 2**, and 2 is UTF-16LE:
-all 20 text modules that carry it decode to readable Markdown as UTF-16LE,
-and 16 of them are rejected outright as UTF-8. 1 marks ASCII-only content
+all 20 text modules that carry it decode cleanly as UTF-16LE (16 Markdown
+documents, two `.mjs` templates, two HTML fragments), and 16 of them are
+rejected outright as UTF-8. 1 marks ASCII-only content
 (1,975 JS, 64 text), 0 raw bytes.
 
 **How chunks reach each other**, counted over all 1,975 modules: 119,359

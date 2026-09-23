@@ -83,9 +83,10 @@ FORMAT_ESM = 1
 # module's stored bytes into a JavaScript string. MEASURED on linux-x64
 # 2.1.280, not transcribed: every .node/file module is 0 and is raw bytes; all
 # 1975 JavaScript and 64 text modules are 1 and are pure ASCII; the other 20
-# text modules are 2 and are UTF-16LE (each decodes to readable Markdown, e.g.
-# "# Claude Code Configuration Guide"). Decoding a 2 as UTF-8 fails outright -
-# 16 of the 20 contain byte sequences UTF-8 rejects.
+# text modules are 2 and are UTF-16LE - each decodes cleanly to readable text:
+# 16 Markdown documents, two .mjs templates and two HTML fragments, all of them
+# with non-ASCII in them (e.g. "# Claude Code Configuration Guide"). Decoding a
+# 2 as UTF-8 fails outright - 16 of the 20 contain byte sequences it rejects.
 ENCODINGS = {0: "binary", 1: "latin1", 2: "utf16le"}
 
 # The one VFS prefix a POSIX standalone uses. In the esm shape every module
@@ -476,11 +477,16 @@ def extract_tree(payload, table, count, entry_point_id, out_dir):
                 "which is not in LOADERS - written verbatim; postprocess.py "
                 "will refuse to rewire references to it\n")
         dest = os.path.join(tree, *rel.split("/"))
-        parent = os.path.dirname(dest)
-        if os.path.isfile(parent):
-            die(f"module {i} ({name!r}) needs {parent} to be a directory, but "
-                "another module was written there")
-        os.makedirs(parent, exist_ok=True)
+        # EVERY ancestor, not just the parent: `a` then `a/b/c` makes
+        # os.makedirs raise NotADirectoryError two levels up, a traceback
+        # instead of a diagnosis.
+        parts = rel.split("/")
+        for k in range(1, len(parts)):
+            ancestor = os.path.join(tree, *parts[:k])
+            if os.path.isfile(ancestor):
+                die(f"module {i} ({name!r}) needs {ancestor} to be a directory, "
+                    "but another module was written there")
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
         if os.path.isdir(dest):
             die(f"module {i} ({name!r}) collides with a directory another "
                 "module's path created")

@@ -542,7 +542,14 @@ TREE_REF = re.compile(r"""(["'])/\$bunfs/root/([^"'\s`\\]+)\1""")
 _SPEC_BEFORE = re.compile(
     r"(?:(?<![\w$.])from|(?<![\w$.])import|(?<![\w$.])import\s*\(|"
     r"(?<![\w$.])require\s*\(|(?<![\w$])import\.meta\.require\s*\()\s*$")
-_CALL_BEFORE = re.compile(r"[\w$]\s*\(\s*$")
+# The callee of a text-module reference: an identifier or import.meta.require,
+# called directly. Which identifiers are acceptable is decided per tree, in
+# transform_tree(): only names bound to import.meta.require.
+_CALLEE_BEFORE = re.compile(r"(?<![\w$])(import\.meta\.require|(?<!\.)[A-Za-z_$][\w$]*)\s*\(\s*$")
+_REQUIRE_BINDING = re.compile(r"(?<![\w$.])([A-Za-z_$][\w$]*)\s*=\s*import\.meta\.require(?![\w$])")
+# Comments between a keyword and its specifier (`import/*x*/"a"`) do not change
+# what the specifier is, so they are removed before the context is judged.
+_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.S)
 
 # Loaders whose modules are JavaScript source this half rewrites, and loaders
 # that are copied through untouched. `text` is neither: see _text_module().
@@ -585,12 +592,14 @@ def _text_module(content):
 # extract_bun.ENCODINGS, by name: how the runtime decodes a module's bytes.
 _DECODERS = {"latin1": "latin-1", "utf16le": "utf-16-le", "binary": "utf-8"}
 
-# A string literal that is nothing but a VFS prefix is a constant the code
-# compares paths against, not a reference to a module, e.g. 2.1.280's hooks
-# worker resolver: var xdt="B:/~BUN/root/";function Cdt(e){return
-# O()==="windows"&&e.startsWith(xdt)?e:new URL(`file://${e}`)}. Left alone and
-# counted; anything LONGER is a module path and must have been rewired.
-PREFIX_CONSTANT = re.compile(r"""(["'])(?:/\$bunfs/root/|B:/~BUN/root/)\1""")
+# The Windows VFS prefix on its own is a constant the code compares paths
+# against, not a reference to a module - 2.1.280's hooks worker resolver:
+# var xdt="B:/~BUN/root/";function Cdt(e){return O()==="windows"&&
+# e.startsWith(xdt)?e:new URL(`file://${e}`)}. It is the one such constant
+# measured, so it is the one left alone (and counted). A bare POSIX
+# "/$bunfs/root/" is NOT exempt: on Linux and macOS it would be the stem of a
+# path built by concatenation, which nothing here could rewire.
+PREFIX_CONSTANT = re.compile(r"""(["'])B:/~BUN/root/\1""")
 
 
 def _decode(data, mod):
@@ -617,7 +626,8 @@ def transform_module(code, rel, by_path):
     """
     here = posixpath.dirname(rel)
     counts = {"specifier": 0, "expression": 0, "text": 0,
-              "missing": set(), "bad_text": set()}
+              "missing": set(), "bad_text": set(), "text_callees": set(),
+              "realm_entries": set()}
 
     def sub(m):
         quote, target = m.group(1), m.group(2)
@@ -626,18 +636,28 @@ def transform_module(code, rel, by_path):
             counts["missing"].add(target)
             return m.group(0)
         out = _out_path(mod)
-        before = code[max(0, m.start() - 32):m.start()]
+        before = _BLOCK_COMMENT.sub("", code[max(0, m.start() - 96):m.start()])
         if mod["loader"] == "text":
             # Only ever reached through a require-like call (84 of 84 on
-            # 2.1.280). A text path used any other way would be handed to fs
-            # and read the WRAPPER's source instead of the text - refuse.
-            if not _CALL_BEFORE.search(before):
+            # 2.1.280, all `Re(...)`). A text path handed to anything else -
+            # fs above all - would read the WRAPPER's source instead of the
+            # text, so the callee is recorded and transform_tree() accepts it
+            # only if it is bound to import.meta.require.
+            callee = _CALLEE_BEFORE.search(before)
+            if not callee:
                 counts["bad_text"].add(target)
                 return m.group(0)
+            counts["text_callees"].add(callee.group(1))
             counts["text"] += 1
-        if _SPEC_BEFORE.search(before) and mod["loader"] != "text":
-            counts["specifier"] += 1
-            return quote + _relative_specifier(here, out) + quote
+        else:
+            if _SPEC_BEFORE.search(before):
+                counts["specifier"] += 1
+                return quote + _relative_specifier(here, out) + quote
+            if mod["loader"] in TREE_JS_LOADERS:
+                # JavaScript reached by PATH rather than by import is the entry
+                # of another realm - 2.1.280's hooks Worker - which must get
+                # Bun.ant too; transform_tree() adds it there.
+                counts["realm_entries"].add(target)
         counts["expression"] += 1
         up = posixpath.relpath(out, here or ".")
         return "(import.meta.dirname+" + json.dumps("/" + up) + ")"
@@ -666,11 +686,45 @@ def _bun_ant_source_dir():
     return os.environ.get("NRC_BUN_ANT_DIR") or os.path.join(here, "..", "scripts")
 
 
+# A self-spawn the native binary makes work simply by BEING the program: it
+# runs process.execPath with a flag, and native process.execPath is claude.
+# Here it is bun, and `bun --claude-in-chrome-mcp` prints Bun's help and exits
+# 0 - measured - so the Claude-in-Chrome MCP server Claude configures for
+# itself never starts. Legacy builds reached it through the cli.js sibling;
+# 2.1.280's config has no non-standalone branch at all:
+#   function $7e(){return{type:"stdio",command:process.execPath,
+#                         args:["--claude-in-chrome-mcp"],scope:"dynamic"}}
+# so it gains the entry as its first argument, the way every other self-spawn
+# in the build already does outside a standalone (`ku()?[]:[process.argv[1]]`).
+# Matched as the whole literal shape; the flag stays in args, which is how
+# Claude recognises that server elsewhere.
+SELF_SPAWNS = (
+    ('command:process.execPath,args:["--claude-in-chrome-mcp"]',
+     'command:process.execPath,args:[process.argv[1],"--claude-in-chrome-mcp"]'),
+)
+
+STAGE_NAME = ".root.partial"
+
+
+def _after_header(code):
+    """Offset just past the file's leading `//` comment lines (the pragma and
+    the licence header), where an import can go without displacing them."""
+    i = 0
+    while code.startswith("//", i) or code.startswith("\n", i):
+        nl = code.find("\n", i)
+        if nl < 0:
+            return len(code)
+        i = nl + 1
+    return i
+
+
 def transform_tree(d):
     """Build root/, the entry and the polyfill from original/ + manifest.json.
 
-    Returns (totals, errors). Writes into d; on errors the caller must not
-    treat d as an artifact (build.sh only swaps a staged dir in on success).
+    Returns (totals, errors). root/ is built in a staging directory and only
+    replaces the previous one on success, so a failed run - including an
+    in-place re-run over an existing artifact - leaves the previous artifact
+    whole: root/, cli.js and the polyfill all from the same run.
     """
     with open(os.path.join(d, MANIFEST_NAME), encoding="utf-8") as fh:
         manifest = json.load(fh)
@@ -680,16 +734,30 @@ def transform_tree(d):
     modules = manifest["modules"]
     by_path = {m["path"]: m for m in modules}
     src_root = os.path.join(d, manifest.get("tree", TREE_SRC))
-    out_root = os.path.join(d, TREE_OUT)
-    if os.path.isdir(out_root):
-        shutil.rmtree(out_root)
-    os.makedirs(out_root)
-
     totals = {"modules": len(modules), "js": 0, "text": 0, "copied": 0,
               "specifier": 0, "expression": 0, "text_refs": 0,
-              "prefix_constants": 0,
+              "prefix_constants": 0, "self_spawns": 0, "realm_entries": [],
               "leftovers": [], "build_paths": set()}
+
+    # Two modules must never land on one file: `cli` gains .js and a text
+    # module gains .cjs, so `cli` + `cli.js`, or `p.md` + `p.md.cjs`, would.
+    # The second would overwrite the first in silence. Refused before any
+    # byte is written.
+    placed = {}
+    for mod in modules:
+        out = _out_path(mod)
+        key = out.lower() if sys.platform == "darwin" else out
+        if key in placed:
+            errors.append("modules %s and %s would both be written to root/%s"
+                          % (placed[key], mod["path"], out))
+        placed[key] = mod["path"]
+    if errors:
+        return totals, errors
+
     missing, bad_text, undecodable, unknown = set(), set(), [], []
+    callees, realm_entries, js_out = set(), set(), {}
+    bindings = {"import.meta.require", "require"}
+    blobs = {}
     for mod in modules:
         src = os.path.join(src_root, *mod["path"].split("/"))
         try:
@@ -705,41 +773,55 @@ def transform_tree(d):
                           % mod["path"])
             continue
         out = _out_path(mod)
-        dest = os.path.join(out_root, *out.split("/"))
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
         if mod["loader"] in TREE_JS_LOADERS:
             try:
                 code = _decode(data, mod)
             except ValueError as e:
                 undecodable.append("%s (%s)" % (mod["path"], e))
                 continue
+            bindings |= set(_REQUIRE_BINDING.findall(code))
             code, c = transform_module(code, out, by_path)
+            for old, new in SELF_SPAWNS:
+                if old in code:
+                    totals["self_spawns"] += code.count(old)
+                    code = code.replace(old, new)
             totals["prefix_constants"] += c["prefix_constants"]
             missing |= c["missing"]
             bad_text |= c["bad_text"]
+            callees |= c["text_callees"]
+            realm_entries |= c["realm_entries"]
             totals["specifier"] += c["specifier"]
             totals["expression"] += c["expression"]
             totals["text_refs"] += c["text"]
             totals["leftovers"] += ["%s: %s" % (out, x) for x in c["leftovers"]]
             totals["build_paths"] |= set(c["build_paths"])
-            with open(dest, "w", encoding="utf-8") as fh:
-                fh.write(code)
-            totals["js"] += 1
+            js_out[mod["path"]] = (out, code)
         elif mod["loader"] == "text":
             try:
                 text = _decode(data, mod)
             except ValueError as e:
                 undecodable.append("%s (%s)" % (mod["path"], e))
                 continue
-            with open(dest, "w", encoding="utf-8") as fh:
-                fh.write(_text_module(text))
+            blobs[out] = _text_module(text).encode("utf-8")
             totals["text"] += 1
         elif mod["loader"] in TREE_COPY_LOADERS:
-            with open(dest, "wb") as fh:
-                fh.write(data)
+            blobs[out] = data
             totals["copied"] += 1
         else:
             unknown.append("%s (loader %s)" % (mod["path"], mod["loader"]))
+
+    # Every JavaScript module reached by path starts a realm of its own (the
+    # hooks Worker on 2.1.280), and the native runtime's Worker has Bun.ant as
+    # much as its main thread does. The polyfill goes in as that module's
+    # first import - evaluated before anything it imports - and is inert
+    # wherever Bun.ant already exists.
+    for vfs in sorted(realm_entries):
+        out, code = js_out[vfs]
+        rel = posixpath.relpath(BUN_ANT_NAME, posixpath.dirname(TREE_OUT + "/" + out))
+        at = _after_header(code)
+        js_out[vfs] = (out, code[:at] + 'import "' + rel + '";\n' + code[at:])
+        totals["realm_entries"].append(out)
+    totals["js"] = len(js_out)
 
     entry = by_path.get(manifest.get("entry"))
     entry_out = _out_path(entry) if entry else None
@@ -759,11 +841,15 @@ def transform_tree(d):
         errors.append("%d /$bunfs/root/ reference(s) name a module the graph "
                       "does not contain: %s - they would fail at runtime"
                       % (len(missing), ", ".join(sorted(missing))))
-    if bad_text:
-        errors.append("text module(s) referenced other than through a "
-                      "require()-like call: %s - rewiring them to the .cjs "
-                      "wrapper would hand fs a JavaScript file instead of the "
-                      "text" % ", ".join(sorted(bad_text)))
+    stray = sorted(callees - bindings)
+    if bad_text or stray:
+        errors.append("text module(s) reached other than through a call to "
+                      "import.meta.require (or a name bound to it): %s%s - "
+                      "rewiring them to the .cjs wrapper would hand that code "
+                      "a JavaScript file instead of the text"
+                      % (", ".join(sorted(bad_text)) or "-",
+                         "; callee(s) not bound to import.meta.require: "
+                         + ", ".join(stray) if stray else ""))
     if totals["leftovers"]:
         errors.append("%d /$bunfs/ reference(s) survived the rewrite: %s. "
                       "Widen TREE_REF to cover the new shape."
@@ -777,9 +863,28 @@ def transform_tree(d):
         if not os.path.isfile(os.path.join(src_dir, name)):
             errors.append("the Bun.ant polyfill file %s is missing from %s - "
                           "without it the TUI cannot render (docs/findings.md "
-                          "13)" % (name, src_dir))
+                          "14)" % (name, src_dir))
     if errors:
         return totals, errors
+
+    stage = os.path.join(d, STAGE_NAME)
+    if os.path.isdir(stage):
+        shutil.rmtree(stage)
+    try:
+        for out, code in js_out.values():
+            blobs[out] = code.encode("utf-8")
+        for out, data in blobs.items():
+            dest = os.path.join(stage, *out.split("/"))
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "wb") as fh:
+                fh.write(data)
+        out_root = os.path.join(d, TREE_OUT)
+        if os.path.isdir(out_root):
+            shutil.rmtree(out_root)
+        os.rename(stage, out_root)
+    finally:
+        if os.path.isdir(stage):
+            shutil.rmtree(stage)
 
     for name in BUN_ANT_FILES:
         shutil.copyfile(os.path.join(src_dir, name), os.path.join(d, name))
@@ -804,11 +909,30 @@ def main_tree(d):
         print(f"paths made runtime-abs : {totals['expression']} "
               f"(of which text-module requires: {totals['text_refs']})")
         print(f"VFS prefix constants   : {totals['prefix_constants']} "
-              "(left alone: prefixes compared against, not module paths)")
+              "(left alone: the Windows prefix, compared against, not a path)")
+        print(f"self-spawns given entry: {totals['self_spawns']}  "
+              "(--claude-in-chrome-mcp: process.execPath is bun here)")
+        print(f"realms given Bun.ant   : {len(totals['realm_entries'])}  "
+              f"({', '.join(totals['realm_entries']) or 'none'})")
         print("image shim applied     : 0  (not applicable: this build has no "
               "native image processor to gate; images go through Bun.Image)")
         for path in sorted(totals["build_paths"]):
             sys.stderr.write(f"note: build-machine path still present: {path}\n")
+        if totals["self_spawns"] == 0:
+            sys.stderr.write(
+                "warning: the Claude-in-Chrome MCP self-spawn shape was not "
+                "found, so it was not given the entry; if this release still "
+                "spawns process.execPath with --claude-in-chrome-mcp, that "
+                "server will run `bun --claude-in-chrome-mcp` and never start\n")
+    if re.search(r"[#?%]", os.path.abspath(d)):
+        # The hooks Worker's URL is built as new URL(`file://${path}`), so an
+        # install path containing these reads as a fragment, a query or an
+        # escape and the Worker is started from the wrong file.
+        sys.stderr.write(
+            "warning: %s contains '#', '?' or '%%'; Claude builds the hooks "
+            "worker's URL as file://<path> without encoding it, so function "
+            "hooks will not start from here. Move the artifact.\n"
+            % os.path.abspath(d))
     if errors:
         for e in errors:
             sys.stderr.write(f"error: {e}\n")
