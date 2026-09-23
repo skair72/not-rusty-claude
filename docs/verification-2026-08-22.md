@@ -279,4 +279,5 @@ loaded". Use a script file.
 - **Most gate branches** were read from source, not exercised; the four that have
   an A/B behind them are [findings.md](./findings.md) §10's table.
 - **The `find`/`grep` shell-function shadowing** was reconstructed from the
-  shipped source, not observed live.
+  shipped source, not observed live. *(Later: observed live and fixed on
+  2026-09-23 — [findings.md](./findings.md) §10, "Embedded search".)*

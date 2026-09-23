@@ -35,7 +35,8 @@ that installs a `Bun.ant` polyfill. The details are in
 **How it is verified: `make harness`.** `scripts/harness.py` builds the
 artifact, then runs the same scenario through the native binary and the
 artifact, and compares what each one did. Measured on this host on 2026-09-22
-against `/usr/bin/claude` 2.1.280, under stock Bun 1.3.14:
+against `/usr/bin/claude` 2.1.280, under stock Bun 1.3.14, and re-run in full on
+2026-09-23 (30 checks, all PASS) once the search checks were added:
 
 | check | artifact vs native |
 |---|---|
@@ -44,13 +45,17 @@ against `/usr/bin/claude` 2.1.280, under stock Bun 1.3.14:
 | `--version`, `--help`, `mcp list`, `mcp add` → `get` → `remove` → `list`, `plugin list`, `auth status` | exit code, stdout **and** stderr equal, at every step |
 | `doctor` | equal bar the install-identity and search lines, which are the [equivalence gap](docs/findings.md) |
 | the Claude-in-Chrome MCP server, and Claude's own config for it spawned as Claude spawns it | an MCP `initialize` answered identically |
-| 8 mock-API agentic turns: text, Bash, Read, Read of a 3000×3000 PNG, Grep, Write, Glob, function hooks | tool results equal, and the full request bodies equal once per-run paths, session ids and the random device id are normalised |
+| 9 mock-API agentic turns: text, Bash, Read, Read of a 3000×3000 PNG, Grep, Write, Glob, function hooks, and a Bash `grep`/`find` | tool results equal, and the full request bodies equal once per-run paths, session ids and the random device id are normalised. Native runs these, and the TUI, under its own Glob/Grep opt-in; `search-optin` pins what that opt-in changes on native in a `-p` turn |
 | TUI under a pty: onboarding, a REPL turn, a REPL turn full of CJK, emoji, bidi text, a table and a code block | screens identical cell for cell, **styles and hyperlinks included** — bar the randomly chosen spinner verb and the clock, and onboarding compared below its randomly sparkling logo; same requests; the REPL exits 0 with the terminal restored |
 | `Bun.ant`, probed inside the native runtime with a real peer process | 27 answers identical |
 | `CellSegmenter`, fuzzed against the native class | 0 mismatches (3,000 cases per harness run; 610,000 in development) |
 
 **What it is not.** The same gaps apply as before: the sandbox is off, ripgrep
-is the system `rg` and install identity reads `unknown`. On top of that,
+is the system `rg` and install identity reads `unknown`. Search runs in the
+configuration native uses under its own Glob/Grep opt-in, not its default: the **Glob** and
+**Grep** tools are offered, and a Bash `grep`/`find` is the system's. Bun has
+no embedded ugrep or bfs, and before 2026-09-23 every Bash `grep` printed Bun's
+help ([findings §10](docs/findings.md), *Embedded search*). On top of that,
 startup is **3–8× slower** than native (`--help` takes 1.2 s against 0.16 s),
 because the native runtime runs JSC bytecode that a different WebKit build
 cannot load. A code-split build does **not** run under Node yet
@@ -97,7 +102,11 @@ Claude Code 2.1.222, on Linux** — a measurement, not a guarantee.
 its non-standalone branch at every site that asks (how many sites per binary is a
 row of [`docs/findings.md`](docs/findings.md) §6's table). Measured consequences:
 the **seccomp sandbox is off**, embedded ripgrep becomes a **system `rg`** (so
-`rg` is a de facto prerequisite), and install identity reports `unknown`. Both
+`rg` is a de facto prerequisite), and install identity reports `unknown`. One
+more gap is not a runtime check at all. Claude's embedded bfs/ugrep is switched
+on by a build-time constant, so `postprocess.py` switches it off. Glob and Grep
+are then offered, and Bash `grep`/`find` are the system's, exactly as native
+runs when an `--allowedTools` or `--tools` entry names Glob or Grep. Both
 addon loaders swallow failure, so **exit 0 is not evidence that the asset wiring
 works**.
 
@@ -106,7 +115,8 @@ call that guards native image processing, so a default build resizes a large
 image instead of erroring — scoped to that one call site because flipping
 `Bun.isStandaloneExecutable` globally is measured to make `Grep` answer `No
 matches found` for a string that exists: a wrong answer, not an error.
-`NRC_NO_IMAGE_SHIM` (any non-empty value) builds the old artifact;
+`NRC_NO_IMAGE_SHIM` (any non-empty value) builds the old artifact, bar the
+embedded-search gate rewrite, which has no opt-out;
 `scripts/ab-equivalence.sh` reproduces the three-way A/B against a committed
 loopback mock ([`docs/findings.md`](docs/findings.md) §10, Linux-only).
 
@@ -168,7 +178,12 @@ One consequence to know about: under a native install `process.execPath` *is*
 `claude`; here it is **bun**, and the CLI unconditionally exports
 `CLAUDE_CODE_EXECPATH=<bun>` into every shell it spawns. Setting that variable
 yourself does nothing — the CLI never reads it
-([`docs/runbook.md`](docs/runbook.md) § Shell integrations). Step-by-step and
+([`docs/runbook.md`](docs/runbook.md) § Shell integrations). The shell
+functions that ran it as `grep` and `find` are gone from every build since
+2026-09-23. On an older artifact, start it with
+`--allowedTools='Glob(/nonexistent/**)'`: naming Glob switches Claude's own opt-in on,
+and a rule for a directory that does not exist grants nothing. A bare
+`--allowedTools=Grep` works too, but it also pre-approves Grep on every path. Step-by-step and
 troubleshooting: [`docs/runbook.md`](docs/runbook.md); on a Mac, read the
 section below first.
 
@@ -361,7 +376,7 @@ its consequences.
   ([`docs/runbook.md`](docs/runbook.md) step 1); nothing on *this* host has ever
   unzipped or executed a darwin Bun.
 - **The rest of the equivalence gap on macOS** — sandbox, ripgrep, install
-  identity — and **the `Makefile`**, whose macOS dialect is enforced by
+  identity, and search, where a Bash `grep`/`find` is BSD's — and **the `Makefile`**, whose macOS dialect is enforced by
   `tests/test_makefile.py` on Linux but which the Mac run, predating that file,
   never invoked.
 
@@ -410,7 +425,7 @@ only as quoted command output labelled with the binary and date that produced
 it.** These counts *move*, in both directions, as test files are added and removed —
 which is exactly why. Every row was re-measured here on 2026-09-23
 by forcing it with the variables named beside it; `--collect-only` reports the
-same total, **378**, in all six configurations, because what the host has
+same total, **404**, in all six configurations, because what the host has
 changes the skips, never the collection. "Binaries" are three now: a legacy
 (single-file) ELF, a code-split ELF (2.1.280+) and the Mach-O. The first row
 had all three - the cached 2.1.231 download, `/usr/bin/claude` 2.1.280 and
@@ -419,28 +434,28 @@ the 2.1.231 download and named by `NRC_TEST_ARTIFACT`.
 
 | host has | result | how the row was forced |
 | --- | --- | --- |
-| all three binaries, Bun, Node 24 | **378 passed** | `NRC_TEST_NODE=…/node-v24.21.0-linux-x64/bin/node` (this host's own `node` is 22.23.2) |
-| …no Mach-O | 373 passed, 5 skipped | `NRC_TEST_MACHO=/nonexistent/macho` |
-| …no ELF | 371 passed, 7 skipped | `NRC_TEST_ELF=/nonexistent/elf NRC_TEST_ESM=/nonexistent/esm` |
-| …no binary at all | 366 passed, 12 skipped | all three of those variables at once |
-| …and no Bun | 256 passed, 122 skipped | …plus `BUN_BIN=/nonexistent/bun` and a `HOME` with no Bun under it |
-| none of them, Node 22 | 227 passed, 151 skipped | …and drop `NRC_TEST_NODE` — the command below |
+| all three binaries, Bun, Node 24 | **404 passed** | `NRC_TEST_NODE=…/node-v24.21.0-linux-x64/bin/node` (this host's own `node` is 22.23.2) |
+| …no Mach-O | 399 passed, 5 skipped | `NRC_TEST_MACHO=/nonexistent/macho` |
+| …no ELF | 396 passed, 8 skipped | `NRC_TEST_ELF=/nonexistent/elf NRC_TEST_ESM=/nonexistent/esm` |
+| …no binary at all | 391 passed, 13 skipped | all three of those variables at once |
+| …and no Bun | 280 passed, 124 skipped | …plus `BUN_BIN=/nonexistent/bun` and a `HOME` with no Bun under it |
+| none of them, Node 22 | 251 passed, 153 skipped | …and drop `NRC_TEST_NODE` — the command below |
 
-Every row adds up to 378, and the skips decompose — counted from each run's own
+Every row adds up to 404, and the skips decompose — counted from each run's own
 `-rs` skip reasons, not inferred from the totals. **5** tests need the Mach-O
-binary, **5** a legacy ELF and **2** a code-split ELF, and the three sets are
-disjoint, which is why the fourth row skips exactly 12. Removing Bun while Node
-24 is still present skips a further **104**, and moving `HOME` takes
-`ws`+`undici` with it for another **6**: 12 + 104 + 6 = 122. Dropping to Node 22
+binary, **6** a legacy ELF and **2** a code-split ELF, and the three sets are
+disjoint, which is why the fourth row skips exactly 13. Removing Bun while Node
+24 is still present skips a further **105**, and moving `HOME` takes
+`ws`+`undici` with it for another **6**: 13 + 105 + 6 = 124. Dropping to Node 22
 changes which check fires first, so the last row is not the previous one plus
 a constant. **63** tests skip for Node ≥ 24, of which **28** also want Bun and
 **6** also want `ws`+`undici`, leaving **29** that want only the newer Node; the
-other **76** Bun-wanting tests still skip for Bun. 12 + 63 + 76 = 151.
+other **77** Bun-wanting tests still skip for Bun. 13 + 63 + 77 = 153.
 
 **The Apple Silicon run is not reconcilable to this table, and should not be.**
 It reported **257 passed, 6 skipped, 0 failed, 263 collected** — a true
 measurement of the tree as it stood on 2026-08-24, whose test set is not
-today's. No arithmetic connects 263 to 378 and none is offered. What the Mac run
+today's. No arithmetic connects 263 to 404 and none is offered. What the Mac run
 established is in [§ macOS](#macos); its totals belong to the tree it ran on.
 
 The last two rows need care twice over. `BUN_BIN` is a *first* choice, not an

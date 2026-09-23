@@ -50,7 +50,9 @@ MEASURED = {
         "2.1.222": {"version": "linux-x64 2.1.222", "assets": 5, "file_urls": 7,
                     "gate_calls_before": 21, "gate_calls_after": 20, "image_shim": 1},
         "2.1.231": {"version": "linux-x64 2.1.231", "assets": 7, "file_urls": 7,
-                    "gate_calls_before": 24, "gate_calls_after": 23, "image_shim": 1},
+                    "gate_calls_before": 24, "gate_calls_after": 23, "image_shim": 1,
+                    # measured 2026-09-23 (docs/findings.md §10)
+                    "search_gate": 1},
     },
     "macho": {
         "2.1.239": {"version": "darwin-arm64 2.1.239", "assets": 9, "file_urls": 8,
@@ -98,7 +100,7 @@ def _assert_no_drift(counts, key, binary, code):
             "has been smoke-tested (docs/runbook.md). Measured now: %s"
             % (version, binary, key, version,
                {k: counts[k] for k in ("assets", "file_urls", "gate_calls_before",
-                                       "gate_calls_after", "image_shim")}))
+                                       "gate_calls_after", "image_shim", "search_gate")}))
     expected = MEASURED[key][version]
     drifted = {name: (want, counts[name])
                for name, want in expected.items()
@@ -179,7 +181,9 @@ def test_real_macho_measured_counts_have_not_drifted(extract_bun, postprocess,
 MEASURED_ESM = {
     "2.1.280": {"modules": 2196, "js": 1975, "text": 84, "copied": 137,
                 "specifier": 138195, "expression": 485, "text_refs": 84,
-                "prefix_constants": 1},
+                "prefix_constants": 1,
+                # the embedded-search gate, rewritten 2026-09-23 (findings §10)
+                "search_gate": 1, "search_gate_module": "chunk-1xqpf2j8.js"},
 }
 
 

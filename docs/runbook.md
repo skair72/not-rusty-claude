@@ -53,7 +53,9 @@ command, marking which machine each was run on.
   third-party packages; the test suite additionally wants `pytest`).
 - **`ripgrep` on `PATH`.** Not optional here, though it is optional for a native
   install: the CLI only uses its *embedded* ripgrep when it detects it is a Bun
-  standalone, which this build is not ([findings.md](./findings.md) §10).
+  standalone, which this build is not ([findings.md](./findings.md) §10). The
+  Glob and Grep tools, which this build offers because its embedded-search gate
+  is off, run it too.
 - This repo checked out. Nothing needs installing from it.
 
 > **A shortcut for the whole sequence.** The `Makefile` wraps steps 1–4 as
@@ -343,7 +345,7 @@ the CLI injects into spawned shells for `find` and `grep` 🔎.
 ```bash
 function find {
   local _cc_bin="${CLAUDE_CODE_EXECPATH:-}"
-  [[ -x $_cc_bin ]] || _cc_bin='<bundled bfs path>'
+  [[ -x $_cc_bin ]] || _cc_bin=<$HOME/.local/bin/claude>
   if [[ ! -x $_cc_bin ]]; then command find ${1+"$@"}; return; fi
   ...
   (exec -a bfs "$_cc_bin" -S dfs -regextype findutils-default ${1+"$@"})
@@ -352,9 +354,34 @@ function find {
 
 The `[[ -x ]]` fallback does not rescue you: bun *is* executable, so the function
 resolves to bun invoked with `bfs`/`ugrep` arguments rather than to the real
-`find`/`grep`. Read out of the shipped source; **not observed live**. Same family
-as [findings.md](./findings.md) §10, and no supported workaround yet. If `find`
-or `grep` misbehave inside a Bash tool call, this is why.
+`find`/`grep`. **Observed live on 2026-09-23** ✅: every Bash `grep` printed Bun's
+help, reported as success.
+
+**Fixed in the build, not through this variable.** The functions are emitted
+only while one gate is true. Its first clause is the build-time constant
+`EMBEDDED_SEARCH_TOOLS`, and `postprocess.py` rewrites it to `false`, so a build
+from 2026-09-23 on emits no `find`/`grep` functions at all. Look for this line
+in the build log:
+
+```
+embedded search off    : 1  (gate zb() in chunk-1xqpf2j8.js: bun has no embedded ugrep/bfs; as native under its Glob/Grep opt-in)
+```
+
+The result is exactly what native runs under its own Glob/Grep opt-in, which
+any `--allowedTools` or `--tools` entry naming Glob or Grep switches on:
+**Glob** and **Grep** are offered, backed by the system `rg`, and a Bash
+`grep`/`find` is the system's. That is a difference from native's default, and
+[findings.md](./findings.md) §10 (*Embedded search*) tabulates it. On an older
+artifact, start it with `--allowedTools='Glob(/nonexistent/**)'` for the same search
+configuration. Keep the `=`, because the flag is variadic. The rule names a
+directory that does not exist, so it grants nothing. A bare
+`--allowedTools=Grep` also works, but it also pre-approves Grep on every path,
+with no prompt.
+
+Unsetting `CLAUDE_CODE_EXECPATH` is **not** a workaround. The functions then
+fall back to `~/.local/bin/claude`, which on a machine with a native install is
+the native binary, silently run as ugrep/bfs (measured with a symlink,
+2026-09-23).
 
 ---
 
@@ -462,9 +489,10 @@ Two things to expect:
 | `mcp list` prints nothing and exits 137 (`SIGKILL`); or `This build of @anthropic-ai/bun-internal has no Bun.ant.CellSegmenter` | A code-split build run **without** its `Bun.ant` polyfill: Ink throws on unmount inside `process.exit()`, and Claude's `forceExit()` answers that with `SIGKILL` (findings §14) | Run `build/extract/cli.js`, not `root/cli.js`; rebuild if `bun-ant.mjs` is missing beside it |
 | `TypeError: (intermediate value).require is not a function` / `ERR_MODULE_NOT_FOUND` for `ws` / `ERR_REQUIRE_CYCLE_MODULE` under Node | A code-split (2.1.280+) build under Node. Not supported yet: Node has no `import.meta.require`, and refuses `require()` of an ES module inside an import cycle that Bun allows (findings §14) | Run it under Bun; `make node-run` refuses a code-split build for this reason |
 | Images are refused with *"Unable to resize image…"* | **Not expected in a default build.** It means the artifact predates the shim, was built with `NRC_NO_IMAGE_SHIM` non-empty, or the shim refused on this Claude release | `grep -o 'if(true)try' build/extract/cli.original.cjs \| wc -l` prints **1** for a shimmed build and **0** for an as-shipped one (measured on all three real binaries). If 0, rebuild without the env var and read the `image shim` lines: a refusal names which of three things drifted — the gate **declaration**'s minified shape, the **anchor** string, or the `if(<gate>())try{` branch shape (findings §10). Never "fix" it by flipping `Bun.isStandaloneExecutable` globally: measured, that silently breaks `Grep` |
-| `ripgrep not found on PATH` | Embedded ripgrep needs a standalone; this build uses a system `rg` (findings §10) | Install `ripgrep` |
+| `ripgrep not found on PATH` | Embedded ripgrep needs a standalone; this build uses a system `rg` (findings §10). The Glob and Grep tools need it too, since the embedded-search gate is off | Install `ripgrep` |
+| A Bash `grep` or `find` prints `error: Invalid Argument '-G'` (or `'-S'`) and then Bun's help | An artifact built **before** 2026-09-23. Claude's shell snapshot runs `grep`/`find` as its embedded ugrep/bfs by re-execing `$CLAUDE_CODE_EXECPATH`, and here that is bun (findings §10, *Embedded search*). The tool result says `is_error: false`, so the model may carry on as if nothing matched | Rebuild: the build log should say `embedded search off    : 1`. Without a rebuild, start the artifact with `--allowedTools='Glob(/nonexistent/**)'`. Claude's own opt-in turns the shadowing off, and the rule grants nothing. Keep the `=`, because the flag is variadic. A bare `--allowedTools=Grep` works too, but it also pre-approves Grep on every path |
 | Missing `rg` does **not** always announce itself | Observed 2026-08-26 on a Mac with no ripgrep: the file-scan spawns fail with `ENOENT` and the TUI simply never paints - no message, no error, no exit. The failure is silent because the spawn error arrives asynchronously; `scripts/node-trace.cjs` is what made it visible, and only after it learned to follow children to their exit | `command -v rg` before blaming the runtime. Note `USE_BUILTIN_RIPGREP` cannot substitute: the embedded copy is gated behind standalone mode, which this build is not |
-| `postprocess.py` exits non-zero and writes nothing | one of `check()`'s **six** fatal conditions (findings §6) | The error names which. Shape problems (IIFE, `(function`) mean the entry module changed — read its last ~200 bytes and re-measure before editing a regex. A surviving reference means a `/$bunfs/` shape the rewriter does not cover. A missing asset means `extract_bun.py` dropped a loader kind. Zero rewrites with populated assets means a different VFS prefix ([status.md](./status.md) § Windows/PE). Failed shim arithmetic means the one-site rewrite spread, and nothing is written deliberately, because the site it would reach next is embedded ripgrep. `not counted (no gate identified)` is not an error on its own — it is the honest reading when no gate declaration matched |
+| `postprocess.py` exits non-zero and writes nothing | one of `check()`'s **seven** fatal conditions (findings §6) | The error names which. Shape problems (IIFE, `(function`) mean the entry module changed — read its last ~200 bytes and re-measure before editing a regex. A surviving reference means a `/$bunfs/` shape the rewriter does not cover. A missing asset means `extract_bun.py` dropped a loader kind. Zero rewrites with populated assets means a different VFS prefix ([status.md](./status.md) § Windows/PE). An `embedded-search gate` error means the gate or the find/grep shadow generator changed shape in this Claude release, while its shadowing is still present. It is fatal because the artifact would run bun for every Bash `grep`. Re-measure both shapes (findings §10) before touching `SEARCH_GATE_DEF`. Failed shim arithmetic means the one-site rewrite spread, and nothing is written deliberately, because the site it would reach next is embedded ripgrep. `not counted (no gate identified)` is not an error on its own — it is the honest reading when no gate declaration matched |
 | `Cannot find module '.../assets/X.node'` | asset not extracted, or its path not rewritten | Should be unreachable from a build that succeeded: `check()` fails when the rewritten code references an asset that is not on disk. If you see it anyway, the artifact and its `assets/` came from different runs — rebuild |
 | A mermaid/highlight/chart feature breaks | a `file`-loader asset still referenced via `/$bunfs/`, or an unverified runtime path | The rewritten path shape is verified to work, but no command here has exercised these three features — [status.md](./status.md) remaining work #3 |
 | `error: PE (Windows) executable detected` | you pointed the extractor at `claude.exe` | Not supported by design — [status.md](./status.md) § Windows/PE |
