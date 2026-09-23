@@ -112,9 +112,20 @@ def _real_shaped(env_var, want_esm, magic, kind, *defaults):
     for path in candidates:
         if not (path and os.path.isfile(path)):
             continue
-        _usable(path, magic, kind, env_var)
+        if override:
+            _usable(path, magic, kind, env_var)     # named on purpose: say why not
+        elif _magic(path) != magic:
+            seen.append(f"{path} (not {kind})")     # a default: try the next one
+            continue
         fmt = _entry_format(path)
-        if (fmt == 1) == want_esm and fmt is not None:
+        if fmt is None:
+            # The right container magic and still unparsable is not a missing
+            # specimen: it is the extractor under test failing on a real
+            # binary, and a skip would hide exactly that regression.
+            pytest.fail(f"{path} is a {kind} binary but tools/extract_bun.py cannot "
+                        f"parse its Bun graph - a regression in the extractor, or a "
+                        f"corrupt specimen; set {env_var} to rule out the latter")
+        if (fmt == 1) == want_esm:
             return path
         seen.append(f"{path} (entry format {fmt})")
     shape = "code-split (esm)" if want_esm else "legacy (cjs)"

@@ -21,8 +21,14 @@ POLYFILL = os.path.join(ROOT, "scripts", "bun-ant.mjs")
 PROBE = r"""
 import { bunAnt, installBunAnt } from "%s";
 import net from "node:net"; import os from "node:os"; import path from "node:path"; import fs from "node:fs";
+import cp from "node:child_process";
 const out = {};
-function t(k, fn) { try { const v = fn(); out[k] = v; } catch (e) { out[k] = "THREW " + e.message; } }
+let child;
+function t(k, fn) {
+  try { const r = fn(); out[k] = r === null ? null : r === child?.pid ? "CHILD" : r === process.getuid() ? "UID"
+    : r === process.pid ? "SELF" : r; }
+  catch (e) { out[k] = "THREW " + e.message; }
+}
 out.installedOnStockBun = typeof Bun.ant === "object" && typeof Bun.ant.CellSegmenter === "function";
 out.members = Object.keys(Bun.ant).sort();
 out.lengths = Object.fromEntries(["getPeerPid", "getPeerUid", "setDumpable", "memoryPressureLevel"].map((k) => [k, Bun.ant[k].length]));
@@ -30,35 +36,43 @@ const real = { CellSegmenter: function Native() {}, marker: 1 };
 const target = { ant: real };
 out.keepsANativeOne = installBunAnt(target) === false && target.ant === real;
 t("mem", () => Bun.ant.memoryPressureLevel());
-t("peerPid_-1", () => Bun.ant.getPeerPid(-1));
-t("peerPid_999", () => Bun.ant.getPeerPid(999));
-t("peerPid_str", () => Bun.ant.getPeerPid("3"));
-t("peerUid_-1", () => Bun.ant.getPeerUid(-1));
 t("dump_true", () => Bun.ant.setDumpable(true));
 t("dump_false", () => Bun.ant.setDumpable(false));
+for (const bad of [-1, 999, Infinity, 2 ** 32]) t("peerPid:" + bad, () => Bun.ant.getPeerPid(bad));
 const sock = path.join(os.tmpdir(), "nrc-t-" + process.pid + ".sock");
 const srv = net.createServer((c) => {
-  const fd = c._handle && c._handle.fd;
-  t("peerPid_conn_is_self", () => Bun.ant.getPeerPid(fd) === process.pid);
-  t("peerUid_conn_is_self", () => Bun.ant.getPeerUid(fd) === process.getuid());
-  c.end(); srv.close(); try { fs.unlinkSync(sock); } catch {}
+  const fd = c._handle.fd;
+  const cases = { num: fd, str: String(fd), float: fd + 0.7, obj: { valueOf() { return fd; } }, arr: [fd],
+    none: undefined, nul: null, junk: fd + "x", neg_float: -0.5, bool: true };
+  for (const [k, v] of Object.entries(cases)) {
+    t("getPeerPid:" + k, () => Bun.ant.getPeerPid(v));
+    t("getPeerUid:" + k, () => Bun.ant.getPeerUid(v));
+  }
+  c.destroy(); srv.close(); child.kill(); try { fs.unlinkSync(sock); } catch {}
   console.log(JSON.stringify(out)); process.exit(0);
 });
-srv.listen(sock, () => { net.connect(sock); });
+srv.listen(sock, () => {
+  // the peer is ANOTHER process, so its pid cannot be mistaken for our own
+  child = cp.spawn("/usr/bin/python3", ["-c", "import socket,sys,time; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); time.sleep(10)", sock], { stdio: "ignore" });
+});
+setTimeout(() => { console.log(JSON.stringify(out)); process.exit(1); }, 8000);
 """
 
-# Measured in the native 2.1.280 runtime on Linux x64, 2026-09-22.
+# Measured in the native 2.1.280 runtime on Linux x64, 2026-09-22/23, with a
+# python3 process as the peer and stdin on /dev/null (so fd 0 is no socket).
+# The argument is coerced like ToNumber: NaN counts as 0, it is truncated, and
+# a negative or > 2^31-1 fd answers null.
 NATIVE = {
     "mem": "THREW Bun.ant.memoryPressureLevel() is only supported on macOS",
-    "peerPid_-1": None,
-    "peerPid_999": None,
-    "peerPid_str": None,
-    "peerUid_-1": None,
-    "dump_true": True,
-    "dump_false": True,
-    "peerPid_conn_is_self": True,
-    "peerUid_conn_is_self": True,
+    "dump_true": True, "dump_false": True,
+    "peerPid:-1": None, "peerPid:999": None, "peerPid:Infinity": None, "peerPid:4294967296": None,
 }
+for _case in ("num", "str", "float", "obj", "arr"):
+    NATIVE["getPeerPid:" + _case] = "CHILD"
+    NATIVE["getPeerUid:" + _case] = "UID"
+for _case in ("none", "nul", "junk", "neg_float", "bool"):   # fd 0 or 1: not sockets here
+    NATIVE["getPeerPid:" + _case] = None
+    NATIVE["getPeerUid:" + _case] = None
 
 
 @pytest.fixture(scope="module")
@@ -67,7 +81,7 @@ def probe(bun_bin, tmp_path_factory):
     script = d / "probe.mjs"
     script.write_text(PROBE % POLYFILL)
     r = subprocess.run([bun_bin, str(script)], capture_output=True, text=True, timeout=60,
-                       env={"PATH": "/usr/bin:/bin"})
+                       env={"PATH": "/usr/bin:/bin"}, stdin=subprocess.DEVNULL)
     assert r.returncode == 0, r.stderr
     return json.loads(r.stdout.strip().splitlines()[-1])
 

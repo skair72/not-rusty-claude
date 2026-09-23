@@ -458,7 +458,11 @@ node-deps:
 # The Node counterpart of `smoke`. Same command, same throwaway config dir, so
 # the two are directly comparable by eye; tests/test_node_runtime.py is what
 # compares them byte for byte.
-node-run: node-deps
+# A code-split build is refused before node-deps can reach npm: the refusal
+# is the recipe's first line, and node-deps is only a prerequisite when the
+# built artifact is not one ($(wildcard) is evaluated when make reads this).
+NODE_RUN_PREREQ := $(if $(wildcard $(OUT_DIR)/extract/manifest.json),,node-deps)
+node-run: $(NODE_RUN_PREREQ)
 	@set -eu; \
 	mods="$${NRC_TEST_NODE_MODULES:-$(NODE_MODULES)}"; \
 	art='$(OUT_DIR)/extract/cli.original.cjs'; \
@@ -540,7 +544,8 @@ test:
 	  exit 1; \
 	fi; \
 	echo '==> test inputs (a missing one skips its tests; it is not a failure)'; \
-	if [ -n "$$elf" ] && [ -f "$$elf" ]; then printf '    %-22s RUN    %s [%s]\n' 'ELF Claude binary' "$$elf" "$$elfsrc"; \
+	if [ -n "$$elf" ] && [ -f "$$elf" ] && [ "$$elfsrc" = default ]; then printf '    %-22s RUN    %s [%s]\n' 'ELF Claude binary' "$$elf, and the cached download for the legacy-shape tests" 'default: the tests pick each by graph shape'; \
+	  elif [ -n "$$elf" ] && [ -f "$$elf" ]; then printf '    %-22s RUN    %s [%s]\n' 'ELF Claude binary' "$$elf" "$$elfsrc"; \
 	  else printf '    %-22s SKIP   not found - set NRC_TEST_ELF, or `make binary` on Linux\n' 'ELF Claude binary'; fi; \
 	if [ -n "$$macho" ] && [ -f "$$macho" ]; then printf '    %-22s RUN    %s [%s]\n' 'Mach-O Claude binary' "$$macho" "$$msrc"; \
 	  else printf '    %-22s SKIP   not found - set NRC_TEST_MACHO, or `make binary` on macOS\n' 'Mach-O Claude binary'; fi; \
@@ -563,7 +568,7 @@ test:
 	echo '    Every skip this suite can produce comes from one of the rows'; \
 	echo '    above; the SKIPPED lines pytest prints at the end give the counts.'; \
 	echo '==> running'; \
-	if [ -n "$$elf" ]; then NRC_TEST_ELF="$$elf"; export NRC_TEST_ELF; fi; \
+	if [ -n "$$elf" ] && [ "$$elfsrc" != default ]; then NRC_TEST_ELF="$$elf"; export NRC_TEST_ELF; fi; \
 	if [ -n "$$macho" ]; then NRC_TEST_MACHO="$$macho"; export NRC_TEST_MACHO; fi; \
 	if [ -n "$$bun" ]; then BUN_BIN="$$bun"; export BUN_BIN; fi; \
 	if [ -n "$$node" ]; then NRC_TEST_NODE="$$node"; export NRC_TEST_NODE; fi; \

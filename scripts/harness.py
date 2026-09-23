@@ -13,19 +13,28 @@ failure, run it again.
     scripts/harness.py --artifact build/extract/cli.js   # skip the build
 
 What it compares, by group:
-  build      build.sh succeeds and reports the counts it should
+  build      build.sh succeeds, runs its own parser gate, and its counts add
+             up to the manifest (plus the Chrome self-spawn rewrite applied)
+  provenance the native version, and whether the artifact carries the polyfill
+             now in scripts/ (a stale artifact fails)
   structure  every relative specifier and runtime path in root/ exists
-  parse      stock Bun parses every emitted module
+  parse      scripts/verify-tree.js: Bun parses every module, and every module
+             keeps exactly the import records it had before the rewrite
   text       every text module require()s to the native string
-  cli        stdout + exit code of non-interactive commands, native vs artifact
+  cli        non-interactive commands, EVERY step's exit code, stdout and
+             stderr; the Chrome MCP server; Claude's own Chrome-MCP config
+             spawned exactly as Claude would spawn it
   agentic    mock-API turns (text, Bash, Read, Read of a large PNG, Grep,
-             Write): the tool_result each side sent back up, compared
+             Write, Glob, function hooks): the tool results and the full
+             request bodies each side sent up
   tui        the interactive TUI under a pty, screens compared through
-             scripts/vtscreen.py: onboarding, and a REPL turn plus a clean exit
-  bunant     Bun.ant: the polyfill against the native members (the native
-             binary honours BUN_OPTIONS=--preload, so probes run inside it)
-  segmenter  CellSegmenter differential fuzz, native vs polyfill
-  pytest     the repo's own suite
+             scripts/vtscreen.py with styles and links: onboarding, a REPL
+             turn and a REPL turn full of unicode, request bodies, clean exit
+  bunant     Bun.ant: the polyfill against the native members, with a real
+             peer process on the socket (the native binary honours
+             BUN_OPTIONS=--preload, so probes run inside it)
+  segmenter  CellSegmenter differential fuzz, native vs polyfill, every case
+  pytest     the repo's own suite, pointed at the same native binary
 
 SAFETY. The native binary is executed here, unlike in the build pipeline -
 that is the point of an A/B. Every run gets a throwaway HOME and
@@ -56,7 +65,7 @@ sys.path.insert(0, HERE)
 import vtscreen  # noqa: E402
 
 FAKE_KEY = "sk-ant-harness-fake-key-000000000000"
-GROUPS = ["build", "structure", "parse", "text", "cli", "agentic", "tui",
+GROUPS = ["build", "provenance", "structure", "parse", "text", "cli", "agentic", "tui",
           "bunant", "segmenter", "pytest"]
 
 
@@ -117,11 +126,12 @@ class Ctx:
         return env
 
 
-def run(argv, env, cwd=None, timeout=120, stdin=subprocess.DEVNULL):
+def run(argv, env, cwd=None, timeout=120, stdin=subprocess.DEVNULL, input_data=None):
     t0 = time.time()
     try:
-        p = subprocess.run(argv, env=env, cwd=cwd, stdin=stdin, timeout=timeout,
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        kw = {"input": input_data} if input_data is not None else {"stdin": stdin}
+        p = subprocess.run(argv, env=env, cwd=cwd, timeout=timeout,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kw)
         rc, out, err = p.returncode, p.stdout, p.stderr
     except subprocess.TimeoutExpired as e:
         rc, out, err = "timeout", e.stdout or b"", e.stderr or b""
@@ -167,11 +177,15 @@ class Mock:
             argv += ["--tool-input", json.dumps(tool_input)]
         self.proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL, env={"PATH": "/usr/bin:/bin"})
-        for _ in range(100):
-            if os.path.exists(self.ready) and open(self.ready).read().strip():
-                break
-            time.sleep(0.05)
-        self.port = int(open(self.ready).read().strip())
+        try:
+            for _ in range(200):
+                if os.path.exists(self.ready) and open(self.ready).read().strip():
+                    break
+                time.sleep(0.05)
+            self.port = int(open(self.ready).read().strip())
+        except (OSError, ValueError):
+            self.stop()   # the caller's finally has not started yet
+            raise RuntimeError("the mock did not come up within 10 s")
 
     def reset_logs(self):
         for p in (self.log, self.bodies):
@@ -238,6 +252,19 @@ def pty_session(argv, env, cwd, steps, rows=30, cols=100, total_timeout=120):
     proc = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=slave, env=env,
                             cwd=cwd, start_new_session=True, close_fds=True)
     os.close(slave)
+    try:
+        return _drive(proc, master, steps, rows, cols, total_timeout)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        try:
+            os.close(master)
+        except OSError:
+            pass
+
+
+def _drive(proc, master, steps, rows, cols, total_timeout):
     scr = vtscreen.Screen(rows, cols)
     snaps, timeline = {}, []
     deadline = time.time() + total_timeout
@@ -272,6 +299,7 @@ def pty_session(argv, env, cwd, steps, rows=30, cols=100, total_timeout=120):
                 pass
         elif kind == "snap":
             snaps[step[1]] = scr.text()
+            snaps[step[1] + ":styled"] = scr.styled_text()
         elif kind == "until":
             end = time.time() + step[2]
             found = False
@@ -290,10 +318,6 @@ def pty_session(argv, env, cwd, steps, rows=30, cols=100, total_timeout=120):
         proc.kill()
         proc.wait()
         rc = "killed"
-    try:
-        os.close(master)
-    except OSError:
-        pass
     return rc, scr, snaps, timeline
 
 
@@ -315,10 +339,29 @@ def check_build(ctx):
     ctx.artifact = entry
     counts = {}
     for line in log.splitlines():
-        m = re.match(r"^\s*([a-zA-Z/$ ]+?)\s*: (.*)$", re.sub(r"\x1b\[[0-9;]*m", "", line))
+        m = re.match(r"^\s*([a-zA-Z/$' -]+?)\s*: (.*)$", re.sub(r"\x1b\[[0-9;]*m", "", line))
         if m and len(m.group(1)) < 30:
             counts[m.group(1).strip()] = m.group(2).strip()
-    return [Result("build", "PASS", "artifact %s" % entry, {"counts": counts})]
+    problems = []
+    manifest = _manifest(ctx)
+    if manifest:
+        # the counts add up, and describe THIS artifact
+        m = re.match(r"(\d+) \((\d+) js rewritten, (\d+) text wrapped, (\d+) copied\)",
+                     counts.get("modules", ""))
+        if not m:
+            problems.append("no modules line in the build log")
+        else:
+            total, js, text, copied = map(int, m.groups())
+            if total != js + text + copied or total != len(manifest["modules"]):
+                problems.append("module counts do not add up: %s against %d in the manifest"
+                                % (counts["modules"], len(manifest["modules"])))
+        if not str(counts.get("self-spawns given entry", "")).startswith("1"):
+            problems.append("the Claude-in-Chrome self-spawn was not given the entry")
+        if "verifying the rewired tree" not in log:
+            problems.append("build.sh did not run scripts/verify-tree.js")
+    return [Result("build", "FAIL" if problems else "PASS",
+                   "artifact %s%s" % (entry, "; " + "; ".join(problems) if problems else ""),
+                   {"counts": counts})]
 
 
 _SPEC = re.compile(r"""(?:\bfrom|\bimport|\bimport\s*\(|\brequire\s*\()\s*(["'])(\.{1,2}/[^"']+)\1""")
@@ -454,36 +497,46 @@ def check_text(ctx):
                    {"differ": diff[:20]})]
 
 
-def _cli_pair(ctx, name, argv, cwd_files=None, setup=None, allow=()):
-    """Run argv on both sides; compare rc and normalized stdout."""
-    sides = {}
+def _cli_pair(ctx, name, steps, allow=(), input_data=None):
+    """Run each step on both sides, one throwaway HOME per side, in order.
+    EVERY step's exit code, stdout and stderr must match (lines matching
+    `allow` excepted) - a round trip is judged step by step, not by its end
+    state, which an add/get/remove that did nothing would reach as well."""
+    steps = steps if isinstance(steps[0], list) else [steps]
+    runs = {}
     for side in ("native", "artifact"):
         home = ctx.scratch("cli", name, side)
         work = os.path.join(home, "work")
         os.makedirs(work)
         env = ctx.base_env(home)
-        if setup:
-            setup(env, work)
-        r = None
-        for sub in argv if isinstance(argv[0], list) else [argv]:
-            r = run(ctx.argv(side) + sub, env, cwd=work, timeout=120)
-            r["norm"] = normalize(r["stdout"], ctx, [(work, "<WORK>"), (home, "<HOME>")])
-            sides.setdefault("steps_" + side, []).append({"argv": sub, "rc": r["rc"]})
-        sides[side] = r
-    n, a = sides["native"], sides["artifact"]
-    lines_n = [l for l in n["norm"].splitlines() if not any(re.search(p, l) for p in allow)]
-    lines_a = [l for l in a["norm"].splitlines() if not any(re.search(p, l) for p in allow)]
-    same_out = lines_n == lines_a
-    same_rc = n["rc"] == a["rc"]
-    status = "PASS" if same_out and same_rc and a["rc"] != "timeout" else "FAIL"
-    details = {"rc": [n["rc"], a["rc"]], "secs": [n["secs"], a["secs"]],
-               "first_diff": first_diff("\n".join(lines_n), "\n".join(lines_a)),
-               "allowed_patterns": list(allow)}
-    if status == "FAIL":
-        details["artifact_stderr"] = a["stderr"][-1500:]
-    return Result("cli:" + name, status,
-                  "rc %s/%s, stdout %s" % (n["rc"], a["rc"], "equal" if same_out else "DIFFERS"),
-                  details)
+        paths = [(work, "<WORK>"), (home, "<HOME>")]
+        runs[side] = []
+        for sub in steps:
+            r = run(ctx.argv(side) + sub, env, cwd=work, timeout=120, input_data=input_data)
+
+            def keep(text):
+                return "\n".join(l for l in normalize(text, ctx, paths).split("\n")
+                                 if not any(re.search(p, l) for p in allow))
+            runs[side].append({"argv": sub, "rc": r["rc"], "out": keep(r["stdout"]),
+                               "err": keep(r["stderr"]), "secs": r["secs"]})
+    diffs = []
+    for i, (n, a) in enumerate(zip(runs["native"], runs["artifact"])):
+        for k in ("rc", "out", "err"):
+            if n[k] != a[k]:
+                diffs.append({"step": i, "argv": n["argv"], "what": k,
+                              "diff": [n["rc"], a["rc"]] if k == "rc" else first_diff(n[k], a[k])})
+    timeout = any(x["rc"] == "timeout" for x in runs["native"] + runs["artifact"])
+    empty = all(not x["out"] and not x["err"] for x in runs["native"])
+    status = "PASS" if not diffs and not timeout and not empty else "FAIL"
+    what = ("%d step(s): exit code, stdout and stderr equal" % len(steps) if not diffs
+            else "step %d (%s) %s DIFFERS" % (diffs[0]["step"], " ".join(diffs[0]["argv"]), diffs[0]["what"]))
+    if empty:
+        what += "; native printed NOTHING, so equality proves nothing"
+    return Result("cli:" + name, status, what,
+                  {"diffs": diffs[:10], "rc": [[x["rc"] for x in runs[s_]] for s_ in ("native", "artifact")],
+                   "secs": [[x["secs"] for x in runs[s_]] for s_ in ("native", "artifact")],
+                   "allowed_patterns": list(allow),
+                   "native_out": [x["out"][-800:] for x in runs["native"]]})
 
 
 # doctor lines that name the interpreter or the install, which differ by
@@ -496,6 +549,127 @@ def _cli_pair(ctx, name, argv, cwd_files=None, setup=None, allow=()):
 # install identity or search, i.e. the documented gap - nothing else may differ.
 DOCTOR_ALLOWED = (r"^Running: ", r"^Package manager: ", r"^Path: ", r"^Invoked: ",
                   r"install method", r"^Search: ", r"^Auto-updates: ")
+
+MCP_INITIALIZE = (b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":'
+                  b'"2025-06-18","capabilities":{},"clientInfo":{"name":"harness","version":"1"}}}\n')
+
+# Claude's own Chrome-MCP config function, called on each side, and what it
+# returns spawned exactly as Claude would spawn it. Natively the command is
+# claude itself; in the artifact it is bun, and the entry must be in args or
+# `bun --claude-in-chrome-mcp` prints Bun's help (postprocess.py SELF_SPAWNS).
+CHROME_PROBE = r"""
+const { spawn } = require("child_process");
+const mod = await import(process.env.NRC_CHUNK);
+const cfg = mod[process.env.NRC_EXPORT]();
+const env = { ...process.env };
+delete env.BUN_OPTIONS;   // or a native child would run this probe again
+const child = spawn(cfg.command, cfg.args, { env, stdio: ["pipe", "pipe", "ignore"] });
+let out = "";
+const done = (why) => {
+  child.kill();
+  console.log(JSON.stringify({ args: cfg.args.map((a) => a === process.argv[1] ? "<ENTRY>" : a),
+    why, response: out.split("\n").find((l) => l.includes('"id":1')) || null }));
+  process.exit(0);
+};
+child.stdout.on("data", (d) => { out += d; if (out.includes('"id":1')) done("answered"); });
+child.on("exit", (code) => done("exited " + code));
+child.stdin.write(process.env.NRC_INPUT);   // stdin stays open: EOF would race the reply
+setTimeout(() => done("timeout"), 30000);
+"""
+
+
+def mcp_handshake(argv, env, cwd=None, timeout=30):
+    """Start an MCP stdio server, send initialize, return the id:1 reply line
+    (or None). stdin stays open until the reply: closing it at once races the
+    server's answer against its EOF handling."""
+    proc = subprocess.Popen(argv, env=env, cwd=cwd, stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    buf, reply = b"", None
+    try:
+        proc.stdin.write(MCP_INITIALIZE)
+        proc.stdin.flush()
+        deadline = time.time() + timeout
+        while time.time() < deadline and reply is None:
+            ready, _, _ = select.select([proc.stdout], [], [], 0.2)
+            if ready:
+                chunk = os.read(proc.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                buf += chunk
+                for line in buf.split(b"\n"):
+                    if b'"id":1' in line:
+                        reply = line.decode("utf-8", "replace")
+    finally:
+        proc.kill()
+        proc.wait()
+    return reply
+
+
+def _chrome_mcp_export(ctx):
+    """(chunk file name, export name) of the Chrome-MCP config function in the
+    artifact, found by its shape - never by calling exports to see."""
+    root = os.path.join(ctx.extract_dir, "root")
+    fn = re.compile(r"function ([\w$]+)\(\)\{return\{type:\"stdio\",command:process\.execPath,"
+                    r"args:\[(?:process\.argv\[1\],)?\"--claude-in-chrome-mcp\"")
+    for path in _js_modules(ctx):
+        if os.path.dirname(path) != root:
+            continue
+        name = os.path.basename(path)
+        code = open(path, encoding="utf-8").read()
+        m = fn.search(code)
+        if not m:
+            continue
+        local = m.group(1)
+        for clause in re.findall(r"export\{([^}]*)\}", code):
+            for item in clause.split(","):
+                parts = item.strip().split(" as ")
+                if parts[0] == local:
+                    return name, parts[-1]
+    return None, None
+
+
+def check_chrome_mcp_server(ctx):
+    """The Chrome MCP server itself, started by hand the way the legacy sibling
+    started it: an initialize must get the same reply on both sides."""
+    got = {}
+    for side in ("native", "artifact"):
+        home = ctx.scratch("chrome-server", side)
+        got[side] = mcp_handshake(ctx.argv(side) + ["--claude-in-chrome-mcp"], ctx.base_env(home))
+    ok = got["native"] is not None and got["native"] == got["artifact"]
+    return Result("cli:chrome-mcp-server", "PASS" if ok else "FAIL",
+                  "initialize answered %s" % ("identically" if ok else "DIFFERENTLY (or not at all)"), got)
+
+
+def check_chrome_mcp_spawn(ctx):
+    chunk, export = _chrome_mcp_export(ctx)
+    if not chunk:
+        return Result("cli:chrome-mcp-spawn", "FAIL", "no Chrome-MCP config function found in root/")
+    d = ctx.scratch("chrome")
+    probe = os.path.join(d, "probe.mjs")
+    open(probe, "w").write(CHROME_PROBE)
+    got = {}
+    for side in ("native", "artifact"):
+        home = ctx.scratch("chrome", side)
+        env = ctx.base_env(home, extra={"NRC_EXPORT": export,
+                                        "NRC_INPUT": MCP_INITIALIZE.decode()})
+        if side == "native":
+            env["NRC_CHUNK"] = "/$bunfs/root/" + chunk
+            env["BUN_OPTIONS"] = "--preload " + probe
+            r = run([ctx.native, "--version"], env, timeout=120)
+        else:
+            env["NRC_CHUNK"] = os.path.join(ctx.extract_dir, "root", chunk)
+            r = run([ctx.bun, "--preload", probe, ctx.artifact, "--version"], env, timeout=120)
+        try:
+            got[side] = json.loads(r["stdout"].strip().split("\n")[-1])
+        except (ValueError, IndexError):
+            got[side] = {"error": (r["stdout"] + r["stderr"])[-600:]}
+    n, a = got["native"], got["artifact"]
+    answered = '"serverInfo":{"name":"Claude in Chrome"' in str(a.get("response"))
+    same = n.get("response") == a.get("response") and n.get("response") is not None
+    return Result("cli:chrome-mcp-spawn", "PASS" if answered and same else "FAIL",
+                  "Claude's own config spawned on each side: %s, response %s" % (
+                      "server answered" if answered else "NO SERVER", "equal" if same else "DIFFERS"),
+                  {"native": n, "artifact": a, "export": [chunk, export]})
 
 
 def check_cli(ctx):
@@ -513,6 +687,9 @@ def check_cli(ctx):
         _cli_pair(ctx, "auth-status", ["auth", "status"]),
         _cli_pair(ctx, "doctor", ["doctor"], allow=DOCTOR_ALLOWED),
     ]
+    out.append(check_chrome_mcp_server(ctx))
+    if _manifest(ctx):
+        out.append(check_chrome_mcp_spawn(ctx))
     return out
 
 
@@ -670,27 +847,17 @@ def check_agentic(ctx):
                     break
         same = (n["rc"] == a["rc"] and n["final"] == a["final"]
                 and n["tool_results"] == a["tool_results"] and n["written"] == a["written"]
-                and len(n["requests"]) == len(a["requests"]))
-        note = ""
-        if not same and name == "read-png":
-            # the resize path runs through two different Bun.Image builds; equal
-            # decoded dimensions and media type is the equivalence that matters
-            def shape(side):
-                return [[{k: v for k, v in c.items() if k != "bytes"} for c in tr["content"]]
-                        for tr in side["tool_results"]]
-            if (n["rc"] == a["rc"] and n["final"] == a["final"] and shape(n) == shape(a)):
-                same, note = True, " (image bytes differ, dimensions and type equal)"
+                and n["files"] == a["files"] and len(n["requests"]) == len(a["requests"]))
+        # No relaxation for the image turn: measured, both Bun.Image builds
+        # produce the same resized bytes, so they are compared like everything
+        # else, inside the tool result and inside the request body.
         ok_turn = a["final"] is not None and a["final"].get("result") == "MOCK-DONE"
-        # the read-png turn sends the image back up, so its second body carries
-        # the resized bytes: judged by the dimension rule above, not verbatim
-        bodies_ok = bodies_equal or (name == "read-png" and same and nb[:1] == ab[:1])
-        status = "PASS" if same and ok_turn and bodies_ok else "FAIL"
+        status = "PASS" if same and ok_turn and bodies_equal and nb else "FAIL"
         results.append(Result("agentic:" + name, status,
-                              "rc %s/%s, %d/%d requests, results %s, request bodies %s%s" % (
+                              "rc %s/%s, %d/%d requests, results %s, request bodies %s" % (
                                   n["rc"], a["rc"], len(n["requests"]), len(a["requests"]),
                                   "equal" if same else "DIFFER",
-                                  "equal" if bodies_equal else ("equal bar the image" if bodies_ok else "DIFFER"),
-                                  note),
+                                  "equal" if bodies_equal else "DIFFER"),
                               {"native": {k: v for k, v in n.items() if k != "stderr"},
                                "artifact": a, "body_diff": body_diff}))
     return results
@@ -700,16 +867,30 @@ def check_agentic(ctx):
 
 def _seed_repl_config(env, work):
     cfg = os.path.join(env["CLAUDE_CONFIG_DIR"], ".claude.json")
+    # prefersReducedMotion: the mascot's startup entrance is drawn at random from
+    # skip/jump/look/spin, so two identical runs would animate differently
     json.dump({"hasCompletedOnboarding": True, "theme": "dark", "numStartups": 3,
+               "prefersReducedMotion": True,
                "customApiKeyResponses": {"approved": [FAKE_KEY[-20:]], "rejected": []},
                "projects": {work: {"hasTrustDialogAccepted": True,
                                    "hasCompletedProjectOnboarding": True}}},
               open(cfg, "w"))
 
 
-def _below(text, marker):
-    i = text.find(marker)
-    return text[i:] if i >= 0 else None
+def _below(plain, styled, marker):
+    """The styled rows from the first row whose PLAIN text holds `marker` on:
+    style markers may split the words, so the anchor is found without them."""
+    rows = (plain or "").split("\n")
+    for i, row in enumerate(rows):
+        if marker in row:
+            return "\n".join((styled or "").split("\n")[i:])
+    return None
+
+
+# Terminal hyperlinks are only emitted when the terminal claims support;
+# forcing it on both sides puts OSC 8 - and so the segmenter's link runs -
+# on the screen being compared.
+TUI_ENV = {"FORCE_HYPERLINK": "1", "COLORTERM": "truecolor"}
 
 
 def check_tui(ctx):
@@ -718,16 +899,21 @@ def check_tui(ctx):
     screens = {}
     for side in ("native", "artifact"):
         home = ctx.scratch("tui", "onboarding", side)
-        env = ctx.base_env(home)
+        env = ctx.base_env(home, extra=TUI_ENV)
         rc, scr, snaps, tl = pty_session(ctx.argv(side), env, home, [
             ("until", "Choose the text style", 30), ("wait", 1.5), ("snap", "picker"),
             ("send", "\x03"), ("wait", 0.5), ("send", "\x03"), ("wait", 1)], total_timeout=60)
-        screens[side] = {"rc": rc, "picker": snaps.get("picker", ""), "found": tl}
-    n = _below(screens["native"]["picker"], "Let's get started")
-    a = _below(screens["artifact"]["picker"], "Let's get started")
-    ok = n is not None and n == a
+        screens[side] = {"rc": rc, "plain": snaps.get("picker", ""),
+                         "picker": snaps.get("picker:styled", ""), "found": tl}
+    # below the animated logo, whose sparkles are placed at random
+    n = _below(screens["native"]["plain"], screens["native"]["picker"], "Let's get started")
+    a = _below(screens["artifact"]["plain"], screens["artifact"]["picker"], "Let's get started")
+    same_rc = screens["native"]["rc"] == screens["artifact"]["rc"]
+    ok = n is not None and n == a and same_rc
     results.append(Result("tui:onboarding", "PASS" if ok else "FAIL",
-                          "theme picker %s" % ("identical below the logo" if ok else "DIFFERS"),
+                          "theme picker %s below the logo (text, styles, links); exit %s/%s" % (
+                              "identical" if n is not None and n == a else "DIFFERS",
+                              screens["native"]["rc"], screens["artifact"]["rc"]),
                           {"first_diff": first_diff(n or "", a or ""),
                            "rc": [screens["native"]["rc"], screens["artifact"]["rc"]],
                            "artifact_screen": screens["artifact"]["picker"][-3000:]}))
@@ -758,12 +944,20 @@ UNICODE_REPLY = (
     + "A long line that must wrap: " + " ".join("word%d" % i for i in range(40)) + "\n")
 
 # The one line two identical runs still draw differently: the spinner verb is
-# chosen at random ("Brewed", "Churned", ...) and the clock is the clock.
-_TUI_VOLATILE = re.compile(r"^(\s*\S)\s+\w+ for [0-9hms ]+(?: · done \d{1,2}:\d{2}(?: [AP]M)?)?\s*$")
+# chosen at random ("Brewed", "Churned", ...) and the clock is the clock. It is
+# recognised on the text with style markers removed, and replaced by its style
+# markers alone - so its colour is still compared, its words are not.
+_TUI_VOLATILE = re.compile(r"^\s*\S\s+\w+ for [0-9hms ]+(?:· done \d{1,2}:\d{2}(?: [AP]M)?)?\s*$")
+_STYLE_MARK = re.compile(r"\{[^}]*\}")
 
 
 def _tui_normalize(text):
-    return "\n".join(_TUI_VOLATILE.sub(r"\1 <STATUS>", l) for l in (text or "").splitlines())
+    out = []
+    for line in (text or "").split("\n"):
+        if _TUI_VOLATILE.match(_STYLE_MARK.sub("", line)):
+            line = "<STATUS %s>" % "".join(_STYLE_MARK.findall(line))
+        out.append(line)
+    return "\n".join(out)
 
 
 def _tui_repl(ctx, name, reply):
@@ -774,7 +968,7 @@ def _tui_repl(ctx, name, reply):
         os.makedirs(work)
         mock = Mock(ctx, "tui-%s-%s" % (name, side), tool="none", text=reply)
         try:
-            env = ctx.base_env(home, mock.port)
+            env = ctx.base_env(home, mock.port, TUI_ENV)
             _seed_repl_config(env, work)
             rc, scr, snaps, tl = pty_session(ctx.argv(side), env, work, [
                 ("until", "for shortcuts", 40), ("wait", 1.0), ("snap", "ready"),
@@ -783,23 +977,31 @@ def _tui_repl(ctx, name, reply):
                 ("send", "\x03"), ("wait", 0.5), ("send", "\x03"), ("wait", 2)], total_timeout=120)
             screens[side] = {"rc": rc, "snaps": snaps, "found": tl, "final": scr.text(),
                              "requests": mock.requests(), "alt": scr.alt_active,
-                             "cursor_visible": scr.cursor_visible}
+                             "cursor_visible": scr.cursor_visible,
+                             "bodies": normalize_bodies(mock.post_bodies(), ctx,
+                                                        [(work, "<WORK>"), (home, "<HOME>")])}
         finally:
             mock.stop()
     n, a = screens["native"], screens["artifact"]
-    ns, as_ = _tui_normalize(n["snaps"].get("answered")), _tui_normalize(a["snaps"].get("answered"))
+    ns = _tui_normalize(n["snaps"].get("answered:styled"))
+    as_ = _tui_normalize(a["snaps"].get("answered:styled"))
     answered = "MOCK-DONE" in as_
     same = ns == as_
-    ready_same = _tui_normalize(n["snaps"].get("ready")) == _tui_normalize(a["snaps"].get("ready"))
+    nr = _tui_normalize(n["snaps"].get("ready:styled"))
+    ar = _tui_normalize(a["snaps"].get("ready:styled"))
+    ready_same = nr == ar
     clean_exit = a["rc"] == n["rc"] == 0 and a["cursor_visible"] and not a["alt"]
     resume = "--resume" in a["final"]
-    ok = (answered and same and ready_same and clean_exit and resume
+    bodies = n["bodies"] == a["bodies"] and len(n["bodies"]) > 0
+    ok = (answered and same and ready_same and clean_exit and resume and bodies
           and len(a["requests"]) == len(n["requests"]))
     return Result("tui:" + name, "PASS" if ok else "FAIL",
-                  "answered=%s screen %s, ready screen %s, exit rc %s/%s restored=%s resume-hint=%s" % (
+                  "answered=%s screen %s, ready screen %s (text, styles, links), request bodies %s, "
+                  "exit rc %s/%s restored=%s resume-hint=%s" % (
                       answered, "identical" if same else "DIFFERS",
-                      "identical" if ready_same else "DIFFERS", n["rc"], a["rc"], clean_exit, resume),
-                  {"first_diff": first_diff(ns, as_),
+                      "identical" if ready_same else "DIFFERS", "equal" if bodies else "DIFFER",
+                      n["rc"], a["rc"], clean_exit, resume),
+                  {"first_diff": first_diff(ns, as_), "ready_diff": first_diff(nr, ar),
                    "native_answered": n["snaps"].get("answered", "")[-4000:],
                    "artifact_answered": a["snaps"].get("answered", "")[-4000:],
                    "artifact_final": a["final"][-1500:],
@@ -809,26 +1011,37 @@ def _tui_repl(ctx, name, reply):
 # ------------------------------------------------------------------ Bun.ant
 
 BUNANT_JS = r"""
-const net = require("net"), os = require("os"), path = require("path"), fs = require("fs");
+// The peer is a SEPARATE process (python3), so "the peer's pid" cannot be
+// confused with "my own pid" - an implementation that never asks the kernel
+// and answers process.pid fails here.
+const net = require("net"), os = require("os"), path = require("path"), fs = require("fs"), cp = require("child_process");
 const A = Bun.ant, out = {};
-function t(k, fn) { try { const v = fn(); out[k] = v === null ? null : typeof v + ":" + (typeof v === "number" && k.includes("conn") ? (v === process.pid || v === process.getuid() ? "self" : "other") : v); } catch (e) { out[k] = "THREW " + e.message; } }
+function t(k, fn) {
+  try { const r = fn(); out[k] = r === null ? null : r === child?.pid ? "CHILD" : r === process.getuid() ? "UID"
+    : r === process.pid ? "SELF" : typeof r === "boolean" ? r : "other"; }
+  catch (e) { out[k] = "THREW " + e.message; }
+}
+let child;
 t("mem", () => A.memoryPressureLevel());
-t("peerPid_-1", () => A.getPeerPid(-1));
-t("peerPid_999", () => A.getPeerPid(999));
-t("peerPid_str", () => A.getPeerPid("3"));
-t("peerUid_-1", () => A.getPeerUid(-1));
 t("dump_true", () => A.setDumpable(true));
 t("dump_false", () => A.setDumpable(false));
+for (const bad of [-1, 999, Infinity, 2 ** 32]) t("peerPid:" + bad, () => A.getPeerPid(bad));
 const sock = path.join(os.tmpdir(), "nrc-h-" + process.pid + ".sock");
 const srv = net.createServer((c) => {
-  const fd = c._handle && c._handle.fd;
-  t("peerPid_conn", () => A.getPeerPid(fd));
-  t("peerUid_conn", () => A.getPeerUid(fd));
-  c.end(); srv.close(); try { fs.unlinkSync(sock); } catch {}
+  const fd = c._handle.fd;
+  const cases = { num: fd, str: String(fd), float: fd + 0.7, obj: { valueOf() { return fd; } }, arr: [fd],
+    none: undefined, nul: null, junk: fd + "x", neg_float: -0.5, bool: true };
+  for (const [k, v] of Object.entries(cases)) {
+    t("getPeerPid:" + k, () => A.getPeerPid(v));
+    t("getPeerUid:" + k, () => A.getPeerUid(v));
+  }
+  c.destroy(); srv.close(); child.kill(); try { fs.unlinkSync(sock); } catch {}
   console.log(JSON.stringify(out)); process.exit(0);
 });
-srv.listen(sock, () => { net.connect(sock); });
-setTimeout(() => { console.log(JSON.stringify(out)); process.exit(0); }, 5000);
+srv.listen(sock, () => {
+  child = cp.spawn("/usr/bin/python3", ["-c", "import socket,sys,time; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); time.sleep(10)", sock], { stdio: "ignore" });
+});
+setTimeout(() => { console.log(JSON.stringify(out)); process.exit(1); }, 8000);
 """
 
 
@@ -848,8 +1061,12 @@ def check_bunant(ctx):
         return [Result("bunant", "FAIL", "probe did not report",
                        {"native": nat["stderr"][-800:], "artifact": art["stderr"][-800:]})]
     diff = {k: [a.get(k), b.get(k)] for k in sorted(set(a) | set(b)) if a.get(k) != b.get(k)}
-    return [Result("bunant", "FAIL" if diff else "PASS",
-                   "%d probes, %d differ" % (len(a), len(diff)), {"differ": diff, "native": a})]
+    real_peer = a.get("getPeerPid:num") == "CHILD"
+    ok = not diff and real_peer
+    return [Result("bunant", "PASS" if ok else "FAIL",
+                   "%d probes, %d differ%s" % (len(a), len(diff),
+                                               "" if real_peer else "; the native side never saw the peer"),
+                   {"differ": diff, "native": a})]
 
 
 def check_segmenter(ctx):
@@ -881,8 +1098,12 @@ def check_segmenter(ctx):
     def lines(path):
         return [l for l in open(path, encoding="utf-8").read().split("\n") if l]
     nl, al = lines(nat_out), lines(art_out)
-    bad = [i for i in range(max(len(nl), len(al)))
-           if (nl[i] if i < len(nl) else None) != (al[i] if i < len(al) else None)]
+    ncases = len(json.load(open(cases)))
+    if not (ncases == ctx.args.fuzz_cases == len(nl) == len(al)) or ncases == 0:
+        return [Result("segmenter", "FAIL", "case count mismatch: generated %d of %d, native answered "
+                       "%d, port %d" % (ncases, ctx.args.fuzz_cases, len(nl), len(al)),
+                       {"native": nat["stderr"][-800:], "artifact": art["stderr"][-800:]})]
+    bad = [i for i in range(ncases) if nl[i] != al[i]]
     detail = {}
     if bad:
         i = bad[0]
@@ -898,6 +1119,8 @@ def check_segmenter(ctx):
 
 def check_pytest(ctx):
     env = dict(os.environ, BUN_BIN=ctx.bun)
+    # the real-binary tests use the binary this harness was pointed at
+    env["NRC_TEST_ESM" if _manifest(ctx) else "NRC_TEST_ELF"] = ctx.native
     # The Node tests drive a LEGACY artifact (cli.original.cjs); hand them the
     # one just built only if that is what it is.
     legacy = os.path.join(ctx.extract_dir, "cli.original.cjs") if ctx.artifact else ""
@@ -910,10 +1133,30 @@ def check_pytest(ctx):
                    {"failures": [l for l in r["stdout"].splitlines() if l.startswith("FAILED")][:30]})]
 
 
+def check_provenance(ctx):
+    """What was compared: the native version, and whether the artifact's
+    polyfill is the one in scripts/ - an artifact built before the last edit
+    to it would otherwise be judged under a name it no longer earns."""
+    r = run([ctx.native, "--version"], ctx.base_env(ctx.scratch("provenance")), timeout=60)
+    native_version = r["stdout"].strip()
+    stale = []
+    if _manifest(ctx):
+        for name in ("bun-ant.mjs", "bun-ant-cell-segmenter.mjs"):
+            a, b = os.path.join(ctx.extract_dir, name), os.path.join(HERE, name)
+            if not (os.path.isfile(a) and open(a, "rb").read() == open(b, "rb").read()):
+                stale.append(name)
+    return [Result("provenance", "FAIL" if stale else "PASS",
+                   "native %s; artifact %s%s" % (native_version or "(no version)", ctx.artifact,
+                                                 "; STALE copies of " + ", ".join(stale) if stale else
+                                                 "; polyfill identical to scripts/"),
+                   {"native_version": native_version, "stale": stale})]
+
+
 CHECKS = {
     "build": check_build, "structure": check_structure, "parse": check_parse,
     "text": check_text, "cli": check_cli, "agentic": check_agentic, "tui": check_tui,
     "bunant": check_bunant, "segmenter": check_segmenter, "pytest": check_pytest,
+    "provenance": check_provenance,
 }
 
 
@@ -932,7 +1175,13 @@ def main():
     if args.list:
         print("\n".join(GROUPS))
         return 0
-    groups = args.only.split(",") if args.only else list(GROUPS)
+    wanted = args.only.split(",") if args.only else list(GROUPS)
+    unknown = [g for g in wanted if g not in CHECKS]
+    if unknown:
+        print("unknown group(s) %s (see --list)" % ", ".join(unknown), file=sys.stderr)
+        return 2
+    # canonical order whatever the spelling: `--only cli,build` must still build first
+    groups = [g for g in GROUPS if g in wanted]
     if args.skip:
         groups = [g for g in groups if g not in args.skip.split(",")]
     if "build" not in groups and not args.artifact:
@@ -942,18 +1191,16 @@ def main():
     ctx = Ctx(args)
     os.makedirs(ctx.out, exist_ok=True)
     for g in groups:
-        if g not in CHECKS:
-            print("unknown group %r (see --list)" % g, file=sys.stderr)
-            return 2
-        if g != "build" and not ctx.artifact:
-            ctx.results.append(Result(g, "SKIP", "no artifact (build failed or not requested)"))
-            continue
         t0 = time.time()
-        try:
-            res = CHECKS[g](ctx)
-        except Exception as e:  # a harness bug must be a FAIL, never a silent pass
-            import traceback
-            res = [Result(g, "FAIL", "harness error: %s" % e, {"traceback": traceback.format_exc()})]
+        if g != "build" and not ctx.artifact:
+            # a requested check that could not run is not a pass
+            res = [Result(g, "FAIL", "not run: no artifact (the build failed, or pass --artifact)")]
+        else:
+            try:
+                res = CHECKS[g](ctx)
+            except Exception as e:  # a harness bug must be a FAIL, never a silent pass
+                import traceback
+                res = [Result(g, "FAIL", "harness error: %s" % e, {"traceback": traceback.format_exc()})]
         for r in res:
             r.details["group_secs"] = round(time.time() - t0, 1)
             ctx.results.append(r)

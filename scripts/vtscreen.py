@@ -8,17 +8,36 @@ timing alone reorders frames), so bytes would differ where screens do not.
 Standard library only, like every tool in this repo. It models what Claude
 Code's Ink renderer was measured to emit - printable text, CR/LF/BS/TAB, CSI
 cursor movement and erasure, scroll regions, insert/delete, the alternate
-screen, save/restore cursor - and IGNORES styling (SGR), hyperlinks (OSC 8),
-titles and every other OSC/DCS/APC string. It answers the queries a TUI blocks
-on (cursor position, device attributes) so that neither side stalls on a
-timeout the other does not hit. Widths come from unicodedata: East Asian
-Wide/Fullwidth are two cells, combining marks and format characters zero.
-Both sides go through this same emulator, so its approximations - emoji width,
-above all - cancel out of every native-vs-artifact comparison.
+screen, save/restore cursor - plus, per cell, the SGR style and the OSC 8
+hyperlink it was written with (styled_text()), so a comparison sees colour,
+emphasis and links and not only characters. Titles and every other
+OSC/DCS/APC string are ignored. It answers the queries a TUI blocks on
+(cursor position, device attributes) so that neither side stalls on a
+timeout the other does not hit.
+
+Widths come from unicodedata: East Asian Wide/Fullwidth are two cells,
+combining marks and format characters zero. A grapheme cluster occupies ONE
+cell: whatever joins a cluster (ZWJ and what follows it, variation selectors,
+skin tones, tag characters, the second regional indicator of a flag) is
+attached to the cell before it. Measuring each code point on its own made a
+ZWJ family eight cells wide, and Ink's next absolute cursor move then wrote
+over part of it - hiding cells from the comparison, which is exactly what an
+emulator used as an oracle must not do. Emoji widths remain approximations;
+both sides go through the same ones.
 """
 
 import codecs
 import unicodedata
+
+
+def _joins_cluster(ch):
+    o = ord(ch)
+    return (o == 0x200D or 0xFE00 <= o <= 0xFE0F or 0x1F3FB <= o <= 0x1F3FF
+            or 0xE0020 <= o <= 0xE007F or 0xE0100 <= o <= 0xE01EF)
+
+
+def _is_ri(ch):
+    return 0x1F1E6 <= ord(ch) <= 0x1F1FF
 
 
 def char_width(ch):
@@ -51,6 +70,13 @@ class Screen:
         self._buf = ""
         self.bells = 0
         self.modes = set()           # private modes currently set, e.g. "?2004"
+        self.sgr = {}                # active SGR attributes, see _sgr()
+        self.link = ""               # active OSC 8 URI
+        self.pen = ""                # canonical (sgr, link) key of the next cell
+        self.style = self._blank_styles()
+        self.main_style, self.alt_style = self.style, self._blank_styles()
+        self._join_next = False      # the previous code point was a ZWJ
+        self._last = None            # (row, col) of the last cell written
 
     # -- grid helpers -------------------------------------------------------
     def _blank_row(self):
@@ -59,15 +85,25 @@ class Screen:
     def _blank_grid(self):
         return [self._blank_row() for _ in range(self.rows)]
 
+    def _blank_styles(self):
+        return [[""] * self.cols for _ in range(self.rows)]
+
+    def _blank_style_row(self):
+        return [""] * self.cols
+
     def _scroll_up(self, n=1):
         for _ in range(n):
             del self.grid[self.top]
             self.grid.insert(self.bottom, self._blank_row())
+            del self.style[self.top]
+            self.style.insert(self.bottom, self._blank_style_row())
 
     def _scroll_down(self, n=1):
         for _ in range(n):
             del self.grid[self.bottom]
             self.grid.insert(self.top, self._blank_row())
+            del self.style[self.bottom]
+            self.style.insert(self.top, self._blank_style_row())
 
     def _linefeed(self):
         if self.r == self.bottom:
@@ -151,13 +187,32 @@ class Screen:
         elif ch == "\x07":
             self.bells += 1
 
+    def _attach(self, ch):
+        if self._last is not None:
+            r, c = self._last
+            self.grid[r][c] += ch
+            return True
+        return False
+
     def _print(self, ch):
+        # grapheme continuation: joins the cell written last, takes no cell
+        if self._join_next or _joins_cluster(ch):
+            self._join_next = ord(ch) == 0x200D
+            if self._attach(ch):
+                return
+        if _is_ri(ch) and self._last is not None:
+            r, c = self._last
+            cell = self.grid[r][c]
+            if len(cell) == 1 and _is_ri(cell):
+                self.grid[r][c] += ch      # the second half of a flag
+                return
         w = char_width(ch)
         if w == 0:
             # attach to the previous cell so a combining mark is not lost
-            pc = self.c - 1 if self.c > 0 and not self.wrap_pending else self.c
-            if 0 <= pc < self.cols:
-                self.grid[self.r][pc] += ch
+            if not self._attach(ch):
+                pc = self.c - 1 if self.c > 0 and not self.wrap_pending else self.c
+                if 0 <= pc < self.cols:
+                    self.grid[self.r][pc] += ch
             return
         if self.wrap_pending and self.autowrap:
             self.c = 0
@@ -170,8 +225,11 @@ class Screen:
                 self._linefeed()
         row = self.grid[self.r]
         row[self.c] = ch
+        self.style[self.r][self.c] = self.pen
+        self._last = (self.r, self.c)
         if w == 2 and self.c + 1 < self.cols:
             row[self.c + 1] = ""
+            self.style[self.r][self.c + 1] = self.pen
         if self.c + w >= self.cols:
             self.c = self.cols - 1
             self.wrap_pending = True
@@ -197,6 +255,12 @@ class Screen:
             self.__init__(self.rows, self.cols)
 
     def _osc(self, s):
+        if s.startswith("8;"):
+            # OSC 8 ; params ; URI - an empty URI closes the link
+            parts = s.split(";", 2)
+            self.link = parts[2] if len(parts) > 2 else ""
+            self._repen()
+            return
         # colour queries: answer with a dark background so both sides agree
         if s.startswith("11;?"):
             self.responses.append(b"\x1b]11;rgb:0000/0000/0000\x1b\\")
@@ -221,6 +285,9 @@ class Screen:
         # `priv in "<="` would be True for "" - every plain CSI dropped.
         if inter or priv in ("<", "="):
             return
+        if final == "m" and not priv:
+            self._sgr(buf)
+            return
         if final == "A":
             self.r = max(self.top if self.r >= self.top else 0, self.r - n())
         elif final == "B":
@@ -241,49 +308,58 @@ class Screen:
             self.r, self.c = n(0) - 1, n(1) - 1
         elif final == "J":
             mode = nums[0] if nums else 0
-            g = self.grid
+            g, st = self.grid, self.style
             if mode == 0:
                 g[self.r][self.c:] = [" "] * (self.cols - self.c)
+                st[self.r][self.c:] = [""] * (self.cols - self.c)
                 for i in range(self.r + 1, self.rows):
-                    g[i] = self._blank_row()
+                    g[i], st[i] = self._blank_row(), self._blank_style_row()
             elif mode == 1:
                 g[self.r][:self.c + 1] = [" "] * (self.c + 1)
+                st[self.r][:self.c + 1] = [""] * (self.c + 1)
                 for i in range(0, self.r):
-                    g[i] = self._blank_row()
+                    g[i], st[i] = self._blank_row(), self._blank_style_row()
             elif mode in (2, 3):
                 for i in range(self.rows):
-                    g[i] = self._blank_row()
+                    g[i], st[i] = self._blank_row(), self._blank_style_row()
         elif final == "K":
             mode = nums[0] if nums else 0
-            row = self.grid[self.r]
+            row, st = self.grid[self.r], self.style[self.r]
             if mode == 0:
                 row[self.c:] = [" "] * (self.cols - self.c)
+                st[self.c:] = [""] * (self.cols - self.c)
             elif mode == 1:
                 row[:self.c + 1] = [" "] * (self.c + 1)
+                st[:self.c + 1] = [""] * (self.c + 1)
             else:
                 self.grid[self.r] = self._blank_row()
+                self.style[self.r] = self._blank_style_row()
         elif final == "X":
-            row = self.grid[self.r]
+            row, st = self.grid[self.r], self.style[self.r]
             for i in range(self.c, min(self.cols, self.c + n())):
-                row[i] = " "
+                row[i], st[i] = " ", ""
         elif final == "@":
-            row = self.grid[self.r]
             k = min(n(), self.cols - self.c)
-            row[self.c:] = ([" "] * k + row[self.c:])[:self.cols - self.c]
+            for grid, blank in ((self.grid[self.r], " "), (self.style[self.r], "")):
+                grid[self.c:] = ([blank] * k + grid[self.c:])[:self.cols - self.c]
         elif final == "P":
-            row = self.grid[self.r]
             k = min(n(), self.cols - self.c)
-            row[self.c:] = row[self.c + k:] + [" "] * k
+            for grid, blank in ((self.grid[self.r], " "), (self.style[self.r], "")):
+                grid[self.c:] = grid[self.c + k:] + [blank] * k
         elif final == "L":
             if self.top <= self.r <= self.bottom:
                 for _ in range(n()):
                     del self.grid[self.bottom]
                     self.grid.insert(self.r, self._blank_row())
+                    del self.style[self.bottom]
+                    self.style.insert(self.r, self._blank_style_row())
         elif final == "M":
             if self.top <= self.r <= self.bottom:
                 for _ in range(n()):
                     del self.grid[self.r]
                     self.grid.insert(self.bottom, self._blank_row())
+                    del self.style[self.r]
+                    self.style.insert(self.bottom, self._blank_style_row())
         elif final == "S":
             self._scroll_up(n())
         elif final == "T":
@@ -327,12 +403,65 @@ class Screen:
             return
         if on:
             self.saved_main_cursor = (self.r, self.c)
-            self.alt = self._blank_grid()
-            self.grid = self.alt
+            self.alt, self.alt_style = self._blank_grid(), self._blank_styles()
+            self.grid, self.style = self.alt, self.alt_style
         else:
-            self.grid = self.main
+            self.grid, self.style = self.main, self.main_style
             self.r, self.c = getattr(self, "saved_main_cursor", (self.r, self.c))
         self.alt_active = on
+        self._last = None
+
+    # -- style --------------------------------------------------------------
+    _SGR_FLAGS = {1: "bold", 2: "dim", 3: "italic", 4: "underline", 5: "blink",
+                  7: "inverse", 8: "hidden", 9: "strike", 53: "overline"}
+    _SGR_OFF = {22: ("bold", "dim"), 23: ("italic",), 24: ("underline",),
+                25: ("blink",), 27: ("inverse",), 28: ("hidden",), 29: ("strike",),
+                55: ("overline",)}
+
+    def _sgr(self, buf):
+        """Apply one SGR sequence to the pen. Colours are kept exactly as
+        spelled (5;n, 2;r;g;b, colon forms), since both sides spelling them the
+        same way is part of what is compared."""
+        params = buf.split(";") if buf else ["0"]
+        i = 0
+        while i < len(params):
+            p = params[i]
+            head = p.split(":")[0]
+            code = int(head) if head.isdigit() else 0
+            if ":" in p and code in (38, 48, 58, 4):
+                key = {38: "fg", 48: "bg", 58: "ul", 4: "underline"}[code]
+                self.sgr[key] = p
+            elif code in (38, 48, 58):
+                key = {38: "fg", 48: "bg", 58: "ul"}[code]
+                if i + 1 < len(params) and params[i + 1] == "5":
+                    self.sgr[key] = ";".join(params[i:i + 3])
+                    i += 2
+                elif i + 1 < len(params) and params[i + 1] == "2":
+                    self.sgr[key] = ";".join(params[i:i + 5])
+                    i += 4
+            elif code == 0:
+                self.sgr = {}
+            elif code in self._SGR_FLAGS:
+                self.sgr[self._SGR_FLAGS[code]] = "1"
+            elif code in self._SGR_OFF:
+                for k in self._SGR_OFF[code]:
+                    self.sgr.pop(k, None)
+            elif 30 <= code <= 37 or 90 <= code <= 97:
+                self.sgr["fg"] = str(code)
+            elif 40 <= code <= 47 or 100 <= code <= 107:
+                self.sgr["bg"] = str(code)
+            elif code == 39:
+                self.sgr.pop("fg", None)
+            elif code == 49:
+                self.sgr.pop("bg", None)
+            elif code == 59:
+                self.sgr.pop("ul", None)
+            i += 1
+        self._repen()
+
+    def _repen(self):
+        style = ",".join("%s=%s" % kv for kv in sorted(self.sgr.items()))
+        self.pen = style + ("|link=" + self.link if self.link else "")
 
     # -- output -------------------------------------------------------------
     def take_responses(self):
@@ -344,3 +473,21 @@ class Screen:
 
     def text(self):
         return "\n".join(self.lines()).rstrip("\n")
+
+    def styled_text(self):
+        """The screen with every style change marked inline as {style}, e.g.
+        `{bold=1,fg=31}Error{} plain {|link=https://x}here{}` - comparable
+        text that differs whenever colour, emphasis or a link differs."""
+        out = []
+        for row, st in zip(self.grid, self.style):
+            parts, cur = [], ""
+            last = max((i for i, ch in enumerate(row) if ch != " " or st[i]), default=-1)
+            for i in range(last + 1):
+                if st[i] != cur:
+                    parts.append("{%s}" % st[i])
+                    cur = st[i]
+                parts.append(row[i])
+            if cur:
+                parts.append("{}")
+            out.append("".join(parts))
+        return "\n".join(out).rstrip("\n")

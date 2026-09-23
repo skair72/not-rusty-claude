@@ -59,16 +59,27 @@ function loadLibc() {
   return libc;
 }
 
+// The native members coerce their argument the way ToNumber does, measured
+// with a real peer process on the other end of the socket: "12", 12.7, [12]
+// and {valueOf(){return 12}} all mean fd 12; undefined, null, NaN and "12x"
+// mean fd 0; true means fd 1; a negative integer, Infinity or anything above
+// 2^31-1 answers null. (A BigInt answers something unrelated natively; nothing
+// in Claude passes one - its callers pass socket._handle.fd - so it is not
+// imitated.)
+function toFd(v) {
+  let x = Number(v);
+  if (Number.isNaN(x)) x = 0;
+  x = Math.trunc(x);
+  return x >= 0 && x <= 0x7fffffff ? x : -1;
+}
+
 // struct ucred { pid_t pid; uid_t uid; gid_t gid; } - or null when the fd is
-// not a connected unix socket, which is what the native member returns there
-// (measured: fd -1, an unopened fd and a string all give null).
-function peerCred(fd) {
+// not a connected unix socket, which is what the native member returns there.
+function peerCred(v) {
   const c = loadLibc();
   if (!c) return null;
-  // Native coerces a missing argument to fd 0 (measured: getPeerPid() and
-  // getPeerPid(0) agree) and answers null for a non-number.
-  if (fd === undefined) fd = 0;
-  if (typeof fd !== "number" || !Number.isInteger(fd) || fd < 0 || fd > 0x7fffffff) return null;
+  const fd = toFd(v);
+  if (fd < 0) return null;
   const cred = new Int32Array(3);
   const len = new Uint32Array([12]);
   const rc = c.sym.getsockopt(fd, SOL_SOCKET, SO_PEERCRED, c.ffi.ptr(cred), c.ffi.ptr(len));

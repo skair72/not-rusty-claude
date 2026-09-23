@@ -129,7 +129,22 @@ function toI32Field(v, name, dflt) {
   if (!Number.isInteger(v)) throw argTypeError(`The "${name}" property must be of type integer. Received number`);
   return v | 0;
 }
-const toInt32 = (v) => (typeof v === "number" ? v | 0 : Number(v) | 0);
+// ToInt32 as the native binding does it (measured): a BigInt primitive wraps modulo 2^32, anything
+// else goes through ToNumber (so a BigInt from valueOf/toPrimitive throws). Engine TypeErrors are
+// reworded to JavaScriptCore's text so Node reports the same messages as Bun.
+function toInt32Slow(v) {
+  if (typeof v === "bigint") return Number(BigInt.asIntN(32, v));
+  if (typeof v === "symbol") throw new TypeError("Cannot convert a symbol to a number");
+  try { return +v | 0; } catch (e) { throw jscTypeError(e); }
+}
+function jscTypeError(e) {
+  if (e instanceof TypeError) {
+    if (e.message === "Cannot convert a Symbol value to a number") return new TypeError("Cannot convert a symbol to a number");
+    if (e.message === "Cannot convert a BigInt value to a number") return new TypeError("Conversion from 'BigInt' to 'number' is not allowed.");
+  }
+  return e;
+}
+const toInt32 = (v) => (typeof v === "number" ? v | 0 : toInt32Slow(v));
 
 // ------------------------------------------------------------------------------------------------
 // SGR model
@@ -334,12 +349,13 @@ function paraLevelAt(B, index) {
   return B.paras[i].level;
 }
 
+const GDP_ISO = new Int32Array(MAX_EXPLICIT_LEVEL + 1), GDP_PREV = new Int32Array(MAX_EXPLICIT_LEVEL + 1);
 function getDirProps(B) {
   const text = B.text, n = B.n, dirProps = B.dirProps;
   const NOT_SEEKING_STRONG = 0, SEEKING_STRONG_FOR_PARA = 1, SEEKING_STRONG_FOR_FSI = 2, LOOKING_FOR_PDI = 3;
   let flags = 0, i = 0, state = SEEKING_STRONG_FOR_PARA, stackLast = -1;
   const defaultParaLevel = 0; // UBIDI_DEFAULT_LTR & 1
-  const isolateStartStack = new Int32Array(MAX_EXPLICIT_LEVEL + 1), previousStateStack = new Int32Array(MAX_EXPLICIT_LEVEL + 1);
+  const isolateStartStack = GDP_ISO, previousStateStack = GDP_PREV; // scratch (fully rewritten before read)
   const paras = B.paras;
   paras[0].level = defaultParaLevel;
   while (i < n) {
@@ -863,10 +879,10 @@ function makeState(opts) {
   const S = {
     amb: true, subMin: 0x7fffffff, subMax: -1, sub: null, repl: "�", replGid: 97, replWord: 1 | 512,
     MASK: 3, NARROW: 0, WIDE: 1, TAIL: 2, HEAD: 3, EC: 0, SC: 1, EW: 0, TW: 8,
-    gList: [], gMap: new Map(), g1: new Int32Array(0x10000).fill(-1), graphemes: [],
+    gList: [], gTab: new Int32Array(1024).fill(-1), gHash: new Int32Array(1024), g1: new Int32Array(0x10000).fill(-1), graphemes: [],
     kList: [""], cList: [""], kMap: new Map([["", 0]]), kTrie: { idx: 0, next: null }, sgrKeys: [""], sgrCloseKeys: [""],
     uList: [""], uMap: new Map([["", 0]]), uris: [""],
-    gcKeys: new Array(GCACHE).fill(null), gcIds: new Int32Array(GCACHE), ucKeys: new Array(UCACHE).fill(null), ucIds: new Int32Array(UCACHE),
+    ucKeys: new Array(UCACHE).fill(null), ucIds: new Int32Array(UCACHE),
     // per-call scratch; last validated (cells, runs) pair
     C: null, okCells: null, okRuns: null,
   };
@@ -918,14 +934,14 @@ function makeState(opts) {
       S.TW = toI32Field(scr.tabWidth, "tabWidth", 8);
     }
   }
+  S.regular = paintIsRegular(S);
   // ---- graphemes seed: " ", "", "!".."~", "\t", replacement (deduplicated)
   const seed = [" ", ""];
   for (let c = 0x21; c <= 0x7e; c++) seed.push(String.fromCharCode(c));
   seed.push("\t");
   if (!seed.includes(S.repl)) seed.push(S.repl);
   for (const g of seed) internG(S, g);
-  S.replGid = S.gMap.get(S.repl);
-  S.replWord = stringWidth(S.repl, S.amb) | 512;
+  S.replGid = internG(S, S.repl); // already present: the lookup returns its seed id
   for (let k = 0; k < S.gList.length; k++) S.graphemes.push(S.gList[k]);
   S.C = {
     text: "", cells: null, runs: null, cellCap: 0, runCap: 0, count: 0, nRuns: 0, lastSgr: -1, lastUri: -1,
@@ -933,18 +949,46 @@ function makeState(opts) {
     clOpen: false, clStart: 0, clEnd: 0, clText: null, clSgr: 0, clUri: 0, clCount: 0, clSum: 0,
     clBaseW: 0, clBaseCp: 0, clEmojiBase: false, clFlags: 0, prevCls: 0, gbState: 0,
   };
+  S.replWord = replacementWidth(S, S.repl) | 512;
   return S;
 }
 
-function internG(S, str) {
-  let id = S.gMap.get(str);
-  if (id === undefined) {
-    id = S.gList.length;
-    S.gList.push(str);
-    S.gMap.set(str, id);
-    if (str.length === 1) S.g1[str.charCodeAt(0)] = id;
+// Grapheme interning: an open-addressing table of ids keyed by the FNV-1a hash of the UTF-16 units
+// (gTab: id or -1, gHash: the full hash), so a cluster is looked up straight from the line text
+// without slicing it; the string is only materialised when it is new.
+function gLookup(S, text, a, b, h) {
+  const tab = S.gTab, hs = S.gHash, mask = tab.length - 1, len = b - a, list = S.gList;
+  for (let s = (h ^ (h >>> 15)) & mask; ; s = (s + 1) & mask) {
+    const id = tab[s];
+    if (id < 0) return -1 - s; // miss: encode the free slot
+    if (hs[s] === h) { const k = list[id]; if (k.length === len && sameChars(k, text, a)) return id; }
   }
+}
+function gInsert(S, str, h, slot) {
+  const id = S.gList.length;
+  S.gList.push(str);
+  S.gTab[slot] = id; S.gHash[slot] = h;
+  if (str.length === 1) S.g1[str.charCodeAt(0)] = id;
+  if (2 * (id + 1) > S.gTab.length) gGrow(S);
   return id;
+}
+function gGrow(S) {
+  const oldTab = S.gTab, oldHash = S.gHash, cap = oldTab.length * 4, mask = cap - 1;
+  const tab = new Int32Array(cap).fill(-1), hs = new Int32Array(cap);
+  for (let s = 0; s < oldTab.length; s++) {
+    const id = oldTab[s];
+    if (id < 0) continue;
+    const h = oldHash[s];
+    let q = (h ^ (h >>> 15)) & mask;
+    while (tab[q] >= 0) q = (q + 1) & mask;
+    tab[q] = id; hs[q] = h;
+  }
+  S.gTab = tab; S.gHash = hs;
+}
+function internG(S, str) {
+  const h = rangeHash(str, 0, str.length) | 0;
+  const r = gLookup(S, str, 0, str.length, h);
+  return r >= 0 ? r : gInsert(S, str, h, -1 - r);
 }
 function internUnit(S, u) {
   let id = S.g1[u];
@@ -984,15 +1028,11 @@ function rangeHash(text, a, b) {
   for (let j = a; j < b; j++) h = Math.imul(h ^ text.charCodeAt(j), 16777619);
   return h >>> 0;
 }
-const GCACHE = 2048, UCACHE = 256;
+const UCACHE = 256;
 function internRange(S, text, a, b) {
-  const slot = rangeHash(text, a, b) & (GCACHE - 1);
-  const k = S.gcKeys[slot];
-  if (k !== null && k.length === b - a && sameChars(k, text, a)) return S.gcIds[slot];
-  const str = text.slice(a, b);
-  const id = internG(S, str);
-  S.gcKeys[slot] = str; S.gcIds[slot] = id;
-  return id;
+  const h = rangeHash(text, a, b) | 0;
+  const r = gLookup(S, text, a, b, h);
+  return r >= 0 ? r : gInsert(S, text.slice(a, b), h, -1 - r);
 }
 function internUriRange(S, text, a, b) {
   const slot = rangeHash(text, a, b) & (UCACHE - 1);
@@ -1026,19 +1066,49 @@ function isSub(S, cp) {
 }
 
 // Width of a whole string treated as one cluster (used for the replacement glyph).
-function stringWidth(str, ambNarrow) {
-  let count = 0, sum = 0, baseW = 0, baseCp = 0, emojiBase = false, f = 0;
-  for (let i = 0; i < str.length; i++) {
-    let cp = str.charCodeAt(i);
-    if ((cp & 0xfc00) === 0xd800 && i + 1 < str.length && (str.charCodeAt(i + 1) & 0xfc00) === 0xdc00) { cp = 0x10000 + ((cp - 0xd800) << 10) + (str.charCodeAt(i + 1) - 0xdc00); i++; }
-    else if ((cp & 0xfc00) === 0xd800 || (cp & 0xfc00) === 0xdc00) continue;
-    const p = propOf(cp);
-    let w = (p & 7) === K_TEXT ? (p >> 8) & 3 : 0;
-    if (!ambNarrow && (p & P_AMB)) w = 2;
-    count++; sum += w; f |= p & F_MASK;
-    if (baseW === 0 && w > 0) { baseW = w; baseCp = cp; emojiBase = cp >= 0x80 && (p & P_EMOJI) !== 0; }
+// Width of the substitute glyph (measured with work/probe-repl.js over 3000 random replacement
+// strings): the replacement is segmented like a line - escape sequences and lone surrogates are
+// transparent, controls and TAB contribute 0, substitution does not apply - and the widths of its
+// clusters are summed; the result is at least 1 and saturates at 255.
+function replacementWidth(S, str) {
+  const n = str.length;
+  let total = 0, open = false, prevCls = 0, st = 0, cnt = 0, sum = 0, baseW = 0, baseCp = 0, eb = false, f = 0;
+  const close = () => { if (open) { open = false; total += widthOf(f, cnt, sum, baseW, baseCp, eb); } };
+  let i = 0;
+  while (i < n) {
+    const c = str.charCodeAt(i);
+    if (c < 0xa0 && !(c >= 0x20 && c <= 0x7e)) {
+      if (c === 0x1b || c === 0x9b || c === 0x9d || c === 0x90 || c === 0x98 || c === 0x9e || c === 0x9f) { i = escSeq(S, S.C, str, i, n, false); continue; }
+      close(); i++; continue;
+    }
+    let cp = c, len = 1;
+    if ((c & 0xf800) === 0xd800) {
+      if (c <= 0xdbff && i + 1 < n) {
+        const d = str.charCodeAt(i + 1);
+        if ((d & 0xfc00) === 0xdc00) { cp = 0x10000 + ((c - 0xd800) << 10) + (d - 0xdc00); len = 2; }
+      }
+      if (len === 1) { i++; continue; }
+    }
+    const p = cp < 0x10000 ? P16[cp] : PROP[IDS[cp]];
+    const g = (p >> 3) & 31;
+    let w = (p >> 8) & 3;
+    if (!S.amb && (p & P_AMB)) w = 2;
+    let brk = true;
+    if (open) { const d = GB[(st * NG + prevCls) * NG + g]; st = d >> 1; brk = (d & 1) !== 0; }
+    else st = S_DEFAULT;
+    if (brk) {
+      close();
+      open = true; cnt = 1; sum = w; f = p & F_MASK;
+      if (w > 0) { baseW = w; baseCp = cp; eb = cp >= 0x80 && (p & P_EMOJI) !== 0; } else { baseW = 0; baseCp = 0; eb = false; }
+    } else {
+      cnt++; sum += w; f |= p & F_ADD;
+      if (baseW === 0 && w > 0) { baseW = w; baseCp = cp; eb = cp >= 0x80 && (p & P_EMOJI) !== 0; }
+    }
+    prevCls = g;
+    i += len;
   }
-  return Math.min(widthOf(f, count, sum, baseW, baseCp, emojiBase), 255);
+  close();
+  return total < 1 ? 1 : total > 255 ? 255 : total;
 }
 function widthOf(f, count, sum, baseW, baseCp, emojiBase) {
   if (f & F_RI) return count >= 2 ? 2 : 1;
@@ -1398,25 +1468,27 @@ function hasRtlBlockUnit(text, n) {
   return false;
 }
 
+// Scratch buffers for bidiReorder (segment() never re-enters itself: no user code runs inside it).
+let BR_BT = new Uint16Array(256), BR_POS = new Int32Array(256), BR_VIS = new Int32Array(256), BR_RANK = new Int32Array(256),
+  BR_SLOT = new Int32Array(256), BR_TMP = new Int32Array(512), BR_LV = new Uint8Array(256);
 function bidiReorder(S, C, text, count) {
   const n = text.length;
   if (!hasRtlBlockUnit(text, n)) return;
-  const bt = new Uint16Array(n); // bidi text (never longer than the input)
-  const cellPos = new Int32Array(count); // first bidi-text unit of each cell's cluster
+  if (BR_BT.length < n) { const m = Math.max(n, 2 * BR_BT.length); BR_BT = new Uint16Array(m); BR_VIS = new Int32Array(m); BR_RANK = new Int32Array(m); BR_SLOT = new Int32Array(m); BR_LV = new Uint8Array(m); }
+  if (BR_POS.length < count) { const m = Math.max(count, 2 * BR_POS.length); BR_POS = new Int32Array(m); BR_TMP = new Int32Array(2 * m); }
+  const bt = BR_BT; // bidi text (never longer than the input)
+  const cellPos = BR_POS; // first bidi-text unit of each cell's cluster
   let nb = 0, k = 0;
   let open = false, first = 0, prevCls = 0, st = 0, cnt = 0, sum = 0, baseW = 0, baseCp = 0, eb = false, f = 0;
-  const close = () => {
-    if (!open) return;
-    open = false;
-    if (widthOf(f, cnt, sum, baseW, baseCp, eb) > 0 && k < count) cellPos[k++] = first;
-  };
+  // "close the pending cluster" is written out at each site: a closure over these locals is slow on V8
   let i = 0;
   while (i < n) {
     const c = text.charCodeAt(i);
     if (c < 0xa0 && !(c >= 0x20 && c <= 0x7e)) {
-      if (c === 0x09) { close(); if (k < count) cellPos[k++] = nb; bt[nb++] = 9; i++; continue; }
       if (c === 0x1b || c === 0x9b || c === 0x9d || c === 0x90 || c === 0x98 || c === 0x9e || c === 0x9f) { i = escSeq(S, C, text, i, n, false); continue; }
-      close(); i++; continue;
+      if (open) { open = false; if (k < count && widthOf(f, cnt, sum, baseW, baseCp, eb) > 0) cellPos[k++] = first; }
+      if (c === 0x09) { if (k < count) cellPos[k++] = nb; bt[nb++] = 9; }
+      i++; continue;
     }
     let cp = c, len = 1;
     if ((c & 0xf800) === 0xd800) {
@@ -1427,7 +1499,8 @@ function bidiReorder(S, C, text, count) {
       if (len === 1) { i++; continue; }
     }
     if (cp >= S.subMin && cp <= S.subMax && isSub(S, cp)) {
-      close(); if (k < count) cellPos[k++] = nb; bt[nb++] = 0xfffd;
+      if (open) { open = false; if (k < count && widthOf(f, cnt, sum, baseW, baseCp, eb) > 0) cellPos[k++] = first; }
+      if (k < count) cellPos[k++] = nb; bt[nb++] = 0xfffd;
       prevCls = 0; i += len; continue;
     }
     const p = cp < 0x10000 ? P16[cp] : PROP[IDS[cp]];
@@ -1438,7 +1511,7 @@ function bidiReorder(S, C, text, count) {
     if (open) { const d = GB[(st * NG + prevCls) * NG + g]; st = d >> 1; brk = (d & 1) !== 0; }
     else st = S_DEFAULT;
     if (brk) {
-      close();
+      if (open && k < count && widthOf(f, cnt, sum, baseW, baseCp, eb) > 0) cellPos[k++] = first;
       open = true; first = nb; cnt = 1; sum = w; f = p & F_MASK;
       if (w > 0) { baseW = w; baseCp = cp; eb = cp >= 0x80 && (p & P_EMOJI) !== 0; } else { baseW = 0; baseCp = 0; eb = false; }
     } else {
@@ -1450,11 +1523,12 @@ function bidiReorder(S, C, text, count) {
     if (len === 2) bt[nb++] = text.charCodeAt(i + 1);
     i += len;
   }
-  close();
+  if (open && k < count && widthOf(f, cnt, sum, baseW, baseCp, eb) > 0) cellPos[k++] = first;
   if (k !== count || nb === 0) return; // cannot happen; never corrupt the output
-  const lv = icuLevels(bt.subarray(0, nb), nb).slice();
+  const lv = BR_LV;
+  lv.set(icuLevels(bt.subarray(0, nb), nb));
   // L2 over the code units
-  const vis = new Int32Array(nb);
+  const vis = BR_VIS;
   let maxLv = 0;
   for (let q = 0; q < nb; q++) { vis[q] = q; if (lv[q] > maxLv) maxLv = lv[q]; }
   for (let l = maxLv; l >= 1; l--) {
@@ -1471,12 +1545,11 @@ function bidiReorder(S, C, text, count) {
       } else a++;
     }
   }
-  const rank = new Int32Array(nb);
-  for (let x = 0; x < nb; x++) rank[vis[x]] = x;
-  const slot = new Int32Array(nb).fill(-1);
+  const rank = BR_RANK, slot = BR_SLOT;
+  for (let x = 0; x < nb; x++) { rank[vis[x]] = x; slot[x] = -1; }
   for (let q = 0; q < count; q++) slot[rank[cellPos[q]]] = q;
-  const cells = C.cells;
-  const tmp = cells.slice(0, 2 * count);
+  const cells = C.cells, tmp = BR_TMP;
+  for (let q = 0; q < 2 * count; q++) tmp[q] = cells[q];
   let o = 0;
   for (let x = 0; x < nb; x++) {
     const ci = slot[x];
@@ -1565,6 +1638,7 @@ function paintImpl(S, screen, screenWidth, x, y, cells, count, order, charMap, r
   if (overlaps(screen, cells) || overlaps(screen, charMap) || overlaps(screen, runWords) || (order !== undefined && overlaps(screen, order)))
     throw argTypeError("paint: screen must not overlap the input arrays");
   if (order === undefined) order = null;
+  if (!S.regular) return paintPerWrite(S, screen, W, x, y, cells, count, order, charMap, runWords);
   const MASK = S.MASK, NARROW = S.NARROW, WIDE = S.WIDE, TAIL = S.TAIL, HEAD = S.HEAD, EC = S.EC, SC = S.SC, EW = S.EW, TW = S.TW;
   const rows = W > 0 ? Math.floor(Math.floor(screen.length / 2) / W) : 0;
   const rowOk = y >= 0 && y < rows;
@@ -1649,6 +1723,72 @@ function paintImpl(S, screen, screenWidth, x, y, cells, count, order, charMap, r
 // ------------------------------------------------------------------------------------------------
 // setCell()
 // ------------------------------------------------------------------------------------------------
+// paint() is, natively, a sequence of setCell-style writes: every written cell goes through the same
+// primitive as setCell (write; a WIDE-typed word also writes the spacer tail [SC, EW|TAIL] at c+1;
+// then the left/right orphan checks on the CURRENT row state). With a "regular" screen
+// configuration - every word paint can write has an unambiguous type - that sequence collapses to
+// the edge-only rules of paint/spec.md, which is what paintImpl's fast loop implements. Other
+// configurations (measured with fuzz-paint.js: e.g. widthMask hiding the wide bit, spacerTail ===
+// wide) take paintPerWrite, a literal per-write model.
+function paintIsRegular(S) {
+  const M = S.MASK, W = S.WIDE, T = S.TAIL;
+  const types = [S.NARROW & M, (S.EW | S.NARROW) & M, (S.EW | S.HEAD) & M, S.EW & M]; // narrow, tab, spacer head, cleared
+  if ((W & M) !== W || (T & M) !== T || ((S.EW | T) & M) !== T || W === T) return false;
+  for (const x of types) if (x === W || x === T) return false;
+  return true;
+}
+function paintPerWrite(S, screen, W, x, y, cells, count, order, charMap, runWords) {
+  const MASK = S.MASK, NARROW = S.NARROW, WIDE = S.WIDE, TAIL = S.TAIL, HEAD = S.HEAD, EC = S.EC, SC = S.SC, EW = S.EW, TW = S.TW;
+  const rows = W > 0 ? Math.floor(Math.floor(screen.length / 2) / W) : 0;
+  const rowOk = y >= 0 && y < rows;
+  const base = rowOk ? 2 * y * W : 0;
+  const cmLen = charMap.length, rwLen = runWords.length;
+  let dS = 65535, dE = 0;
+  const put = (c, ch, wd) => { // setCellImpl's write + orphan rules, damage folded into [dS, dE)
+    if (!rowOk || c < 0 || c >= W) return;
+    const t = wd & MASK;
+    const wideTail = t === WIDE && c + 1 < W;
+    const e = wideTail ? c + 2 : c + 1;
+    const o = base + 2 * c;
+    const tS = screen[o + 1] & MASK, tSm1 = c > 0 ? screen[o - 1] & MASK : -1;
+    const tEm1 = screen[base + 2 * (e - 1) + 1] & MASK, tE = e < W ? screen[base + 2 * e + 1] & MASK : -1;
+    screen[o] = ch; screen[o + 1] = wd;
+    if (wideTail) { screen[o + 2] = SC; screen[o + 3] = EW | TAIL; }
+    let s0 = c, e0 = e;
+    if (t !== TAIL && c > 0 && tS === TAIL && tSm1 === WIDE) { screen[o - 2] = EC; screen[o - 1] = EW; s0 = c - 1; }
+    if (e < W && tEm1 === WIDE && tE === TAIL) { screen[base + 2 * e] = EC; screen[base + 2 * e + 1] = EW; e0 = e + 1; }
+    if (s0 < dS) dS = s0;
+    if (e0 > dE) dE = e0;
+  };
+  let col = x;
+  for (let k = 0; k < count; k++) {
+    const idx = order === null ? k : order[k];
+    const g = cells[2 * idx], f = cells[2 * idx + 1];
+    if (f & 256) {
+      if (col < W) {
+        let stop = TW > 0 ? col + (TW - (col % TW)) : col + 1;
+        if (stop > W) stop = W;
+        for (let c = col < 0 ? 0 : col; c < stop; c++) put(c, EC, EW | NARROW);
+        col = stop;
+      }
+      continue;
+    }
+    const width = f & 255;
+    const run = f >>> 10;
+    const rw = run < rwLen ? runWords[run] : EW;
+    const ch = g >= 0 && g < cmLen ? charMap[g] : EC;
+    if (width >= 2 && col + width > W) { put(col, EC, EW | HEAD); col += 1; continue; }
+    if (width <= 1) { put(col, ch, (rw & ~MASK) | NARROW); col += width; continue; }
+    if (col >= 0) put(col, ch, (rw & ~MASK) | WIDE);
+    for (let j = 2; j < width; j++) put(col + j, SC, (rw & ~MASK) | TAIL);
+    col += width;
+  }
+  if (dS > 65535) dS = 65535;
+  if (dE > 65535) dE = 65535;
+  const low = col < 0 ? 0 : col > 1048575 ? 1048575 : col;
+  return dE * 68719476736 + dS * 1048576 + low;
+}
+
 function setCellImpl(S, screen, screenWidth, x, y, charId, word) {
   const W = toU32Arg(screenWidth, "screenWidth");
   x = toInt32(x); y = toInt32(y);

@@ -2,6 +2,10 @@
 //   bun tests/cell_segmenter_fuzz.cjs START COUNT OUT.json [family]
 // Case i is generated from an RNG seeded by the case index i alone, so any case can be
 // regenerated in isolation. family (optional) forces one family for every case.
+// Families: text, escapes, bidi, paint, setCell, capacity, lifecycle, claude (Claude-shaped lines),
+// kernelcap (kernel runs vs short buffers), long256 (Claude's 256-cell buffer + retry), bidiexplicit
+// (explicit embeddings reaching ICU), bidigate (the two-part reorder gate), paintwide (width-3+
+// cells clipped at the edges over WIDE/TAIL screens), subst (substitute ranges, replacement glyphs).
 "use strict";
 const fs = require("fs");
 
@@ -390,13 +394,47 @@ FAMILIES.paintwide = (R) => {
   }
   return steps;
 };
-const WEIGHTS = [[5, "text"], [3, "escapes"], [2, "bidi"], [4, "paint"], [1, "setCell"], [2, "capacity"], [2, "lifecycle"], [2, "claude"], [2, "kernelcap"], [1, "long256"], [1, "bidiexplicit"], [1, "bidigate"], [1, "paintwide"]];
+// Constructor options that change segment(): substitute ranges (overlapping, astral, surrogate,
+// huge), the undocumented `replacement` glyph (deduplicated into the seed; any width, multi-cluster,
+// escapes, controls, surrogates) and ambiguousIsNarrow.
+const REPLACEMENTS = ["\ufffd", "?", " ", "\u4e2d", "\u{1f642}", "e\u0301", "ab", "\t", "\x1b", "\x1b[31m", "\u200b", "\u0301", "\ud800", "\u00a7", "\u2400", "~", "\u05d0", "\x07", "\u{1f1ef}\u{1f1f5}", "\u00ad", "xyz\u4e2d"];
+FAMILIES.subst = (R) => {
+  const steps = [];
+  for (let k = R.range(1, 4); k > 0; k--) {
+    let s = "";
+    for (let q = R.range(1, 16); q > 0; q--) {
+      s += R.weighted([[5, () => cp(R.pick(SUBST))], [3, () => cp(R.pick([0x4e2d, 0x301, 0x5d0, 0x627, 0xa7, 0x1f642, 0x1f3fb, 0x200d, 0xfffd, 0x10000, 0x10ffff, 0x80, 0x9f, 0xa0, 0xad]))],
+        [4, () => R.pick(["a", "b", " ", "?", "~", "\t", "xy"])], [2, () => atom(R)], [1, () => ESC + "[" + sgrParams(R) + "m"],
+        [1, () => String.fromCharCode(R.range(0xd800, 0xdfff))], [1, () => cp(R.range(0x80, 0x3000))]])();
+    }
+    steps.push({ op: "segment", text: s, reordered: R.chance(0.3), ...(R.chance(0.15) ? { cap: R.range(0, 8) } : {}) });
+    if (R.chance(0.3)) steps.push(paintStep(R, false));
+  }
+  steps.push({ op: "tables" });
+  return steps;
+};
+function substOpts(R) {
+  const o = {};
+  if (R.chance(0.7)) o.ambiguousIsNarrow = R.chance(0.5);
+  const rs = [];
+  for (let k = R.pick([0, 1, 1, 2, 3]); k > 0; k--) {
+    const a = R.pick([0x80, 0xa0, 0x300, 0x4e2d, 0x5d0, 0x61c, 0x202a, 0x2066, 0xd800, 0xdc00, 0xfffd, 0x1f600, 0x10000, 0x10fff0, R.range(0x80, 0x10ffff)]);
+    const b = Math.min(0x10ffff, a + R.pick([0, 0, 1, 5, 100, 0x10000, 0x10ffff]));
+    rs.push([a, b]);
+  }
+  o.substitute = R.chance(0.1) ? null : rs;
+  if (R.chance(0.8)) o.replacement = R.pick(REPLACEMENTS);
+  o.screen = { widthMask: 3, narrow: 0, wide: 1, spacerTail: 2, spacerHead: 3, emptyCharIndex: 0, spacerCharIndex: 1, emptyWord: 0, tabWidth: 8 };
+  return o;
+}
+const WEIGHTS = [[5, "text"], [3, "escapes"], [2, "bidi"], [4, "paint"], [1, "setCell"], [2, "capacity"], [2, "lifecycle"], [2, "claude"], [2, "kernelcap"], [1, "long256"], [1, "bidiexplicit"], [1, "bidigate"], [1, "paintwide"], [1, "subst"]];
 
 function genCase(i, family) {
   const R = rngFor(i);
   const fam = family || R.weighted(WEIGHTS);
   const c = { id: `fz${i}.${fam}`, steps: FAMILIES[fam](R) };
   if (fam === "bidiexplicit") { c.opts = { ambiguousIsNarrow: true, substitute: R.pick([[], [], [[0x202e, 0x202e]]]) }; return c; }
+  if (fam === "subst") { c.opts = substOpts(R); return c; }
   if (fam === "bidigate") { c.opts = { ambiguousIsNarrow: true, substitute: R.pick([[], [], [[0x5d0, 0x5ea]], [[0x600, 0x6ff]], [[0x200f, 0x200f]], [[1564, 1564], [8234, 8238], [8294, 8297]]]) }; return c; }
   if (R.chance(0.01)) c.opts = { ambiguousIsNarrow: R.chance(0.5), substitute: R.pick([[], null, [[1564, 1564], [8234, 8238], [8294, 8297]], [[0x4e2d, 0x4e2d], [0x301, 0x301]]]), screen: { widthMask: 3, narrow: 0, wide: 1, spacerTail: 2, spacerHead: 3, emptyCharIndex: 0, spacerCharIndex: 1, emptyWord: 0, tabWidth: 8 } };
   return c;
