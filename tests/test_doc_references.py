@@ -30,10 +30,10 @@ SKIPPED_DIRS = {"build", ".git", "__pycache__", ".pytest_cache", ".superpowers"}
 # Files whose findings citations are all about one subject. The value is the
 # set of section titles they may resolve to, matched as substrings.
 ALLOWED = {
-    "scripts/build.sh": {"equivalence gap", "Post-processing"},
+    "scripts/build.sh": {"equivalence gap", "Post-processing", "code-split"},
     "scripts/ab-equivalence.sh": {"equivalence gap"},
     "scripts/mock-messages-api.mjs": {"equivalence gap"},
-    "tools/postprocess.py": {"equivalence gap", "Post-processing"},
+    "tools/postprocess.py": {"equivalence gap", "Post-processing", "code-split"},
     "tests/test_image_shim.py": {"equivalence gap"},
     "tests/test_build_script.py": {"equivalence gap"},
 }

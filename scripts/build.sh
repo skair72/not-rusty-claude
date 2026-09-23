@@ -138,7 +138,8 @@ mkdir -p "$OUT_DIR"
 rm -rf "$STAGE"
 info "extracting cli.js + assets -> $WORK"
 "$HERE/tools/extract_bun.py" "$NATIVE" "$STAGE"
-[ -f "$STAGE/cli.original.js" ] || die "extraction failed: cli.original.js missing"
+[ -f "$STAGE/cli.original.js" ] || [ -f "$STAGE/manifest.json" ] \
+  || die "extraction failed: neither cli.original.js nor manifest.json was written"
 
 # 4. Post-process
 #
@@ -149,8 +150,36 @@ info "extracting cli.js + assets -> $WORK"
 info "post-processing cli.js for external Bun"
 POST_LOG="$STAGE/.postprocess.log"
 "$HERE/tools/postprocess.py" "$STAGE" | tee "$POST_LOG"
-[ -f "$STAGE/cli.original.cjs" ] || die "post-process failed: cli.original.cjs missing"
-[ -f "$STAGE/cli.js" ] || die "post-process failed: cli.js sibling missing"
+# Two graph shapes (docs/findings.md 14): extract_bun.py leaves a manifest.json
+# only for a code-split ESM graph, whose artifact is a root/ tree behind an
+# entry of ours; the legacy shape is one cli.original.cjs. `cli.js` is the
+# runnable entry in BOTH: the ESM entry itself, or the legacy sibling that
+# requires cli.original.cjs.
+SHAPE=legacy
+if [ -f "$STAGE/manifest.json" ]; then
+  SHAPE=esm
+  [ -d "$STAGE/root" ] || die "post-process failed: root/ missing"
+  [ -f "$STAGE/bun-ant.mjs" ] || die "post-process failed: the Bun.ant polyfill is missing"
+else
+  [ -f "$STAGE/cli.original.cjs" ] || die "post-process failed: cli.original.cjs missing"
+fi
+[ -f "$STAGE/cli.js" ] || die "post-process failed: cli.js missing"
+
+# 4'. A code-split tree is checked with Bun's own parser before it can replace
+# anything: every rewritten module must parse and keep exactly the import
+# records it had (scripts/verify-tree.js). postprocess.py judges each
+# reference from the text around it; this is the check that does not.
+if [ "$SHAPE" = esm ]; then
+  if [ -n "$BUN_BIN" ] && [ -x "$BUN_BIN" ]; then
+    info "verifying the rewired tree with bun's parser"
+    VERIFY_OUT="$("$BUN_BIN" "$HERE/scripts/verify-tree.js" "$STAGE" 2>&1)" \
+      || die "the rewired tree failed verification - nothing was swapped in:
+       $VERIFY_OUT"
+    info "  $VERIFY_OUT"
+  else
+    warn "no bun: the rewired tree was NOT checked by a parser (scripts/verify-tree.js)"
+  fi
+fi
 
 # 4a. Say out loud which of the two artifacts this is. Measured 2026-08-23 by
 # building each real binary both ways: the shimmed and unshimmed outputs are the
@@ -179,7 +208,12 @@ rm -f "$POST_LOG"
 # either one left the suite green while every build went on making a false
 # claim about its own artifact.
 GAPS="image processing, sandbox, ripgrep"
-if [ "${SHIM_N:-}" = "1" ]; then
+if [ "$SHAPE" = esm ]; then
+  # Nothing to shim: this build resizes images through Bun.Image, ungated.
+  GAPS="sandbox, ripgrep, install identity"
+  info "code-split ESM build: Bun.ant polyfill installed by the entry;"
+  info "  images resize through Bun.Image, so the image shim does not apply."
+elif [ "${SHIM_N:-}" = "1" ]; then
   GAPS="sandbox, ripgrep, install identity"
   info "image shim APPLIED: the native image-processor branch is reachable,"
   info "  which is what the Read tool needs to resize a large image. Every other"
@@ -207,11 +241,17 @@ info "staged build swapped into place -> $WORK"
 
 # 5. Report - no install
 info "artifacts ready:"
-printf '      %s\n' "$WORK/cli.original.cjs" "$WORK/cli.js" "$WORK/assets/"
+if [ "$SHAPE" = esm ]; then
+  RUN_ENTRY="$WORK/cli.js"
+  printf '      %s\n' "$WORK/cli.js" "$WORK/root/" "$WORK/bun-ant.mjs"
+else
+  RUN_ENTRY="$WORK/cli.original.cjs"
+  printf '      %s\n' "$WORK/cli.original.cjs" "$WORK/cli.js" "$WORK/assets/"
+fi
 echo
 info "run it with ('mcp list' is the smoke test, not '--version'):"
 printf '      DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \\\n'
-printf '        %s %s mcp list\n' "${BUN_BIN:-bun}" "$WORK/cli.original.cjs"
+printf '        %s %s mcp list\n' "${BUN_BIN:-bun}" "$RUN_ENTRY"
 echo
 # Five lines, not the seventeen this used to print. A wall of warnings after
 # every successful build is a wall nobody reads, and the two that can cost the

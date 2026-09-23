@@ -146,6 +146,7 @@ BINARY_LINK := $(CACHE_DIR)/claude-$(PLATFORM).bin
 #   make test PYTEST_ARGS='-k macho -vv'
 PYTEST_ARGS ?= -q -rs
 AB_ARGS     ?=
+HARNESS_ARGS ?=
 
 # Running the artifact under Node instead of Bun (scripts/bun-shim.cjs).
 #
@@ -174,7 +175,7 @@ CLAUDE_BINARY ?=
 # directories it is about to remove one line later.
 KEEP_NOTICE ?= 1
 
-.PHONY: help doctor setup binary build smoke node-deps node-run test wrap-bench ab clean distclean first-run
+.PHONY: help doctor setup binary build smoke node-deps node-run test harness wrap-bench ab clean distclean first-run
 
 help:
 	@printf '%s\n' \
@@ -189,6 +190,7 @@ help:
 	  '  node-deps   download ws + undici into $(NODE_MODULES) (needs npm)' \
 	  '  node-run    run the built artifact under node + scripts/bun-shim.cjs' \
 	  '  test        run the pytest suite, saying up front what will run vs skip' \
+	  '  harness     scripts/harness.py: build, then compare artifact vs native, check by check' \
 	  '  wrap-bench  time Bun.wrapAnsi under bun and under node+shim, side by side' \
 	  '  ab          scripts/ab-equivalence.sh, the three-way A/B (Linux only)' \
 	  '  first-run   setup + binary + build + smoke + test, in that order' \
@@ -205,6 +207,7 @@ help:
 	  '  CLAUDE_BINARY=      binary for `build` (default: the downloaded one)' \
 	  '  PYTEST_ARGS=$(PYTEST_ARGS)         passed to pytest' \
 	  '  AB_ARGS=            passed to scripts/ab-equivalence.sh' \
+	  '  HARNESS_ARGS=       passed to scripts/harness.py (e.g. --only cli,tui)' \
 	  '  NODE_BIN=$(NODE_BIN)' \
 	  '  NODE_ARGS=$(NODE_ARGS)       what `node-run` runs' \
 	  '' \
@@ -262,7 +265,9 @@ doctor:
 	  if [ -n "$$p" ] && [ -f "$$p" ]; then printf '    %-22s %s\n' 'Mach-O candidate' "$$p"; break; fi; \
 	done; \
 	echo '==> artifacts'; \
-	if [ -f '$(OUT_DIR)/extract/cli.original.cjs' ]; then \
+	if [ -f '$(OUT_DIR)/extract/manifest.json' ] && [ -f '$(OUT_DIR)/extract/cli.js' ]; then \
+	  printf '    %-22s %s\n' 'built (code-split)' '$(OUT_DIR)/extract/cli.js'; \
+	elif [ -f '$(OUT_DIR)/extract/cli.original.cjs' ]; then \
 	  printf '    %-22s %s\n' 'built' '$(OUT_DIR)/extract/cli.original.cjs'; \
 	else \
 	  printf '    %-22s %s\n' 'built' 'none - run: make build'; \
@@ -400,6 +405,7 @@ build:
 smoke:
 	@set -eu; \
 	art='$(OUT_DIR)/extract/cli.original.cjs'; \
+	if [ ! -f "$$art" ] && [ -f '$(OUT_DIR)/extract/manifest.json' ]; then art='$(OUT_DIR)/extract/cli.js'; fi; \
 	[ -f "$$art" ] || { echo "error: no artifact at $$art - run: make build" >&2; exit 1; }; \
 	[ -x '$(BUN_BIN)' ] || { echo 'error: no bun at $(BUN_BIN) - run: make setup' >&2; exit 1; }; \
 	cfg="$$(mktemp -d "$${TMPDIR:-/tmp}/nrc-smoke.XXXXXX")"; \
@@ -452,10 +458,16 @@ node-deps:
 # The Node counterpart of `smoke`. Same command, same throwaway config dir, so
 # the two are directly comparable by eye; tests/test_node_runtime.py is what
 # compares them byte for byte.
-node-run: node-deps
+# A code-split build is refused before node-deps can reach npm: the refusal
+# is the recipe's first line, and node-deps is only a prerequisite when the
+# built artifact is not one ($(wildcard) is evaluated when make reads this).
+NODE_RUN_PREREQ := $(if $(wildcard $(OUT_DIR)/extract/manifest.json),,node-deps)
+node-run: $(NODE_RUN_PREREQ)
 	@set -eu; \
 	mods="$${NRC_TEST_NODE_MODULES:-$(NODE_MODULES)}"; \
 	art='$(OUT_DIR)/extract/cli.original.cjs'; \
+	if [ ! -f "$$art" ] && [ -f '$(OUT_DIR)/extract/manifest.json' ]; then \
+	  echo 'error: this is a code-split (2.1.280+) build, and the Node path does not run it yet: its modules call import.meta.require, which Node lacks. Run it under bun: make smoke. See docs/status.md.' >&2; exit 1; fi; \
 	[ -f "$$art" ] || { echo "error: no artifact at $$art - run: make build" >&2; exit 1; }; \
 	node='$(NODE_BIN)'; \
 	[ -n "$$node" ] && [ -x "$$node" ] || { echo 'error: no node found - install Node >= $(MIN_NODE_MAJOR), or set NODE_BIN=' >&2; exit 1; }; \
@@ -532,7 +544,8 @@ test:
 	  exit 1; \
 	fi; \
 	echo '==> test inputs (a missing one skips its tests; it is not a failure)'; \
-	if [ -n "$$elf" ] && [ -f "$$elf" ]; then printf '    %-22s RUN    %s [%s]\n' 'ELF Claude binary' "$$elf" "$$elfsrc"; \
+	if [ -n "$$elf" ] && [ -f "$$elf" ] && [ "$$elfsrc" = default ]; then printf '    %-22s RUN    %s [%s]\n' 'ELF Claude binary' "$$elf, and the cached download for the legacy-shape tests" 'default: the tests pick each by graph shape'; \
+	  elif [ -n "$$elf" ] && [ -f "$$elf" ]; then printf '    %-22s RUN    %s [%s]\n' 'ELF Claude binary' "$$elf" "$$elfsrc"; \
 	  else printf '    %-22s SKIP   not found - set NRC_TEST_ELF, or `make binary` on Linux\n' 'ELF Claude binary'; fi; \
 	if [ -n "$$macho" ] && [ -f "$$macho" ]; then printf '    %-22s RUN    %s [%s]\n' 'Mach-O Claude binary' "$$macho" "$$msrc"; \
 	  else printf '    %-22s SKIP   not found - set NRC_TEST_MACHO, or `make binary` on macOS\n' 'Mach-O Claude binary'; fi; \
@@ -548,17 +561,33 @@ test:
 	  else printf '    %-22s SKIP   not in %s - run `make node-deps`\n' 'ws + undici' "$$mods"; fi; \
 	if [ -f '$(OUT_DIR)/extract/cli.original.cjs' ]; then \
 	  printf '    %-22s RUN    %s\n' 'built artifact' '$(OUT_DIR)/extract/cli.original.cjs'; \
+	  elif [ -f '$(OUT_DIR)/extract/manifest.json' ]; then \
+	  printf '    %-22s SKIP   code-split build: the Node tests need a legacy one\n' 'built artifact'; \
 	  else printf '    %-22s SKIP   not built - run `make build`\n' 'built artifact'; fi; \
 	printf '    %-22s %s\n' 'runner' "$$rsrc"; \
 	echo '    Every skip this suite can produce comes from one of the rows'; \
 	echo '    above; the SKIPPED lines pytest prints at the end give the counts.'; \
 	echo '==> running'; \
-	if [ -n "$$elf" ]; then NRC_TEST_ELF="$$elf"; export NRC_TEST_ELF; fi; \
+	if [ -n "$$elf" ] && [ "$$elfsrc" != default ]; then NRC_TEST_ELF="$$elf"; export NRC_TEST_ELF; fi; \
 	if [ -n "$$macho" ]; then NRC_TEST_MACHO="$$macho"; export NRC_TEST_MACHO; fi; \
 	if [ -n "$$bun" ]; then BUN_BIN="$$bun"; export BUN_BIN; fi; \
 	if [ -n "$$node" ]; then NRC_TEST_NODE="$$node"; export NRC_TEST_NODE; fi; \
 	NRC_TEST_NODE_MODULES="$$mods"; export NRC_TEST_NODE_MODULES; \
 	$$runner tests/ $(PYTEST_ARGS)
+
+# The artifact-vs-native verification harness (scripts/harness.py): builds from
+# the native binary, then runs the same scenarios through both and compares
+# them - CLI output, mock-API agentic turns, the TUI under a pty, Bun.ant and
+# CellSegmenter against the native runtime. It EXECUTES the native binary,
+# which the build pipeline never does; every run is sandboxed to a throwaway
+# HOME and a loopback mock. Report: $(OUT_DIR)/harness/report.json.
+harness:
+	@set -eu; \
+	cd '$(ROOT)'; \
+	[ -x '$(BUN_BIN)' ] || { echo 'error: no bun at $(BUN_BIN) - run: make setup' >&2; exit 1; }; \
+	bin='$(CLAUDE_BINARY)'; \
+	if [ -z "$$bin" ]; then bin=/usr/bin/claude; fi; \
+	python3 scripts/harness.py --native "$$bin" --bun '$(BUN_BIN)' --out '$(OUT_DIR)/harness' $(HARNESS_ARGS)
 
 # Timing, not correctness - `make test` covers the latter. Runs the same
 # benchmark under both runtimes, because a millisecond count means nothing on

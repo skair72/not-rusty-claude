@@ -72,12 +72,79 @@ def _real(env_var, *defaults):
     return None
 
 
+# The legacy (single CommonJS entry) download this repo's runbook caches - the
+# ELF the legacy tests fall back to once /usr/bin/claude is a code-split build.
+CACHED_LEGACY_ELF = os.path.join(os.path.expanduser("~"), ".cache",
+                                 "not-rusty-claude", "claude-linux-x64.bin")
+
+
+def _entry_format(path):
+    """The entry module's format byte (0 none, 1 esm, 2 cjs), or None.
+
+    Which of the two extraction shapes a binary takes is decided by exactly
+    this byte (tools/extract_bun.py), so the fixtures below sort specimens by
+    it too. None when the file is not a parsable Bun standalone at all.
+    """
+    extract_bun = _load("extract_bun")
+    try:
+        with open(path, "rb") as fh:
+            buf = fh.read()
+        off, size = extract_bun.find_bun_section(buf)
+        payload, mod_off, _, entry = extract_bun.parse_payload(buf[off:off + size])
+    except (OSError, SystemExit):
+        return None
+    rec = mod_off + entry * extract_bun.MODULE_RECORD_SIZE
+    return payload[rec + 50]
+
+
+def _real_shaped(env_var, want_esm, magic, kind, *defaults):
+    """The first candidate of the wanted graph shape, or a skip saying why.
+
+    An explicit env var is taken as-is and must have the wanted shape; the
+    defaults are tried in order. The host's /usr/bin/claude moved from a
+    legacy build (2.1.222) to a code-split one (2.1.280) on 2026-09-21, and a
+    test that silently fed it to the legacy transform failed as if the TOOLS
+    had broken (docs/findings.md 14).
+    """
+    override = os.environ.get(env_var)
+    candidates = [override] if override else list(defaults)
+    seen = []
+    for path in candidates:
+        if not (path and os.path.isfile(path)):
+            continue
+        if override:
+            _usable(path, magic, kind, env_var)     # named on purpose: say why not
+        elif _magic(path) != magic:
+            seen.append(f"{path} (not {kind})")     # a default: try the next one
+            continue
+        fmt = _entry_format(path)
+        if fmt is None:
+            # The right container magic and still unparsable is not a missing
+            # specimen: it is the extractor under test failing on a real
+            # binary, and a skip would hide exactly that regression.
+            pytest.fail(f"{path} is a {kind} binary but tools/extract_bun.py cannot "
+                        f"parse its Bun graph - a regression in the extractor, or a "
+                        f"corrupt specimen; set {env_var} to rule out the latter")
+        if (fmt == 1) == want_esm:
+            return path
+        seen.append(f"{path} (entry format {fmt})")
+    shape = "code-split (esm)" if want_esm else "legacy (cjs)"
+    tried = ", ".join(seen) or (f"{override} (named by {env_var}; not a file)" if override
+                                else "the defaults " + ", ".join(defaults))
+    pytest.skip(f"no {shape} {kind} Claude binary among {tried}; set {env_var}")
+
+
 @pytest.fixture(scope="session")
 def real_elf_binary():
-    path = _real("NRC_TEST_ELF", "/usr/bin/claude")
-    if not path:
-        pytest.skip("no ELF Claude binary; set NRC_TEST_ELF")
-    return _usable(path, ELF_MAGIC, "ELF", "NRC_TEST_ELF")
+    """A LEGACY-shaped ELF: one CommonJS entry module, the pre-2.1.280 graph."""
+    return _real_shaped("NRC_TEST_ELF", False, ELF_MAGIC, "ELF",
+                        "/usr/bin/claude", CACHED_LEGACY_ELF)
+
+
+@pytest.fixture(scope="session")
+def real_esm_binary():
+    """A code-split ESM ELF, 2.1.280 or later (docs/findings.md 14)."""
+    return _real_shaped("NRC_TEST_ESM", True, ELF_MAGIC, "ELF", "/usr/bin/claude")
 
 
 @pytest.fixture(scope="session")

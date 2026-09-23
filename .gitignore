@@ -1,5 +1,7 @@
 # extracted artifacts — large, version- and machine-specific
 extract/
+# the build/ output dir (OUT_DIR): artifacts, and make harness's reports
+/build/
 extracted/
 *.node
 *.orig

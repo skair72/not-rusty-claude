@@ -165,8 +165,13 @@ module record (52 bytes):
   +0x04 u32  name_size
   +0x08 u32  content_offset    # → payload[content_offset : +content_size]
   +0x0C u32  content_size
+  +0x10 ..   four more (offset, size) pairs: sourcemap, JSC bytecode,
+             module info, bytecode origin path - unused here
+  +0x30 u8   content encoding  # 0 raw bytes, 1 Latin-1, 2 UTF-16LE (measured)
   +0x31 u8   loader_id         # offset 49; see loader enum below
-  (other bytes: alignment / flags, unused here)
+  +0x32 u8   module format     # 0 none, 1 esm, 2 cjs - the ENTRY's value
+                               # picks the extraction shape (findings §14)
+  +0x33 u8   side
 ```
 
 - Name and content are both slices **into the payload** (absolute payload
@@ -214,6 +219,12 @@ loader, including a real `base64` one: **do not decode.**
 ---
 
 ## 5. Extraction rules used by `extract_bun.py`
+
+For a **code-split** graph (entry format byte 1, 2.1.280+) there is one rule:
+every module is written verbatim under `original/<its path below
+/$bunfs/root/>`, with `manifest.json` recording each one's loader, format,
+encoding, size and sha256; nothing is inlined, so nothing may be skipped
+([findings.md](./findings.md) §14). The table below is the **legacy** shape:
 
 | Module | Action |
 |---|---|

@@ -71,9 +71,12 @@ Usage:
       cli.js shim beside it.
 """
 
+import hashlib
 import json
 import os
+import posixpath
 import re
+import shutil
 import sys
 
 # A /$bunfs/root/<name> string literal. This single pattern covers BOTH shapes
@@ -503,10 +506,449 @@ def die(msg):
     sys.exit(1)
 
 
+# --- the esm tree (2.1.280 and later) ----------------------------------------
+#
+# A code-split build is ~2000 ES modules that import each other by
+# /$bunfs/root/<path>. extract_bun.py writes them verbatim under original/ with
+# a manifest; this half rewrites every reference so the tree runs from real
+# disk under root/, and puts an entry of ours in front of it. See
+# docs/findings.md section 14 for every shape measured on 2.1.280.
+
+TREE_SRC = "original"      # extract_bun.TREE_DIR
+TREE_OUT = "root"
+MANIFEST_NAME = "manifest.json"
+MANIFEST_KIND = "esm-tree"
+ENTRY_NAME = "cli.js"
+# The Bun.ant polyfill (scripts/), copied beside the entry under the same
+# names: bun-ant.mjs imports its sibling by relative path.
+BUN_ANT_NAME = "bun-ant.mjs"
+BUN_ANT_FILES = ("bun-ant.mjs", "bun-ant-cell-segmenter.mjs")
+
+# A quoted /$bunfs/root/ path. Deliberately NOT restricted to basenames the way
+# BUNFS_LITERAL is: 2.1.280 keeps one module in a subdirectory
+# (src/plugins/functionHooks/hooks-worker/hooks-worker.js).
+TREE_REF = re.compile(r"""(["'])/\$bunfs/root/([^"'\s`\\]+)\1""")
+
+# What precedes a reference decides how it may be rewritten. A static
+# `import`/`export ... from` specifier must stay a string literal, so it becomes
+# a RELATIVE specifier; so do import() and a require() that resolves against
+# the module it is written in. Everything else - a path constant later handed
+# to fs, a Worker URL, or a call to `Re`, which is `import.meta.require` of the
+# shared helper chunk and so resolves relative to THAT chunk rather than the
+# caller - becomes an expression that is absolute at runtime.
+# Measured on 2.1.280 (docs/findings.md 14): 119359 `import"`, 17195 `from"`,
+# 1196 `import("`, 445 `import.meta.require("`, 84 text + 2 napi `Re("`, 135
+# file-asset constants and 264 HOOKS_WORKER_URL values.
+_SPEC_BEFORE = re.compile(
+    r"(?:(?<![\w$.])from|(?<![\w$.])import|(?<![\w$.])import\s*\(|"
+    r"(?<![\w$.])require\s*\(|(?<![\w$])import\.meta\.require\s*\()\s*$")
+# The callee of a text-module reference: an identifier or import.meta.require,
+# called directly. Which identifiers are acceptable is decided per tree, in
+# transform_tree(): only names bound to import.meta.require.
+_CALLEE_BEFORE = re.compile(r"(?<![\w$])(import\.meta\.require|(?<!\.)[A-Za-z_$][\w$]*)\s*\(\s*$")
+_REQUIRE_BINDING = re.compile(r"(?<![\w$.])([A-Za-z_$][\w$]*)\s*=\s*import\.meta\.require(?![\w$])")
+# Comments between a keyword and its specifier (`import/*x*/"a"`) do not change
+# what the specifier is, so they are removed before the context is judged.
+_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.S)
+
+# Loaders whose modules are JavaScript source this half rewrites, and loaders
+# that are copied through untouched. `text` is neither: see _text_module().
+TREE_JS_LOADERS = ("js", "jsx", "ts", "tsx")
+TREE_COPY_LOADERS = ("file", "napi", "base64", "wasm", "json", "sqlite",
+                     "sqlite_embedded")
+
+
+def _out_path(mod):
+    """Where a manifest module lands under root/.
+
+    The entry module of 2.1.280 is `/$bunfs/root/cli`, extensionless. Node
+    will not load an extensionless file as an ES module, so JavaScript with no
+    extension gains `.js` (and every reference to it follows). A text module
+    becomes a CommonJS wrapper, see _text_module().
+    """
+    rel = mod["path"]
+    if mod["loader"] in TREE_JS_LOADERS and "." not in posixpath.basename(rel):
+        return rel + ".js"
+    if mod["loader"] == "text":
+        return rel + ".cjs"
+    return rel
+
+
+def _text_module(content):
+    """A text-loader module as a CommonJS file whose exports ARE the string.
+
+    Measured inside the native 2.1.280 runtime: require() of a text module
+    returns the raw string. Stock Bun 1.3.14 returns {default: ...} for a .txt
+    file and, for .md, {default: <the markdown RENDERED TO HTML>} - so leaving
+    the 84 skills and prompts as plain files would silently feed Claude HTML.
+    module.exports = "<text>" is the one shape that returns the same string
+    under Bun and Node alike. ensure_ascii keeps U+2028/2029 and lone
+    surrogates out of the source text.
+    """
+    return ("// not-rusty-claude: a text-loader module; require() returns the string.\n"
+            "module.exports = " + json.dumps(content, ensure_ascii=True) + ";\n")
+
+
+# extract_bun.ENCODINGS, by name: how the runtime decodes a module's bytes.
+_DECODERS = {"latin1": "latin-1", "utf16le": "utf-16-le", "binary": "utf-8"}
+
+# The Windows VFS prefix on its own is a constant the code compares paths
+# against, not a reference to a module - 2.1.280's hooks worker resolver:
+# var xdt="B:/~BUN/root/";function Cdt(e){return O()==="windows"&&
+# e.startsWith(xdt)?e:new URL(`file://${e}`)}. It is the one such constant
+# measured, so it is the one left alone (and counted). A bare POSIX
+# "/$bunfs/root/" is NOT exempt: on Linux and macOS it would be the stem of a
+# path built by concatenation, which nothing here could rewire.
+PREFIX_CONSTANT = re.compile(r"""(["'])B:/~BUN/root/\1""")
+
+
+def _decode(data, mod):
+    """A module's bytes as the runtime would read them, or raise ValueError."""
+    codec = _DECODERS.get(mod.get("encoding"))
+    if codec is None:
+        raise ValueError("unknown content encoding %r" % mod.get("encoding"))
+    if codec == "utf-16-le" and len(data) % 2:
+        raise ValueError("odd byte count for UTF-16LE")
+    return data.decode(codec)
+
+
+def _relative_specifier(from_dir, target):
+    rel = posixpath.relpath(target, from_dir or ".")
+    return rel if rel.startswith("../") else "./" + rel
+
+
+def transform_module(code, rel, by_path):
+    """Rewrite every /$bunfs/root/ reference in one ES module.
+
+    `rel` is the module's own OUTPUT path under root/; `by_path` maps each VFS
+    path to its manifest entry. Returns (code, counts); counts["missing"] and
+    counts["bad_text"] are what check_tree() turns into fatal errors.
+    """
+    here = posixpath.dirname(rel)
+    counts = {"specifier": 0, "expression": 0, "text": 0,
+              "missing": set(), "bad_text": set(), "text_callees": set(),
+              "realm_entries": set()}
+
+    def sub(m):
+        quote, target = m.group(1), m.group(2)
+        mod = by_path.get(target)
+        if mod is None:
+            counts["missing"].add(target)
+            return m.group(0)
+        out = _out_path(mod)
+        before = _BLOCK_COMMENT.sub("", code[max(0, m.start() - 96):m.start()])
+        if mod["loader"] == "text":
+            # Only ever reached through a require-like call (84 of 84 on
+            # 2.1.280, all `Re(...)`). A text path handed to anything else -
+            # fs above all - would read the WRAPPER's source instead of the
+            # text, so the callee is recorded and transform_tree() accepts it
+            # only if it is bound to import.meta.require.
+            callee = _CALLEE_BEFORE.search(before)
+            if not callee:
+                counts["bad_text"].add(target)
+                return m.group(0)
+            counts["text_callees"].add(callee.group(1))
+            counts["text"] += 1
+        else:
+            if _SPEC_BEFORE.search(before):
+                counts["specifier"] += 1
+                return quote + _relative_specifier(here, out) + quote
+            if mod["loader"] in TREE_JS_LOADERS:
+                # JavaScript reached by PATH rather than by import is the entry
+                # of another realm - 2.1.280's hooks Worker - which must get
+                # Bun.ant too; transform_tree() adds it there.
+                counts["realm_entries"].add(target)
+        counts["expression"] += 1
+        up = posixpath.relpath(out, here or ".")
+        return "(import.meta.dirname+" + json.dumps("/" + up) + ")"
+
+    code = TREE_REF.sub(sub, code)
+    counts["prefix_constants"] = len(PREFIX_CONSTANT.findall(code))
+    counts["leftovers"] = sorted(set(LEFTOVER_BUNFS.findall(PREFIX_CONSTANT.sub("", code))))
+    counts["build_paths"] = sorted(set(BUILD_PATH_LEAK.findall(code)))
+    return code, counts
+
+
+def _entry_source(entry_out):
+    return (
+        "// not-rusty-claude: the entry for a code-split (ESM) Claude Code build.\n"
+        "// Claude's own entry module is " + TREE_OUT + "/" + entry_out + "; this\n"
+        "// file only makes sure Bun.ant exists before any of Claude's modules\n"
+        "// evaluate. Bun.ant is a namespace of Anthropic's private Bun build and\n"
+        "// stock Bun has none (docs/findings.md 14). Imports evaluate in order.\n"
+        'import "./' + BUN_ANT_NAME + '";\n'
+        'import "./' + TREE_OUT + "/" + entry_out + '";\n')
+
+
+def _bun_ant_source_dir():
+    """Where the polyfill's files are read from: scripts/, or NRC_BUN_ANT_DIR."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.environ.get("NRC_BUN_ANT_DIR") or os.path.join(here, "..", "scripts")
+
+
+# A self-spawn the native binary makes work simply by BEING the program: it
+# runs process.execPath with a flag, and native process.execPath is claude.
+# Here it is bun, and `bun --claude-in-chrome-mcp` prints Bun's help and exits
+# 0 - measured - so the Claude-in-Chrome MCP server Claude configures for
+# itself never starts. Legacy builds reached it through the cli.js sibling;
+# 2.1.280's config has no non-standalone branch at all:
+#   function $7e(){return{type:"stdio",command:process.execPath,
+#                         args:["--claude-in-chrome-mcp"],scope:"dynamic"}}
+# so it gains the entry as its first argument, the way every other self-spawn
+# in the build already does outside a standalone (`ku()?[]:[process.argv[1]]`).
+# Matched as the whole literal shape; the flag stays in args, which is how
+# Claude recognises that server elsewhere.
+SELF_SPAWNS = (
+    ('command:process.execPath,args:["--claude-in-chrome-mcp"]',
+     'command:process.execPath,args:[process.argv[1],"--claude-in-chrome-mcp"]'),
+)
+
+STAGE_NAME = ".root.partial"
+
+
+def _after_header(code):
+    """Offset just past the file's leading `//` comment lines (the pragma and
+    the licence header), where an import can go without displacing them."""
+    i = 0
+    while code.startswith("//", i) or code.startswith("\n", i):
+        nl = code.find("\n", i)
+        if nl < 0:
+            return len(code)
+        i = nl + 1
+    return i
+
+
+def transform_tree(d):
+    """Build root/, the entry and the polyfill from original/ + manifest.json.
+
+    Returns (totals, errors). root/ is built in a staging directory and only
+    replaces the previous one on success, so a failed run - including an
+    in-place re-run over an existing artifact - leaves the previous artifact
+    whole: root/, cli.js and the polyfill all from the same run.
+    """
+    with open(os.path.join(d, MANIFEST_NAME), encoding="utf-8") as fh:
+        manifest = json.load(fh)
+    errors = []
+    if manifest.get("kind") != MANIFEST_KIND:
+        return {}, ["%s is not an %s manifest" % (MANIFEST_NAME, MANIFEST_KIND)]
+    modules = manifest["modules"]
+    by_path = {m["path"]: m for m in modules}
+    src_root = os.path.join(d, manifest.get("tree", TREE_SRC))
+    totals = {"modules": len(modules), "js": 0, "text": 0, "copied": 0,
+              "specifier": 0, "expression": 0, "text_refs": 0,
+              "prefix_constants": 0, "self_spawns": 0, "realm_entries": [],
+              "leftovers": [], "build_paths": set()}
+
+    # Two modules must never land on one file: `cli` gains .js and a text
+    # module gains .cjs, so `cli` + `cli.js`, or `p.md` + `p.md.cjs`, would.
+    # The second would overwrite the first in silence. Refused before any
+    # byte is written.
+    placed = {}
+    for mod in modules:
+        out = _out_path(mod)
+        key = out.lower() if sys.platform == "darwin" else out
+        if key in placed:
+            errors.append("modules %s and %s would both be written to root/%s"
+                          % (placed[key], mod["path"], out))
+        placed[key] = mod["path"]
+    if errors:
+        return totals, errors
+
+    missing, bad_text, undecodable, unknown = set(), set(), [], []
+    callees, realm_entries, js_out = set(), set(), {}
+    bindings = {"import.meta.require", "require"}
+    blobs = {}
+    for mod in modules:
+        src = os.path.join(src_root, *mod["path"].split("/"))
+        try:
+            with open(src, "rb") as fh:
+                data = fh.read()
+        except OSError as e:
+            errors.append("module %s is in the manifest but cannot be read (%s)"
+                          % (mod["path"], e.strerror))
+            continue
+        if hashlib.sha256(data).hexdigest() != mod["sha256"]:
+            errors.append("%s does not match the manifest's sha256 - original/ "
+                          "and manifest.json come from different extractions"
+                          % mod["path"])
+            continue
+        out = _out_path(mod)
+        if mod["loader"] in TREE_JS_LOADERS:
+            try:
+                code = _decode(data, mod)
+            except ValueError as e:
+                undecodable.append("%s (%s)" % (mod["path"], e))
+                continue
+            bindings |= set(_REQUIRE_BINDING.findall(code))
+            code, c = transform_module(code, out, by_path)
+            for old, new in SELF_SPAWNS:
+                if old in code:
+                    totals["self_spawns"] += code.count(old)
+                    code = code.replace(old, new)
+            totals["prefix_constants"] += c["prefix_constants"]
+            missing |= c["missing"]
+            bad_text |= c["bad_text"]
+            callees |= c["text_callees"]
+            realm_entries |= c["realm_entries"]
+            totals["specifier"] += c["specifier"]
+            totals["expression"] += c["expression"]
+            totals["text_refs"] += c["text"]
+            totals["leftovers"] += ["%s: %s" % (out, x) for x in c["leftovers"]]
+            totals["build_paths"] |= set(c["build_paths"])
+            js_out[mod["path"]] = (out, code)
+        elif mod["loader"] == "text":
+            try:
+                text = _decode(data, mod)
+            except ValueError as e:
+                undecodable.append("%s (%s)" % (mod["path"], e))
+                continue
+            blobs[out] = _text_module(text).encode("utf-8")
+            totals["text"] += 1
+        elif mod["loader"] in TREE_COPY_LOADERS:
+            blobs[out] = data
+            totals["copied"] += 1
+        else:
+            unknown.append("%s (loader %s)" % (mod["path"], mod["loader"]))
+
+    # Every JavaScript module reached by path starts a realm of its own (the
+    # hooks Worker on 2.1.280), and the native runtime's Worker has Bun.ant as
+    # much as its main thread does. The polyfill goes in as that module's
+    # first import - evaluated before anything it imports - and is inert
+    # wherever Bun.ant already exists.
+    for vfs in sorted(realm_entries):
+        out, code = js_out[vfs]
+        rel = posixpath.relpath(BUN_ANT_NAME, posixpath.dirname(TREE_OUT + "/" + out))
+        at = _after_header(code)
+        js_out[vfs] = (out, code[:at] + 'import "' + rel + '";\n' + code[at:])
+        totals["realm_entries"].append(out)
+    totals["js"] = len(js_out)
+
+    entry = by_path.get(manifest.get("entry"))
+    entry_out = _out_path(entry) if entry else None
+    if entry is None or entry["loader"] not in TREE_JS_LOADERS:
+        errors.append("the manifest's entry %r is not a JavaScript module in it"
+                      % manifest.get("entry"))
+    if undecodable:
+        errors.append("%d module(s) could not be decoded with their recorded "
+                      "content encoding and were not written: %s"
+                      % (len(undecodable), ", ".join(sorted(undecodable))))
+    if unknown:
+        errors.append("%d module(s) have a loader this tool does not know how "
+                      "to place, so they were not written: %s. Add the loader "
+                      "to TREE_COPY_LOADERS once it is known to be read as raw "
+                      "bytes." % (len(unknown), ", ".join(sorted(unknown))))
+    if missing:
+        errors.append("%d /$bunfs/root/ reference(s) name a module the graph "
+                      "does not contain: %s - they would fail at runtime"
+                      % (len(missing), ", ".join(sorted(missing))))
+    stray = sorted(callees - bindings)
+    if bad_text or stray:
+        errors.append("text module(s) reached other than through a call to "
+                      "import.meta.require (or a name bound to it): %s%s - "
+                      "rewiring them to the .cjs wrapper would hand that code "
+                      "a JavaScript file instead of the text"
+                      % (", ".join(sorted(bad_text)) or "-",
+                         "; callee(s) not bound to import.meta.require: "
+                         + ", ".join(stray) if stray else ""))
+    if totals["leftovers"]:
+        errors.append("%d /$bunfs/ reference(s) survived the rewrite: %s. "
+                      "Widen TREE_REF to cover the new shape."
+                      % (len(totals["leftovers"]), "; ".join(totals["leftovers"][:20])))
+    written = totals["js"] + totals["text"] + totals["copied"]
+    if not errors and written != len(modules):
+        errors.append("wrote %d of %d modules" % (written, len(modules)))
+
+    src_dir = _bun_ant_source_dir()
+    for name in BUN_ANT_FILES:
+        if not os.path.isfile(os.path.join(src_dir, name)):
+            errors.append("the Bun.ant polyfill file %s is missing from %s - "
+                          "without it the TUI cannot render (docs/findings.md "
+                          "14)" % (name, src_dir))
+    if errors:
+        return totals, errors
+
+    stage = os.path.join(d, STAGE_NAME)
+    if os.path.isdir(stage):
+        shutil.rmtree(stage)
+    try:
+        for out, code in js_out.values():
+            blobs[out] = code.encode("utf-8")
+        for out, data in blobs.items():
+            dest = os.path.join(stage, *out.split("/"))
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "wb") as fh:
+                fh.write(data)
+        out_root = os.path.join(d, TREE_OUT)
+        if os.path.isdir(out_root):
+            shutil.rmtree(out_root)
+        os.rename(stage, out_root)
+    finally:
+        if os.path.isdir(stage):
+            shutil.rmtree(stage)
+
+    for name in BUN_ANT_FILES:
+        shutil.copyfile(os.path.join(src_dir, name), os.path.join(d, name))
+    with open(os.path.join(d, ENTRY_NAME), "w", encoding="utf-8") as fh:
+        fh.write(_entry_source(entry_out))
+    # Node decides .js module type from the nearest package.json; Bun does not
+    # need it. Scoped to this directory, and .cjs files stay CommonJS.
+    with open(os.path.join(d, "package.json"), "w", encoding="utf-8") as fh:
+        fh.write('{\n  "private": true,\n  "type": "module"\n}\n')
+    totals["entry"] = TREE_OUT + "/" + entry_out
+    return totals, errors
+
+
+def main_tree(d):
+    totals, errors = transform_tree(d)
+    if totals:
+        print("graph shape            : esm (code-split)")
+        print(f"modules                : {totals['modules']} "
+              f"({totals['js']} js rewritten, {totals['text']} text wrapped, "
+              f"{totals['copied']} copied)")
+        print(f"specifiers made relative: {totals['specifier']}")
+        print(f"paths made runtime-abs : {totals['expression']} "
+              f"(of which text-module requires: {totals['text_refs']})")
+        print(f"VFS prefix constants   : {totals['prefix_constants']} "
+              "(left alone: the Windows prefix, compared against, not a path)")
+        print(f"self-spawns given entry: {totals['self_spawns']}  "
+              "(--claude-in-chrome-mcp: process.execPath is bun here)")
+        print(f"realms given Bun.ant   : {len(totals['realm_entries'])}  "
+              f"({', '.join(totals['realm_entries']) or 'none'})")
+        print("image shim applied     : 0  (not applicable: this build has no "
+              "native image processor to gate; images go through Bun.Image)")
+        for path in sorted(totals["build_paths"]):
+            sys.stderr.write(f"note: build-machine path still present: {path}\n")
+        if totals["self_spawns"] == 0:
+            sys.stderr.write(
+                "warning: the Claude-in-Chrome MCP self-spawn shape was not "
+                "found, so it was not given the entry; if this release still "
+                "spawns process.execPath with --claude-in-chrome-mcp, that "
+                "server will run `bun --claude-in-chrome-mcp` and never start\n")
+    if re.search(r"[#?%]", os.path.abspath(d)):
+        # The hooks Worker's URL is built as new URL(`file://${path}`), so an
+        # install path containing these reads as a fragment, a query or an
+        # escape and the Worker is started from the wrong file.
+        sys.stderr.write(
+            "warning: %s contains '#', '?' or '%%'; Claude builds the hooks "
+            "worker's URL as file://<path> without encoding it, so function "
+            "hooks will not start from here. Move the artifact.\n"
+            % os.path.abspath(d))
+    if errors:
+        for e in errors:
+            sys.stderr.write(f"error: {e}\n")
+        sys.exit(1)
+    print(f"wrote: {os.path.join(d, ENTRY_NAME)}  (entry: Bun.ant polyfill, "
+          f"then {totals['entry']})")
+    print(f"wrote: {os.path.join(d, TREE_OUT)}/")
+
+
 def main():
     if len(sys.argv) != 2:
         die("usage: postprocess.py <extract-dir>")
     d = sys.argv[1]
+    if os.path.isfile(os.path.join(d, MANIFEST_NAME)):
+        main_tree(d)
+        return
     src = os.path.join(d, "cli.original.js")
     if not os.path.isfile(src):
         die(f"{src} not found - run extract_bun.py first")

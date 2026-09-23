@@ -724,12 +724,16 @@ A **missing-API error** — a `TypeError` naming a `Bun.*` property that does no
 exist — is the unambiguous signal. To tell them apart, rebuild in the
 pragma-preserving shape and try again: if that runs, the wrapper panic was ours.
 
-**The risk remains real going forward:** if a future Claude build uses Bun APIs
-newer than 1.3.14, its `cli.js` will not run on Zig, and the only newer Bun is
-the Rust rewrite. Nothing measured so far comes close. Mitigations: pin Claude
-to the last version that still runs on 1.3.14 (keep its `build/extract/`), or
-shim the newer APIs. If it ever happens, record the first version that breaks
-here.
+**The risk materialised with 2.1.280, in a softer form than feared** (§14).
+That build is compiled on Bun 1.4.3 - Anthropic's private fork of it - and
+calls `Bun.ant`, which no stock Bun has, so it does not run on 1.3.14 as
+extracted. It was recoverable because the missing surface is small enough to
+port and measure against the real thing: a JavaScript `Bun.ant`, validated
+against the native class through the binary's own `BUN_OPTIONS` preload. And
+the signal was not the `TypeError` this section predicted: `mcp list` printed
+nothing and died of `SIGKILL`, because the missing API was first reached in
+Claude's exit path. The general risk stands: a build that needs a Bun API too
+large or too native to port would force a pin to the last working version.
 
 ### Generalisation: newer Claude builds ✅
 
@@ -1333,6 +1337,154 @@ a fix. It affects zero of the 800,000 fuzzed cases and no plausible real uri
 policy. Recorded so the next person to sweep this rule does not spend the
 afternoon rediscovering it. The corpus deliberately pins the ST behavior and
 deliberately omits the BEL one, with a comment saying why.
+
+---
+
+## 14. 2.1.280: a code-split ESM build on a private Bun ✅
+
+Measured 2026-09-22 on `/usr/bin/claude` **2.1.280** (linux-x64, 233,709,640
+bytes, `.bun` section at offset 88,842,240, 144,806,548 bytes). The design of
+record is
+[the 2026-09-22 spec](superpowers/specs/2026-09-22-esm-split-build-design.md).
+
+**The graph changed shape.** 2,196 modules, entry id 5 (`/$bunfs/root/cli`,
+21,310 bytes). The module-format byte at record offset 50 is `1` (esm) for all
+1,975 JavaScript modules; the last cached legacy binary, linux-x64 2.1.231, has
+11 modules and an entry of format `2` (cjs). The other kinds: 84 `text`, 135
+`file`, 2 `napi` (`audio-capture.node`, `clipboard-napi.node` — there is no
+`image-processor.node` any more). Every JavaScript module also carries JSC
+bytecode (`// @bun @bytecode`), which stock Bun ignores outside a standalone.
+
+**The content-encoding byte (offset 48) is 0, 1 or 2**, and 2 is UTF-16LE:
+all 20 text modules that carry it decode cleanly as UTF-16LE (16 Markdown
+documents, two `.mjs` templates, two HTML fragments), and 16 of them are
+rejected outright as UTF-8. 1 marks ASCII-only content
+(1,975 JS, 64 text), 0 raw bytes.
+
+**How chunks reach each other**, counted over all 1,975 modules: 119,359
+`import"/$bunfs/root/…"`, 17,195 `from"…"`, 1,196 `import("…")`, 445
+`import.meta.require("…")`, 264 `HOOKS_WORKER_URL:"…"` values, 135 `file`-asset
+constants, and `Re("…")` 86 times — 84 text modules and the 2 addons — where
+`Re` is `import.meta.require` **of the shared helper chunk**, so a relative
+path passed to it would resolve against that chunk, not the caller.
+
+**A text module is a string.** Inside the native runtime, `require()` of a
+`text` module returns the raw string. Stock Bun 1.3.14 and 1.4.0 return
+`{default: …}`, and for a `.md` file the default is the Markdown **rendered to
+HTML**. `postprocess.py` therefore writes each as `module.exports = "…"`;
+after the rewrite all 84 compare equal to native by sha256 and length.
+
+**`Bun.ant`.** The native runtime exposes 18 members; the bundle calls five:
+`CellSegmenter` (Ink's cell writer, 3 sites, unguarded), `getPeerPid` and
+`getPeerUid` (daemon socket checks, guarded), `setDumpable` (guarded) and
+`memoryPressureLevel` (macOS only, guarded). Without `CellSegmenter`, `mcp
+list` prints nothing and dies of `SIGKILL`: Ink's unmount throws inside
+`process.exit()`, and Claude's `forceExit()` answers a throwing
+`process.exit()` with `process.kill(process.pid, "SIGKILL")`. Every other
+`Bun.*` API the bundle names exists in stock 1.3.14.
+
+**The oracle.** The native binary honours `BUN_OPTIONS=--preload <file>`: the
+preloaded file runs inside Anthropic's runtime, with the real `Bun.ant`, and
+can `process.exit()` before Claude's own main starts. On Linux, measured
+there: `getPeerPid`/`getPeerUid` answer the peer's pid/uid on a connected unix
+socket and `null` for an fd that is not one; `setDumpable(x)` answers `true`;
+`memoryPressureLevel()` throws `Bun.ant.memoryPressureLevel() is only supported
+on macOS`.
+
+**`Bun.isStandaloneExecutable`** is still asked — through one gate function in
+a shared chunk, from 19 call sites — and still undefined outside a standalone.
+Image resizing no longer depends on it: the Read tool calls `new Bun.Image(…)`
+directly.
+
+**The runtime inside the binary is Bun 1.4.3.** Asked from a preloaded probe:
+`Bun.version` 1.4.3, revision `f08e57be…`, WebKit `000c4899…`, ICU 78.3,
+Unicode 17.0 — a post-Zig Bun, where stock 1.3.14 is WebKit `5488984d…`. So
+Claude Code itself now ships on the Rust-era runtime, and this project runs it
+on the Zig one. The embedded JSC bytecode is tied to that WebKit build and is
+unusable by 1.3.14, which is why startup is slower (medians of five,
+interleaved, same host): `--version` 0.02 s native against 0.06 s, `--help`
+0.16 s against 1.22 s, `doctor` 0.37 s against 1.77 s.
+
+**`CellSegmenter`, measured through the oracle.** The contract Claude relies on
+(`scripts/bun-ant-cell-segmenter.mjs` is the port):
+
+- `segment(text, cells, runs, reordered)` returns the number of cells written,
+  or minus the capacity it needs. Each cell is a pair: a grapheme id and a word
+  holding the width (bits 0–7), a tab flag (bit 8), a substituted flag (bit 9)
+  and the run index (bits 10 and up). Each run is a pair of an `sgrKeys` index
+  and a `uris` index. `graphemes` is pre-seeded with 98 entries — `" "`, `""`,
+  the printable ASCII, `"\t"` and `"�"` — and grows as clusters are first
+  seen. A code point in the `substitute` ranges (Claude passes U+061C,
+  U+202A–202E and U+2066–2069, the bidi controls) becomes U+FFFD with bit 9 set.
+- `reordered` is **UAX #9 visual reordering**, and it matches ICU 78.3's
+  `ubidi` — the ICU the runtime ships — case for case.
+- `paint(...)` writes into Claude's screen buffer, handling wide chars, their
+  spacer cells, clipping, and orphaned halves of a wide char it overwrites.
+  `setCell(...)` does the same for a single cell. Both return the damaged
+  column span packed as `start·2²⁰ + end·2³⁶`, with the new column in the low
+  20 bits.
+- The table arrays are the **same objects** across calls: Claude caches
+  `native.graphemes` once and reads it later.
+
+Grapheme clusters follow a uucode-style state machine that differs from
+`Intl.Segmenter` in both Bun 1.3.14 and Node, so the port carries its own.
+Widths come from a per-code-point scan of the native class over all of
+0–0x10FFFF.
+
+The port was fuzzed against the native class to equality. After that, 32,696
+generated cases in two index windows nobody had tuned against gave 0
+mismatches. `make harness`'s own default window still found one case that
+differed (`paint()` at a negative x over a pre-filled row) in the port's
+revision of that hour; the next revision matched it. The final revision: 0
+mismatches over the characterisation's 51,636 corpus cases, 610,000 random
+cases, 1.2 million texts and full code-point and code-unit scans. On typical
+Claude lines `segment()` + `paint()` run at 1.12× native under Bun 1.3.14
+(1.66× under Node 24). The golden record the suite replays is 4,204 cases
+(every hand-built one, 300 generated), stored with their native answers'
+hashes.
+
+**Two self-spawns, and why they needed help.** Claude's Claude-in-Chrome MCP
+config is `{command: process.execPath, args: ["--claude-in-chrome-mcp"]}`,
+with no non-standalone branch in 2.1.280. Natively `process.execPath` is
+claude; here it is bun, and `bun --claude-in-chrome-mcp` prints Bun's help and
+exits 0 (measured), so the server never starts. `postprocess.py` adds the entry
+(`process.argv[1]`) to those args, as every other self-spawn in the build does
+outside a standalone. The harness calls Claude's own config function on both
+sides and spawns what it returns; with the rewrite undone, that check fails.
+The hooks Worker is a realm of its own, and the native Worker has `Bun.ant`, so
+the one JavaScript module reached by path rather than import gets the polyfill
+as its first import.
+
+**Checked by a parser, not only by regexes.** `postprocess.py` classifies each
+reference from the text around it. `scripts/verify-tree.js` checks the result
+with Bun's own parser: every rewritten module must parse, and must keep exactly
+the import records the original had - same count, kinds, order and targets.
+On 2.1.280 that is 140,332 records over 1,975 modules, in about 5 s. `build.sh`
+runs it before a build is swapped in.
+
+**A latent gap: built-in plugin hooks.** Outside a standalone, a built-in
+plugin registers its hooks module as `{module, folder: import.meta.dir}`
+rather than a pre-scanned bundle. The loader then resolves
+`join(folder, "hooks/register.ts")` — a TypeScript source path from
+Anthropic's development tree that no extracted build contains. It is reached
+only when a built-in plugin with its own hooks module is seated. In every
+configuration the harness can create, including `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`,
+both sides seat the same plugins and send byte-identical requests, so the
+branch is recorded here rather than rewritten blind.
+
+**Node ≥ 24 does not run a code-split build**, measured with Node 24.21.0.
+There are three walls, in the order a run meets them:
+
+1. Node gives ES modules no `import.meta.require`, which the bundle calls at
+   445 sites.
+2. Node's ESM resolver ignores `NODE_PATH`, which is how `ws` and `undici`
+   arrive.
+3. `ERR_REQUIRE_CYCLE_MODULE`: Node refuses `require()` of an ES module inside
+   an import cycle that is still evaluating, and Bun allows it.
+
+A preload hook (`module.registerHooks`) clears the first two. The third means
+changing module evaluation order. Separately, the shim would also need
+`Bun.sliceAnsi` (Ink's clipping path) and `Bun.Image` (Read of images).
 
 ---
 

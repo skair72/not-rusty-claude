@@ -3,7 +3,9 @@
 Run Claude Code on a **pre-Rust (Zig-era) Bun** — the runtime before Bun's
 Zig→Rust rewrite — by extracting its JavaScript out of the native binary and
 running it under a stock **Bun 1.3.14**. The signed binary is only ever *read*:
-never modified, never executed by this pipeline.
+never modified, never executed by this pipeline. (`make harness` does run it -
+that is what an artifact-vs-native comparison is - in a throwaway `HOME` with a
+loopback mock as its API.)
 
 > **Why.** Claude Code ships as a Bun *standalone* executable — runtime and app
 > baked into one signed binary (Mach-O on macOS, ELF on Linux, PE on Windows).
@@ -17,6 +19,43 @@ never modified, never executed by this pipeline.
 > also runs on Bun 1.4.0. Running on Zig is the **point**, not a constraint.
 
 ## Status — what works, and exactly how far that goes
+
+### Claude Code 2.1.280: a new shape, verified against the native binary ✅
+
+From **2.1.280** Claude Code is no longer one CommonJS file. It is a
+**code-split ES-module graph** of 2,196 modules, built on Anthropic's *private*
+Bun 1.4.3 (`@anthropic-ai/bun-internal`). That Bun adds a `Bun.ant` namespace
+which stock Bun does not have, and Ink cannot draw a single cell without
+`Bun.ant.CellSegmenter`. The pipeline now handles both shapes. It tells them
+apart by the entry module's own format byte, rewires every
+`/$bunfs/root/` reference by context, and puts an entry of its own in front
+that installs a `Bun.ant` polyfill. The details are in
+[`docs/findings.md`](docs/findings.md) §14.
+
+**How it is verified: `make harness`.** `scripts/harness.py` builds the
+artifact, then runs the same scenario through the native binary and the
+artifact, and compares what each one did. Measured on this host on 2026-09-22
+against `/usr/bin/claude` 2.1.280, under stock Bun 1.3.14:
+
+| check | artifact vs native |
+|---|---|
+| build, structure, parse | 138,195 specifiers made relative and 485 paths made runtime-absolute; Bun's own parser accepts all 2,062 modules, and each keeps exactly the import records it had (140,332) |
+| text modules | all 84 `require()` to the native string (sha256 + length) |
+| `--version`, `--help`, `mcp list`, `mcp add` → `get` → `remove` → `list`, `plugin list`, `auth status` | exit code, stdout **and** stderr equal, at every step |
+| `doctor` | equal bar the install-identity and search lines, which are the [equivalence gap](docs/findings.md) |
+| the Claude-in-Chrome MCP server, and Claude's own config for it spawned as Claude spawns it | an MCP `initialize` answered identically |
+| 8 mock-API agentic turns: text, Bash, Read, Read of a 3000×3000 PNG, Grep, Write, Glob, function hooks | tool results equal, and the full request bodies equal once per-run paths, session ids and the random device id are normalised |
+| TUI under a pty: onboarding, a REPL turn, a REPL turn full of CJK, emoji, bidi text, a table and a code block | screens identical cell for cell, **styles and hyperlinks included** — bar the randomly chosen spinner verb and the clock, and onboarding compared below its randomly sparkling logo; same requests; the REPL exits 0 with the terminal restored |
+| `Bun.ant`, probed inside the native runtime with a real peer process | 27 answers identical |
+| `CellSegmenter`, fuzzed against the native class | 0 mismatches (3,000 cases per harness run; 610,000 in development) |
+
+**What it is not.** The same gaps apply as before: the sandbox is off, ripgrep
+is the system `rg` and install identity reads `unknown`. On top of that,
+startup is **3–8× slower** than native (`--help` takes 1.2 s against 0.16 s),
+because the native runtime runs JSC bytecode that a different WebKit build
+cannot load. A code-split build does **not** run under Node yet
+([§ Under Node](#under-node-instead-of-bun)). The table below is the record for
+the legacy (single-file) builds up to 2.1.241.
 
 Verified on Linux x86_64 (Debian 12, glibc 2.36); commands and output in
 [`docs/verification-2026-08-22.md`](docs/verification-2026-08-22.md) and
@@ -100,8 +139,13 @@ BUN_BIN="$HOME/.bun-1.3.14/bun" scripts/build.sh /usr/bin/claude
 #    install a different, npm-based Claude Code onto your machine. See
 #    docs/runbook.md § Surviving Claude updates.
 DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \
-  "$HOME/.bun-1.3.14/bun" build/extract/cli.original.cjs mcp list
+  "$HOME/.bun-1.3.14/bun" build/extract/cli.js mcp list
 #   → No MCP servers configured. Use `claude mcp add` to add a server.
+#   cli.js is the entry for both shapes: the code-split build's own entry
+#   (2.1.280+), or the sibling that requires cli.original.cjs (legacy builds).
+
+# 4. optional: judge the artifact against the native binary, check by check
+make harness
 ```
 
 **Three safety properties, all deliberate.** `build.sh` **installs nothing on
@@ -114,9 +158,11 @@ Claude's own code resolves a sibling `cli.js` for two MCP self-spawns.)
 **No native `claude` on this machine?** Download one — no install, no npm, no
 Mac needed. The manifest lists **eight** platforms, `linux-x64` and `linux-arm64`
 among them plus `-musl` variants; the runnable fetch → verify →
-delete-on-mismatch flow is [`docs/findings.md`](docs/findings.md) §8. Nothing
-here has *extracted* a downloaded Linux copy: the Linux figures come from the
-pre-installed `/usr/bin/claude` 2.1.222.
+delete-on-mismatch flow is [`docs/findings.md`](docs/findings.md) §8. The
+legacy Linux figures came from the pre-installed `/usr/bin/claude` 2.1.222;
+since that became 2.1.280, the legacy-shape tests run on a downloaded 2.1.231
+(`~/.cache/not-rusty-claude/claude-linux-x64.bin`), extracted here like any
+other.
 
 One consequence to know about: under a native install `process.execPath` *is*
 `claude`; here it is **bun**, and the CLI unconditionally exports
@@ -128,7 +174,17 @@ section below first.
 
 ### Under Node instead of Bun
 
-Yes — **Node ≥ 24 only**: the bundle's `using` declarations (ES explicit
+**A code-split build (2.1.280+) does not run under Node yet**, and `make
+node-run` refuses one and says why. There are three walls, measured with Node
+24.21.0. Node has no `import.meta.require`, which the bundle calls at 445
+sites. Node's ES-module resolver ignores `NODE_PATH`, which is how `ws` and
+`undici` are supplied. The third is structural: Node refuses to `require()` an
+ES module inside an import cycle that is still evaluating
+(`ERR_REQUIRE_CYCLE_MODULE`), and Bun allows it. A preload hook gets past the
+first two; the third would mean changing module evaluation order. What follows
+is the record for legacy builds.
+
+Legacy builds: yes — **Node ≥ 24 only**: the bundle's `using` declarations (ES explicit
 resource management) are a parse error before that — `node --check` fails on
 22.23.2 and 23.11.1, passes on 24.0.0 and 26.7.0. Node also has no `ws`, no
 `undici` and no `Bun` global; the targets below and `scripts/bun-shim.cjs`
@@ -324,9 +380,14 @@ not-rusty-claude/
 ├── tools/
 │   ├── extract_bun.py              extract cli.js + assets from the Bun section
 │   └── postprocess.py              make cli.js runnable under an external Bun,
-│                                   plus the scoped image shim (findings §10)
+│                                   plus the scoped image shim (findings §10);
+│                                   rewires a code-split tree (findings §14)
 ├── scripts/
 │   ├── build.sh                    extract → post-process → print the run command
+│   ├── harness.py                  artifact-vs-native verification (make harness)
+│   ├── vtscreen.py                 a small terminal emulator the harness reads TUIs with
+│   ├── bun-ant.mjs                 Bun.ant polyfill for the code-split (2.1.280+) builds
+│   ├── bun-ant-cell-segmenter.mjs  …its CellSegmenter, fuzzed against the native class
 │   ├── bun-shim.cjs                globalThis.Bun stand-in, so Node ≥ 24 can run it
 │   ├── trim-config.py              bisect a global config that breaks startup
 │   ├── node-trace.cjs              diagnostic preload: what blocked, and where
@@ -347,35 +408,39 @@ run's, reconciled below rather than written out twice — the repo's convention
 being that **a measured figure is stated in one place, and appears elsewhere
 only as quoted command output labelled with the binary and date that produced
 it.** These counts *move*, in both directions, as test files are added and removed —
-which is exactly why. Every row was re-measured here on 2026-08-27
+which is exactly why. Every row was re-measured here on 2026-09-23
 by forcing it with the variables named beside it; `--collect-only` reports the
-same total, **304**, in all six configurations, because what the host has
-changes the skips, never the collection.
+same total, **374**, in all six configurations, because what the host has
+changes the skips, never the collection. "Binaries" are three now: a legacy
+(single-file) ELF, a code-split ELF (2.1.280+) and the Mach-O. The first row
+had all three - the cached 2.1.231 download, `/usr/bin/claude` 2.1.280 and
+`darwin-arm64` 2.1.239 - plus a legacy artifact built by `make build` for the
+Node tests.
 
 | host has | result | how the row was forced |
 | --- | --- | --- |
-| both binaries, Bun, Node 24 | **304 passed** | `NRC_TEST_NODE=…/v24.19.0/bin/node` (this host's own `node` is 22.23.2) |
-| …no Mach-O | 299 passed, 5 skipped | `NRC_TEST_MACHO=/nonexistent/macho` |
-| …no ELF | 299 passed, 5 skipped | `NRC_TEST_ELF=/nonexistent/elf` |
-| …neither binary | 294 passed, 10 skipped | both of those two variables at once |
-| …and no Bun | 220 passed, 84 skipped | …plus `BUN_BIN=/nonexistent/bun` and a `HOME` with no Bun under it |
-| none of them, Node 22 | 191 passed, 113 skipped | …and drop `NRC_TEST_NODE` — the command below |
+| all three binaries, Bun, Node 24 | **374 passed** | `NRC_TEST_NODE=…/node-v24.21.0-linux-x64/bin/node` (this host's own `node` is 22.23.2) |
+| …no Mach-O | 369 passed, 5 skipped | `NRC_TEST_MACHO=/nonexistent/macho` |
+| …no ELF | 367 passed, 7 skipped | `NRC_TEST_ELF=/nonexistent/elf NRC_TEST_ESM=/nonexistent/esm` |
+| …no binary at all | 362 passed, 12 skipped | all three of those variables at once |
+| …and no Bun | 254 passed, 120 skipped | …plus `BUN_BIN=/nonexistent/bun` and a `HOME` with no Bun under it |
+| none of them, Node 22 | 225 passed, 149 skipped | …and drop `NRC_TEST_NODE` — the command below |
 
-Every row adds up to 304, and the skips decompose — counted from each run's own
+Every row adds up to 374, and the skips decompose — counted from each run's own
 `-rs` skip reasons, not inferred from the totals. **5** tests need the Mach-O
-binary and **5** the ELF one, and the two sets are disjoint, which is why the
-fourth row skips exactly 10. Removing Bun while Node 24 is still present skips a
-further **68**, and moving `HOME` takes `ws`+`undici` with it for another **6**:
-10 + 68 + 6 = 84. Dropping to Node 22 changes which check fires first, so the
-last row is not the previous one plus a constant. **63** tests skip for Node
-≥ 24, of which **28** also want Bun and **6** also want `ws`+`undici`, leaving
-**29** that want only the newer Node; the other **40** Bun-wanting tests still
-skip for Bun. 10 + 63 + 40 = 113.
+binary, **5** a legacy ELF and **2** a code-split ELF, and the three sets are
+disjoint, which is why the fourth row skips exactly 12. Removing Bun while Node
+24 is still present skips a further **102**, and moving `HOME` takes
+`ws`+`undici` with it for another **6**: 12 + 102 + 6 = 120. Dropping to Node 22
+changes which check fires first, so the last row is not the previous one plus
+a constant. **63** tests skip for Node ≥ 24, of which **28** also want Bun and
+**6** also want `ws`+`undici`, leaving **29** that want only the newer Node; the
+other **74** Bun-wanting tests still skip for Bun. 12 + 63 + 74 = 149.
 
 **The Apple Silicon run is not reconcilable to this table, and should not be.**
 It reported **257 passed, 6 skipped, 0 failed, 263 collected** — a true
 measurement of the tree as it stood on 2026-08-24, whose test set is not
-today's. No arithmetic connects 263 to 304 and none is offered. What the Mac run
+today's. No arithmetic connects 263 to 374 and none is offered. What the Mac run
 established is in [§ macOS](#macos); its totals belong to the tree it ran on.
 
 The last two rows need care twice over. `BUN_BIN` is a *first* choice, not an
@@ -387,7 +452,8 @@ with it (here it is a `--user` install), so put it back explicitly:
 ```bash
 # the "none of them" row, as run. $(...) is evaluated before HOME is replaced.
 PYTHONPATH="$(python3 -m site --user-site)" \
-NRC_TEST_ELF=/nonexistent/elf NRC_TEST_MACHO=/nonexistent/macho \
+NRC_TEST_ELF=/nonexistent/elf NRC_TEST_ESM=/nonexistent/esm \
+NRC_TEST_MACHO=/nonexistent/macho \
 BUN_BIN=/nonexistent/bun HOME="$(mktemp -d)" \
   python3 -m pytest tests/ -q
 ```
@@ -395,7 +461,10 @@ BUN_BIN=/nonexistent/bun HOME="$(mktemp -d)" \
 (Where pytest is installed system-wide, `--user-site` names a directory that
 need not exist and the `PYTHONPATH` is a harmless no-op.)
 
-Point the tests at binaries with `NRC_TEST_ELF` (default `/usr/bin/claude`) and
+Point the tests at binaries with `NRC_TEST_ELF` (a **legacy**-shape ELF; by
+default the first of `/usr/bin/claude` and the cached
+`~/.cache/not-rusty-claude/claude-linux-x64.bin` whose entry module is CommonJS),
+`NRC_TEST_ESM` (a **code-split** ELF, 2.1.280+; default `/usr/bin/claude`) and
 `NRC_TEST_MACHO` (default `/tmp/ccmac/package/claude-darwin-arm64.bin`; the older
 `/tmp/ccmac/package/claude` is still accepted), and at a Bun with `BUN_BIN`
 (default `~/.bun-1.3.14/bun`, then `bun` on `PATH`). The integration tests'
