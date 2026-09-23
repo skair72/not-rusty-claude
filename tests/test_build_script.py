@@ -351,3 +351,69 @@ def test_any_non_empty_opt_out_value_is_an_opt_out_here_too(tmp_path):
     assert "NRC_NO_IMAGE_SHIM is set" in result.stderr, (
         "the opt-out was honoured but announced as a failure to find the gate")
     assert _gap_list(result) == "image processing, sandbox, ripgrep"
+
+
+# A code-split graph (docs/findings.md 14) at its smallest: an ESM entry that
+# imports one chunk, which prints a marker.
+def _esm_binary(path):
+    mods = [("/$bunfs/root/chunk-a.js", b'console.log("ESM-BUILD-RUNS");\n', 1,
+             fixtures.FORMAT_ESM, fixtures.ENC_LATIN1),
+            ("/$bunfs/root/cli", b'// @bun @bytecode\nimport"/$bunfs/root/chunk-a.js";\n', 1,
+             fixtures.FORMAT_ESM, fixtures.ENC_LATIN1)]
+    path.write_bytes(fixtures.build_elf(fixtures.build_payload(mods, entry=1)))
+    return path
+
+
+VERIFY_TREE = ROOT / "scripts" / "verify-tree.js"
+
+
+def _verify_tree(bun_bin, extract_dir):
+    return subprocess.run([bun_bin, str(VERIFY_TREE), str(extract_dir)],
+                          capture_output=True, text=True, timeout=60)
+
+
+def test_an_esm_build_drops_original_once_the_parser_check_has_passed(bun_bin, tmp_path):
+    """original/ is as big as root/ (47 MB on 2.1.280) and nothing reads it at
+    runtime, so build.sh deletes it after verify-tree.js has passed. What is
+    left still runs, and a later verify-tree.js says why it cannot check."""
+    out = tmp_path / "out"
+
+    result = _build(out, _esm_binary(tmp_path / "native"), env={"BUN_BIN": bun_bin})
+
+    assert result.returncode == 0, result.stderr
+    assert "verifying the rewired tree" in result.stdout
+    art = out / "extract"
+    assert not (art / "original").exists()
+    # kept: the Makefile tells the two artifact shapes apart by it
+    assert (art / "manifest.json").is_file()
+    ran = subprocess.run([bun_bin, str(art / "cli.js")], capture_output=True, text=True,
+                         timeout=60, env={"PATH": "/usr/bin:/bin"})
+    assert ran.stdout.strip() == "ESM-BUILD-RUNS", ran.stderr
+    again = _verify_tree(bun_bin, art)
+    assert again.returncode == 2, again.stdout + again.stderr
+    assert "NRC_KEEP_ORIGINAL=1" in again.stderr
+
+
+def test_nrc_keep_original_keeps_it_so_the_check_can_run_again(bun_bin, tmp_path):
+    out = tmp_path / "out"
+
+    result = _build(out, _esm_binary(tmp_path / "native"),
+                    env={"BUN_BIN": bun_bin, "NRC_KEEP_ORIGINAL": "1"})
+
+    assert result.returncode == 0, result.stderr
+    assert (out / "extract" / "original" / "cli").is_file()
+    again = _verify_tree(bun_bin, out / "extract")
+    assert again.returncode == 0, again.stdout + again.stderr
+
+
+def test_without_bun_original_is_kept_for_the_check_that_did_not_run(tmp_path):
+    """A first build on a machine with no bun yet (a Mac, 2026-09-23): the
+    parser check is skipped, so original/ is the only way to run it later, and
+    the build says how."""
+    out = tmp_path / "out"
+
+    result = _build(out, _esm_binary(tmp_path / "native"))
+
+    assert result.returncode == 0, result.stderr
+    assert (out / "extract" / "original" / "cli").is_file()
+    assert "scripts/verify-tree.js %s" % (out / "extract") in result.stderr

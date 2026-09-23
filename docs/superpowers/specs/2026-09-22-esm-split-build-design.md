@@ -59,6 +59,9 @@ between `original/` and the manifest, two modules bound for one output file.
 **Changed after review:**
 - `root/` is built in a staging directory, so a failed re-run leaves the
   previous artifact whole.
+- `original/` is deleted once the parser check below has passed: nothing reads
+  it at runtime and it is as big as `root/` (47 MB). `NRC_KEEP_ORIGINAL=1`
+  keeps it, and so does a build that had no bun to run the check.
 - The regex-driven rewrite is checked by a parser: `scripts/verify-tree.js`
   makes Bun accept every module and keep exactly the import records it had.
   `build.sh` runs it before swapping a build in.

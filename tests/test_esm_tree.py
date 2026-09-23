@@ -12,6 +12,7 @@ read with fs, and a module in a subdirectory.
 
 import json
 import os
+import shutil
 import subprocess
 
 import pytest
@@ -313,6 +314,17 @@ def test_a_file_further_up_the_path_is_refused_not_a_traceback(extract_bun, tmp_
     with pytest.raises(SystemExit):
         extract_bun.extract(str(binary), str(tmp_path / "x"))
     assert "needs" in capsys.readouterr().err
+
+
+def test_post_processing_without_original_says_why_once(extract_bun, postprocess, tmp_path):
+    """build.sh deletes original/ after its parser check; a re-run of
+    postprocess.py over that build gets one line saying so, not one
+    "cannot be read" per module."""
+    out = extracted(extract_bun, tmp_path)
+    shutil.rmtree(out / "original")
+    totals, errors = run_post(postprocess, out)
+    assert len(errors) == 1, errors
+    assert "NRC_KEEP_ORIGINAL=1" in errors[0]
 
 
 def test_a_failed_rerun_leaves_the_previous_artifact_whole(extract_bun, postprocess, tmp_path):

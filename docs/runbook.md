@@ -139,6 +139,8 @@ BUN_BIN="$HOME/.bun-1.3.14/bun" scripts/build.sh "$NATIVE"
 #   OUT_DIR=/somewhere      to put artifacts elsewhere (default: ./build)
 #   NRC_NO_IMAGE_SHIM=1     build the "as shipped" artifact, without the scoped
 #                           image shim. ANY non-empty value opts out.
+#   NRC_KEEP_ORIGINAL=1     code-split builds: keep original/ after the parser
+#                           check instead of deleting it (section 3)
 ```
 
 `build.sh` extracts, post-processes, and then **stops**. It installs nothing — no
@@ -219,7 +221,13 @@ image shim applied     : 0  (not applicable: this build has no native image proc
 | `build/extract/cli.js` | **the entry** — ours: installs the `Bun.ant` polyfill, then imports Claude's own entry |
 | `build/extract/root/` | the rewired module tree, 2,196 files |
 | `build/extract/bun-ant.mjs`, `bun-ant-cell-segmenter.mjs` | the polyfill (`scripts/`), copied beside the entry |
-| `build/extract/original/`, `manifest.json` | the verbatim extraction, kept so a re-run of `postprocess.py` is reproducible |
+| `build/extract/manifest.json` | what was extracted: each module's path, loader, encoding, size and sha256. The Makefile tells the two artifact shapes apart by it |
+| `build/extract/original/` | the verbatim extraction, `postprocess.py`'s input and the parser check's reference. **Deleted once that check passes** (47 MB on 2.1.280). Kept with `NRC_KEEP_ORIGINAL=1`, or when there was no bun to run the check |
+
+**To move the artifact**, move `cli.js`, `bun-ant.mjs`,
+`bun-ant-cell-segmenter.mjs`, `package.json` and `root/` together, keeping
+their layout (or the whole `build/extract/`). Every path inside is relative, so
+any directory works; `cli.js` alone does not, as it imports its siblings.
 
 **Always run `cli.js`, never `root/cli.js`.** Claude's own entry module does
 not install `Bun.ant`, and without `Bun.ant.CellSegmenter` Ink cannot render —
@@ -239,10 +247,13 @@ requires `cli.original.cjs`), so `build/extract/cli.js` works in both shapes.
 For a code-split build there are 2,062 modules to check, not one file, and
 `build.sh` has already done it: `scripts/verify-tree.js` makes Bun's own parser
 accept every module and confirms each kept exactly its original import records.
-To re-run it, or the harness's structure check as well, point them at the
-artifact:
+It compares against `original/`, which a default build deletes once the check
+has passed, so to re-run it - after editing `root/` by hand, say - build with
+`NRC_KEEP_ORIGINAL=1` **before** editing (a rebuild replaces `root/`). Then
+point it, or the harness's structure check as well, at the artifact:
 
 ```bash
+NRC_KEEP_ORIGINAL=1 BUN_BIN="$HOME/.bun-1.3.14/bun" scripts/build.sh "$NATIVE"
 "$BUN_BIN" scripts/verify-tree.js build/extract
 scripts/harness.py --only structure,parse --artifact build/extract/cli.js
 ```

@@ -213,7 +213,7 @@ help:
 	  '' \
 	  'Also honoured from the environment: NRC_TEST_ELF, NRC_TEST_MACHO,' \
 	  'NRC_TEST_NODE, NRC_TEST_NODE_MODULES, NRC_TEST_ARTIFACT, BUN_BIN,' \
-	  'OUT_DIR, NRC_NO_IMAGE_SHIM.'
+	  'OUT_DIR, NRC_NO_IMAGE_SHIM, NRC_KEEP_ORIGINAL.'
 
 doctor:
 	@set -eu; \

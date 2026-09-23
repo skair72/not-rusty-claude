@@ -327,7 +327,8 @@ def check_build(ctx):
     if ctx.artifact:
         return [Result("build", "SKIP", "--artifact given: %s" % ctx.artifact)]
     out_dir = os.path.join(ctx.out, "build")
-    env = dict(os.environ, BUN_BIN=ctx.bun, OUT_DIR=out_dir)
+    # the parse group re-runs verify-tree.js, which reads original/
+    env = dict(os.environ, BUN_BIN=ctx.bun, OUT_DIR=out_dir, NRC_KEEP_ORIGINAL="1")
     r = run([os.path.join(HERE, "build.sh"), ctx.native], env, timeout=900)
     log = r["stdout"] + r["stderr"]
     with open(os.path.join(ctx.out, "build.log"), "w") as fh:
@@ -427,6 +428,10 @@ def check_parse(ctx):
         return [Result("parse", "PASS" if r["rc"] == 0 else "FAIL",
                        "legacy artifact: bun build --no-bundle rc=%s" % r["rc"],
                        {"stderr": r["stderr"][-1500:]})]
+    tree = os.path.join(ctx.extract_dir, _manifest(ctx).get("tree", "original"))
+    if not os.path.isdir(tree):
+        return [Result("parse", "FAIL", "%s is gone: build.sh removed it after its own check; "
+                       "rebuild with NRC_KEEP_ORIGINAL=1 to check this artifact" % tree)]
     r = run([ctx.bun, os.path.join(HERE, "verify-tree.js"), ctx.extract_dir],
             {"PATH": "/usr/bin:/bin"}, timeout=600)
     try:

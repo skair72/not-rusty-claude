@@ -734,6 +734,11 @@ def transform_tree(d):
     modules = manifest["modules"]
     by_path = {m["path"]: m for m in modules}
     src_root = os.path.join(d, manifest.get("tree", TREE_SRC))
+    if not os.path.isdir(src_root):
+        # one line, not one "cannot be read" per module
+        return {}, ["%s is gone: build.sh removes the verbatim extraction once the "
+                    "parser check has passed. Rebuild instead (NRC_KEEP_ORIGINAL=1 "
+                    "keeps it)." % src_root]
     totals = {"modules": len(modules), "js": 0, "text": 0, "copied": 0,
               "specifier": 0, "expression": 0, "text_refs": 0,
               "prefix_constants": 0, "self_spawns": 0, "realm_entries": [],
