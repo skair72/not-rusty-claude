@@ -220,6 +220,10 @@ SHIM_N="$(sed -n 's/^image shim applied *: *\([0-9][0-9]*\).*/\1/p' "$POST_LOG")
 # that line for an artifact whose anchor was still present exactly once
 # (reproduced on this host 2026-08-24).
 SHIM_WHY="$(sed -n 's/^image shim not applied *: *//p' "$POST_LOG")"
+# The embedded-search gate (docs/findings.md 10): 1 when postprocess.py turned
+# it off, which trades native's default - grep/find shadowed by its embedded
+# ugrep/bfs, which bun does not have - for native's --allowedTools=Grep setup.
+SEARCH_N="$(sed -n 's/^embedded search off *: *\([0-9][0-9]*\).*/\1/p' "$POST_LOG")"
 rm -f "$POST_LOG"
 # ...and remember it, because the closing summary's list of gaps is only true
 # for one of the two builds. Printing the unshimmed list after a shimmed build
@@ -251,6 +255,13 @@ else
   warn "  if(<gate>())try{ branch shape, and they are re-measured differently -"
   warn "  the line above says which one this build hit. See docs/runbook.md's"
   warn "  troubleshooting table."
+fi
+# A difference from the native DEFAULT, so it is one of this build's gaps.
+if [ "${SEARCH_N:-}" = "1" ]; then
+  GAPS="${GAPS/ripgrep/ripgrep, search tools}"
+  info "embedded search OFF: bun has no embedded ugrep/bfs, so Bash grep/find are"
+  info "  the system's and the Glob/Grep tools are offered - native's own"
+  info "  --allowedTools=Grep setup. Both tools need rg on PATH."
 fi
 
 # 4b. Swap the staged build in. Everything above this line is reversible; if any

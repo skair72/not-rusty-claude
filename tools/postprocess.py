@@ -35,8 +35,17 @@ What it does (see docs/findings.md §6):
      shipped" half of that A/B can be regenerated from the same tree. (Any
      non-empty value, matching scripts/build.sh's `[ -n ... ]`; the two must
      agree or a shim FAILURE gets announced as a deliberate opt-out.)
+  7. Rewrite the embedded-search gate's inlined EMBEDDED_SEARCH_TOOLS
+     constant to `false`, in its declaration only. Native shadows `find` and
+     `grep` with its own embedded bfs/ugrep by re-execing process.execPath,
+     which is bun here, so every Bash grep printed Bun's help. With the gate
+     false the artifact runs what native runs under its own
+     `--allowedTools=Grep` opt-in: Glob and Grep offered, Bash grep/find the
+     system's. docs/findings.md §10 and
+     docs/superpowers/specs/2026-09-23-embedded-search-gate-design.md. Applied
+     in both NRC_NO_IMAGE_SHIM modes, and to a code-split tree as well.
 
-check() then validates the transformed code is actually sound. It has SIX
+check() then validates the transformed code is actually sound. It has SEVEN
 fatal conditions:
   a. the output starts with `(function`;
   b. a trailing IIFE invocation was appended;
@@ -58,6 +67,11 @@ fatal conditions:
      cannot catch is a rewrite aimed at the WRONG site: it counts how many
      moved, never which, and one wrong site scores exactly like the right one.
      That is why the site is picked by shape (step 6) and not by distance.
+  g. the embedded-search gate was rewritten exactly once, or the build
+     provably has neither the gate nor the find/grep shadowing. A drifted
+     declaration or generator, two of either, or a generator guarded by some
+     other function while shadowing code is present all refuse: unlike the
+     image shim's refusals, shipping one is shipping the bug (step 7).
 If any of them fails, main() prints the errors to stderr and exits non-zero
 WITHOUT writing cli.original.cjs — a silently-broken output file reaching Bun
 surfaces only as the confusing panic "Expected CommonJS module to have a
@@ -354,6 +368,161 @@ def _apply_image_shim(code):
     return code, name, before, _count_gate_calls(code, name), 1, None
 
 
+# --- the embedded-search gate ------------------------------------------------
+#
+# The native binary embeds bfs and ugrep and picks them by argv[0], so Claude's
+# shell snapshot shadows `find` and `grep` with functions that run
+#   (exec -a ugrep "$CLAUDE_CODE_EXECPATH" -G --ignore-files --hidden -I ...)
+# and CLAUDE_CODE_EXECPATH is process.execPath - here, bun. Every Bash-tool
+# grep printed Bun's help text, and exit 1 is how grep says "no matches", so
+# Claude reported it as success. Measured 2026-09-23 on 2.1.280 and 2.1.231
+# (docs/findings.md §10). Unlike embedded ripgrep, which asks
+# Bun.isStandaloneExecutable at runtime and so falls back to the system rg
+# here, this gate's first clause is the build-time constant
+# EMBEDDED_SEARCH_TOOLS inlined as isEnvTruthy("true"):
+#   function zb(){if(!Me("true"))return!1;if($Rr())return!1;return a.CLAUDE_CODE_ENTRYPOINT!=="local-agent"}   2.1.280
+#   function HP(){if(!fn("true"))return!1;if(CJi())return!1;return Q.CLAUDE_CODE_ENTRYPOINT!=="local-agent"}  2.1.231
+# It has 16 call sites in each build: the shadowing, the removal of the Glob
+# and Grep tools, and a dozen prompts that send the model to grep via Bash.
+# The constant becomes `false` in the DECLARATION, which is exactly what native
+# runs under its own `--allowedTools=Grep` opt-in ($Rr, the second clause) -
+# measured equal, request bodies and tool results, by the design panel.
+# Design of record: docs/superpowers/specs/2026-09-23-embedded-search-gate-design.md.
+#
+# Found by the declaration's WHOLE shape: neither half is unique. Measured on
+# the 2.1.280 tree, `Me("true")` occurs 7 times (six are other inlined flags)
+# and `CLAUDE_CODE_ENTRYPOINT!=="local-agent"` 4 times; the whole shape once,
+# and once in 2.1.231. `[\w$.]+` before .CLAUDE_CODE_ENTRYPOINT takes both the
+# alias the builds use and a literal `process.env.`.
+_SEARCH_GATE_SHAPE = (
+    r"function\s+([\w$]+)\s*\(\s*\)\s*\{\s*if\s*\(\s*!\s*(%s)\s*\)\s*return\s*!1\s*;"
+    r"\s*if\s*\(\s*[\w$]+\s*\(\s*\)\s*\)\s*return\s*!1\s*;"
+    r"\s*return\s+[\w$.]+\.CLAUDE_CODE_ENTRYPOINT\s*!==\s*\"local-agent\"\s*\}")
+SEARCH_GATE_DEF = re.compile(_SEARCH_GATE_SHAPE % r'([\w$]+)\s*\(\s*"true"\s*\)')
+# Boring and greppable on purpose, like the image shim's `true`:
+# `grep -c 'if(!false)return!1'` says whether an artifact carries the rewrite.
+SEARCH_GATE_REPLACEMENT = "false"
+SEARCH_GATE_OFF = re.compile(_SEARCH_GATE_SHAPE % "false")
+
+# The generator the gate guards, `function gAn(){if(!zb())return null;return[
+# "unalias find ...","unalias grep ...",S_e("find","bfs",...),S_e("grep",
+# "ugrep",...)]...}`. The rewrite is licensed only because THIS gate guards
+# THIS generator, so its guard must call the declared gate, in the same module
+# (measured true on both builds; an importing module could call it by any alias).
+SHADOW_GEN = re.compile(
+    r"function\s+([\w$]+)\s*\(\s*\)\s*\{\s*if\s*\(\s*!\s*([\w$]+)\s*\(\s*\)\s*\)\s*return\s+null\s*;"
+    r'\s*return\s*\[\s*"unalias find 2>/dev/null \|\| true"\s*,\s*"unalias grep 2>/dev/null \|\| true"')
+# What proves shadowing code is present: the generator's own literal and the
+# snapshot builder's comment (1 and 2 occurrences in each build). NOT the
+# shadow-function builder's strings (`exec -a`, `_cc_bin`, `ARGV0=`): the
+# ripgrep emitter uses that builder too, so they survive a correct rewrite.
+SHADOW_MARKERS = ("unalias grep 2>/dev/null || true",
+                  "Shadow find/grep with embedded bfs/ugrep")
+
+
+def _apply_search_gate(codes):
+    """Rewrite the embedded-search gate's constant to `false`, or refuse.
+
+    `codes` maps a label (the file, or a module's path under root/) to its
+    text; the one module that changes is replaced in the returned dict. The
+    report's `errors` are FATAL, unlike the image shim's refusals: a missing
+    image shim degrades to an artifact this repo shipped for weeks, while a
+    missing gate rewrite ships the bug - the model's primary search path
+    answering with Bun's help text, reported as success. Every error leaves
+    the code untouched.
+    """
+    report = {"applied": 0, "name": None, "truthy": None, "module": None,
+              "reason": None, "errors": []}
+    errors = report["errors"]
+    decls = [(k, m) for k, text in codes.items() for m in SEARCH_GATE_DEF.finditer(text)]
+    gens = [(k, m) for k, text in codes.items() for m in SHADOW_GEN.finditer(text)]
+    markers = sum(text.count(s) for text in codes.values() for s in SHADOW_MARKERS)
+
+    if len(decls) > 1:
+        errors.append(
+            "the embedded-search gate is declared %d times (%s) - refusing to "
+            "guess which one guards the find/grep shadowing. Nothing was written."
+            % (len(decls), ", ".join("%s() in %s" % (m.group(1), k) for k, m in decls)))
+    if len(gens) > 1:
+        errors.append(
+            "the find/grep shadow generator occurs %d times (%s) - refusing to "
+            "guess which one the embedded-search gate guards. Nothing was written."
+            % (len(gens), ", ".join("%s() in %s" % (m.group(1), k) for k, m in gens)))
+    if errors:
+        return codes, report
+    if not decls:
+        if markers:
+            errors.append(
+                "no embedded-search gate declaration matched, but this build still "
+                "shadows find/grep (%d marker(s): %s). The declaration's shape "
+                "drifted (SEARCH_GATE_DEF, docs/findings.md §10), and shipping it "
+                "would run bun as ugrep/bfs for every Bash grep and find, reported "
+                "as success. Nothing was written."
+                % (markers, " / ".join(s for s in SHADOW_MARKERS
+                                       if any(s in t for t in codes.values()))))
+        else:
+            report["reason"] = ("not applicable: this build has no embedded-search "
+                                "gate and no find/grep shadowing")
+        return codes, report
+
+    label, decl = decls[0]
+    name = decl.group(1)
+    report.update(name=name, truthy=decl.group(3), module=label)
+    if markers:
+        if not gens:
+            errors.append(
+                "the embedded-search gate %s() was found, but the find/grep shadow "
+                "generator it should guard was not, while shadowing code is still "
+                "present (%d marker(s)) - the generator's shape drifted "
+                "(SHADOW_GEN), so nothing shows that %s() is what guards it. "
+                "Nothing was written." % (name, markers, name))
+        else:
+            glabel, gen = gens[0]
+            if glabel != label:
+                errors.append(
+                    "the embedded-search gate %s() is declared in %s but the find/grep "
+                    "shadow generator %s() is in %s, where its guard could be an "
+                    "import alias of anything - measured in one module on every "
+                    "build so far; re-measure (docs/findings.md §10). Nothing was "
+                    "written." % (name, label, gen.group(1), glabel))
+            elif gen.group(2) != name:
+                errors.append(
+                    "the find/grep shadow generator %s() is guarded by %s(), not by "
+                    "the embedded-search gate %s(): rewriting %s() would leave the "
+                    "shadowing on. Nothing was written."
+                    % (gen.group(1), gen.group(2), name, name))
+    if errors:
+        return codes, report
+
+    text = codes[label]
+    text = text[:decl.start(2)] + SEARCH_GATE_REPLACEMENT + text[decl.end(2):]
+    left, off = len(SEARCH_GATE_DEF.findall(text)), len(SEARCH_GATE_OFF.findall(text))
+    if (left, off) != (0, 1):
+        # The selection cannot catch a replacement that did not land where it
+        # was aimed, or that spread; only counting the result can.
+        errors.append(
+            "embedded-search gate bookkeeping is wrong: after rewriting %s() in %s, "
+            "%d declaration(s) still carry the inlined constant and %d read `false` "
+            "(expected 0 and 1). Nothing was written." % (name, label, left, off))
+        return codes, report
+    codes = dict(codes)
+    codes[label] = text
+    report["applied"] = 1
+    return codes, report
+
+
+def _search_gate_line(counts):
+    """The build-log line build.sh and scripts/harness.py read."""
+    if counts["search_gate"]:
+        where = (" in %s" % counts["search_gate_module"]
+                 if counts.get("search_gate_module") else "")
+        return ("embedded search off    : 1  (gate %s()%s: bun has no embedded "
+                "ugrep/bfs; as native under --allowedTools=Grep)"
+                % (counts["search_gate_name"], where))
+    return "embedded search off    : 0  (%s)" % (
+        counts["search_gate_reason"] or "refused: see the error below")
+
+
 def _asset_expr(match):
     name = match.group(2)
     return "require('path').join(__dirname,'assets'," + json.dumps(name) + ")"
@@ -384,6 +553,14 @@ def transform(code, image_shim=True):
     counts.update(gate_name=name, gate_calls_before=before,
                   gate_calls_after=after, image_shim=applied,
                   image_shim_reason=reason)
+    # In both image_shim modes: the opt-out rebuilds the as-shipped half of the
+    # image A/B, not the bun-as-ugrep bug.
+    codes, search = _apply_search_gate({"cli.original.cjs": code})
+    code = codes["cli.original.cjs"]
+    counts.update(search_gate=search["applied"], search_gate_name=search["name"],
+                  search_gate_truthy=search["truthy"],
+                  search_gate_reason=search["reason"],
+                  search_gate_errors=search["errors"])
     # the distinct asset basenames the rewritten code will reach for at
     # runtime; check() matches them against what the extractor actually wrote
     counts["asset_names"] = sorted({m.group(2) for m in BUNFS_LITERAL.finditer(code)})
@@ -498,6 +675,11 @@ def check(code, counts, assets_on_disk=None, asset_names_on_disk=None):
             "build deliberately leaves false - embedded ripgrep above all - "
             "may have been flipped too. Nothing was written."
             % (applied, counts["gate_name"], before, after, before - applied))
+
+    # (g) The embedded-search gate: rewritten exactly once, or provably absent.
+    # Anything in between ships Bash grep/find running bun (docs/findings.md
+    # §10); _apply_search_gate says which rule failed.
+    errors.extend(counts["search_gate_errors"])
     return errors
 
 
@@ -828,6 +1010,17 @@ def transform_tree(d):
         totals["realm_entries"].append(out)
     totals["js"] = len(js_out)
 
+    # The embedded-search gate, across the whole graph: on 2.1.280 it is
+    # declared, and guards the find/grep shadowing, in chunk-1xqpf2j8.js, and
+    # four other chunks import it.
+    codes, search = _apply_search_gate({out: code for out, code in js_out.values()})
+    for vfs, (out, _) in js_out.items():
+        js_out[vfs] = (out, codes[out])
+    totals.update(search_gate=search["applied"], search_gate_name=search["name"],
+                  search_gate_module=search["module"],
+                  search_gate_reason=search["reason"])
+    errors.extend(search["errors"])
+
     entry = by_path.get(manifest.get("entry"))
     entry_out = _out_path(entry) if entry else None
     if entry is None or entry["loader"] not in TREE_JS_LOADERS:
@@ -921,6 +1114,8 @@ def main_tree(d):
               f"({', '.join(totals['realm_entries']) or 'none'})")
         print("image shim applied     : 0  (not applicable: this build has no "
               "native image processor to gate; images go through Bun.Image)")
+        if "search_gate" in totals:
+            print(_search_gate_line(totals))
         for path in sorted(totals["build_paths"]):
             sys.stderr.write(f"note: build-machine path still present: {path}\n")
         if totals["self_spawns"] == 0:
@@ -1014,6 +1209,7 @@ def main():
         # where the anchor was measured present exactly once. Omitted entirely
         # in a shimmed build so the log of the default build is unchanged.
         print(f"image shim not applied : {counts['image_shim_reason']}")
+    print(_search_gate_line(counts))
     print(f"size: {orig_len} -> {len(code)} bytes")
 
     # Diagnostics belong ABOVE the write: printed after "wrote:" they read as

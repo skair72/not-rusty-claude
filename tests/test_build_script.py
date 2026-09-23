@@ -355,8 +355,8 @@ def test_any_non_empty_opt_out_value_is_an_opt_out_here_too(tmp_path):
 
 # A code-split graph (docs/findings.md 14) at its smallest: an ESM entry that
 # imports one chunk, which prints a marker.
-def _esm_binary(path):
-    mods = [("/$bunfs/root/chunk-a.js", b'console.log("ESM-BUILD-RUNS");\n', 1,
+def _esm_binary(path, chunk=b'console.log("ESM-BUILD-RUNS");\n'):
+    mods = [("/$bunfs/root/chunk-a.js", chunk, 1,
              fixtures.FORMAT_ESM, fixtures.ENC_LATIN1),
             ("/$bunfs/root/cli", b'// @bun @bytecode\nimport"/$bunfs/root/chunk-a.js";\n', 1,
              fixtures.FORMAT_ESM, fixtures.ENC_LATIN1)]
@@ -417,3 +417,40 @@ def test_without_bun_original_is_kept_for_the_check_that_did_not_run(tmp_path):
     assert result.returncode == 0, result.stderr
     assert (out / "extract" / "original" / "cli").is_file()
     assert "scripts/verify-tree.js %s" % (out / "extract") in result.stderr
+
+
+# The embedded-search gate, its find/grep shadow generator and the snapshot
+# builder's comment, cut down from 2.1.280's chunk-1xqpf2j8.js. A build that
+# rewrites the gate runs what native runs under --allowedTools=Grep - Glob and
+# Grep offered, Bash grep/find the system's - which is a difference from the
+# native DEFAULT, so the summary has to name it (docs/findings.md 10).
+SEARCH_GATE_JS = (
+    b'function zb(){if(!Me("true"))return!1;if($Rr())return!1;'
+    b'return a.CLAUDE_CODE_ENTRYPOINT!=="local-agent"}'
+    b'function gAn(){if(!zb())return null;return["unalias find 2>/dev/null || true",'
+    b'"unalias grep 2>/dev/null || true",S_e("find","bfs",[]),S_e("grep","ugrep",[])]'
+    b'.join(" ")}'
+    b'function vAn(){let h=gAn();if(h!==null)return"# Shadow find/grep with embedded bfs/ugrep"+h}')
+SEARCHABLE_ENTRY = GOOD_ENTRY.replace(b"module.exports=1;", SEARCH_GATE_JS + b";module.exports=1;")
+
+
+def test_a_build_that_turns_embedded_search_off_names_the_search_tools_gap(tmp_path):
+    native = _synthetic_binary(tmp_path / "native", entry=SEARCHABLE_ENTRY)
+
+    result = _build(tmp_path / "out", native)
+
+    assert result.returncode == 0, result.stderr
+    assert "embedded search off    : 1" in result.stdout
+    assert "embedded search OFF" in result.stdout
+    assert _gap_list(result) == "image processing, sandbox, ripgrep, search tools"
+
+
+def test_the_code_split_gap_list_names_the_search_tools_only_when_rewritten(tmp_path):
+    plain = _build(tmp_path / "a", _esm_binary(tmp_path / "plain"))
+    searchable = _build(tmp_path / "b", _esm_binary(
+        tmp_path / "searchable", chunk=SEARCH_GATE_JS + b';console.log("ESM-BUILD-RUNS");\n'))
+
+    assert (plain.returncode, searchable.returncode) == (0, 0), searchable.stderr
+    assert _gap_list(plain) == "sandbox, ripgrep, install identity"
+    assert "embedded search off    : 1  (gate zb() in chunk-a.js" in searchable.stdout
+    assert _gap_list(searchable) == "sandbox, ripgrep, search tools, install identity"
