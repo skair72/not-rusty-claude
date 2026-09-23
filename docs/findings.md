@@ -293,10 +293,11 @@ with more version headroom (§9).
 
 ### What `check()` refuses to write ✅
 
-`postprocess.py` refuses to write `cli.original.cjs` at all unless **six**
-conditions hold (counted by AST in `tools/postprocess.py` on 2026-08-24: six
-conditions, eight `errors.append` sites — the sixth reports its three failure
-shapes separately):
+`postprocess.py` refuses to write `cli.original.cjs` at all unless **seven**
+conditions hold. Counted by AST in `tools/postprocess.py`, most recently on
+2026-09-23: seven conditions, eight `errors.append` sites and one
+`errors.extend`. The sixth reports its three failure shapes separately, and the
+seventh passes on whichever of `_apply_search_gate`'s seven refusals fired.
 
 1. the output starts with `(function`;
 2. exactly one IIFE invocation was appended (`counts["iife"] == 1`; the pattern
@@ -319,6 +320,11 @@ shapes separately):
    would take the ripgrep gate with it, and that gate's failure mode is a wrong
    answer rather than an error. It counts how many sites moved, never which —
    hence selection by shape (§10).
+7. **the embedded-search gate was rewritten exactly once, or the build provably
+   has neither it nor the find/grep shadowing** (§10, *Embedded search*). A
+   drifted declaration or generator, two of either, or a generator guarded by
+   another function, while shadowing code is present, is fatal. Shipping any of
+   those ships Bash `grep` running bun.
 
 A silently broken output reaching Bun would surface only as that confusing
 panic, or — for a missing asset — as nothing at all, because both of Claude's
@@ -432,7 +438,7 @@ functions read it back at the shell level:
 ```bash
 function find {
   local _cc_bin="${CLAUDE_CODE_EXECPATH:-}"
-  [[ -x $_cc_bin ]] || _cc_bin='<bundled bfs path>'
+  [[ -x $_cc_bin ]] || _cc_bin=<$HOME/.local/bin/claude>
   ...
   (exec -a bfs "$_cc_bin" -S dfs -regextype findutils-default ${1+"$@"})
 }
@@ -440,8 +446,12 @@ function find {
 
 The `[[ -x ]]` guard does not save you: bun *is* executable, so `find` and
 `grep` inside a spawned shell resolve to bun invoked with `bfs`/`ugrep`
-arguments. Read out of the shipped source, **not observed live** 🔎. Same family
-as §10: things that differ because the process is not a Bun standalone.
+arguments. That was read out of the shipped source on 2026-08-22, and **observed
+live on 2026-09-23** ✅: every Bash `grep` printed Bun's help, reported as
+success. It is **fixed**, but not through this variable. `postprocess.py` turns
+off the gate that emits these functions, and nothing reads
+`CLAUDE_CODE_EXECPATH` after that. It still says bun, which is true. The
+mechanism and the fix are in §10, *Embedded search: `grep` and `find` ran bun*.
 
 ---
 
@@ -470,7 +480,16 @@ native image processing — *and*
 `'Restore Glob/Grep tools (un-inline EMBEDDED_SEARCH_TOOLS)'`, which checks that
 real `bfs`/`ugrep` binaries exist on `PATH` before claiming embedded search.
 That second patch is the mitigation for the trap §10 documents. Prior art
-addressed both halves before this project noticed either. The patch count is
+addressed both halves before this project noticed either.
+
+That second patch no longer applies to these builds, measured 2026-09-23 at
+ClawGod `7bf3b15`. Its regex requires a literal `process.env.` in the gate,
+`…return process\.env\.CLAUDE_CODE_ENTRYPOINT!=="local-agent"\}`, but both
+extracts reach the environment through an alias: `Q.` in 2.1.231 and `a.` in
+2.1.280. So it matches **0** times on each. Its `optional: true` sentinel
+`ct("true")` is absent too, and ClawGod reports that as "already applied". This
+project's rewrite targets the same gate, with an alias-tolerant shape
+(§10, *Embedded search*). The patch count is
 `grep -cE '^    name: ' install.sh` at `4401fdb` = **40** (this table said 29
 until 2026-08-23).
 
@@ -758,12 +777,17 @@ contract.
 ## 10. The equivalence gap: this is not the same program ⚠️✅
 
 Everything above answers *does it run*. This answers *does it behave the same as
-the binary Anthropic ships*, and the answer is still **no** — though one of the
-consequences is now fixed in a default build. Read this before deciding whether
+the binary Anthropic ships*, and the answer is still **no** — though two of the
+consequences are now closed: image processing in a default build, and Bash
+`grep`/`find` in every build, differently. Read this before deciding whether
 to use this project.
 
 - **Closed** (default builds, since 2026-08-23): native image processing — see
   *What shipped: the scoped shim*.
+- **Closed differently** (every build, since 2026-09-23): Bash `grep` and `find`,
+  which ran **bun**. The artifact now runs the search configuration native runs
+  under its own Glob/Grep opt-in, not native's default — see *Embedded search:
+  `grep` and `find` ran bun*.
 - **Open, deliberately**: the seccomp sandbox, embedded ripgrep, install
   identity. Each is a refusal with a reason, tabulated below.
 - **Open, and not a gate at all**: both addon loaders swallow their own
@@ -845,6 +869,11 @@ it."*
 
 **5. Install identity reports `unknown`**, which is what makes the auto-updater
 hazardous — [runbook.md](./runbook.md) § Surviving Claude updates.
+
+**6. Bash `grep` and `find` ran bun** — now fixed. It is not an
+`isStandaloneExecutable` site at all, which is why nothing above caught it:
+it is a build-time constant. See *Embedded search: `grep` and `find` ran bun*
+below.
 
 ### The addon itself is fine ✅
 
@@ -1014,7 +1043,8 @@ false. `check()` now treats a rewrite *claimed* against a gate nobody identified
 as the same fatal bookkeeping failure as arithmetic that does not balance.
 
 **Opting out.** `NRC_NO_IMAGE_SHIM` set to **any non-empty value** builds the
-"as shipped" artifact. Both `build.sh` (`[ -n … ]`) and `postprocess.py` (a
+"as shipped" artifact, bar the embedded-search gate rewrite, which applies in
+both modes and has no opt-out. Both `build.sh` (`[ -n … ]`) and `postprocess.py` (a
 truthiness test) use that one rule; they have to agree, or a shim that genuinely
 *failed* gets announced as a deliberate choice — the one wording that stops
 anyone looking. Verified 2026-08-23 with `NRC_NO_IMAGE_SHIM=false` and
@@ -1112,6 +1142,121 @@ the poller attributing **zero** sockets to a turn-driving case, meaning it was
 watching the wrong processes; and the mock's log showing a `stream=false`
 request, meaning the CLI abandoned the SSE stream for the non-streaming fallback
 — a path a real API run never takes.
+
+### Embedded search: `grep` and `find` ran bun ✅
+
+**Observed 2026-09-23**, reported first-hand: started as `bun
+build/extract/cli.js`, Claude could not run a plain `grep`. §6 had predicted it
+from source on 2026-08-22 and marked it *not observed live*.
+
+**The mechanism.** The native binary embeds **bfs** and **ugrep** and picks one
+by `argv[0]`. Claude's shell snapshot, which every Bash-tool command sources,
+therefore shadows `find` and `grep` with functions that run
+`(exec -a bfs|ugrep "$CLAUDE_CODE_EXECPATH" …)`. §6 records that
+`CLAUDE_CODE_EXECPATH` is `process.execPath`, and here that is bun. Measured
+through the loopback mock on 2.1.280, a Bash `grep -n needle somefile.txt`
+answered:
+
+```
+error: Invalid Argument '-G'
+Bun is a fast JavaScript runtime, package manager, bundler, and test runner. (1.3.14+0d9b296af)
+…
+```
+
+It came back as a tool result with **`is_error: false`**. Exit 1 is how `grep`
+says "no matches", so Claude classes it as no error, and the TUI draws
+`Searched for 1 pattern` as if it had worked. `find` fails the same way, on
+`-S`. The legacy 2.1.231 build reproduces it identically.
+
+**Why not the ripgrep story again.** Embedded ripgrep asks
+`isStandaloneExecutable` at runtime (point 4), so outside a standalone it falls
+back to the system `rg`. The bfs/ugrep embed is decided by a gate whose first
+clause is the build-time constant `EMBEDDED_SEARCH_TOOLS`, inlined as
+`isEnvTruthy("true")`:
+
+```js
+function zb(){if(!Me("true"))return!1;if($Rr())return!1;return a.CLAUDE_CODE_ENTRYPOINT!=="local-agent"}   // 2.1.280
+function HP(){if(!fn("true"))return!1;if(CJi())return!1;return Q.CLAUDE_CODE_ENTRYPOINT!=="local-agent"}  // 2.1.231
+```
+
+That makes it true under any runtime. Setting `EMBEDDED_SEARCH_TOOLS=0` changes
+nothing: nothing reads the variable. The gate has **16** call sites in each
+build. Besides the shadowing, it removes the **Glob** and **Grep** tools and
+steers about a dozen prompts (Explore, Plan, the Bash tool's guidance, plan
+mode, …) to "use `grep` via Bash". The model was sent down the one search path
+that could not work.
+
+**Claude's own switch.** `$Rr` / `CJi` is `searchToolsOptIn`. It is true exactly
+when a command-line `--allowedTools` rule or a `--tools` entry names Glob or
+Grep (rule content is ignored), and the gate is its only reader. So native under
+that opt-in runs the gate false: Glob and Grep are offered, and Bash
+`grep`/`find` are the system's. The opt-in is also a workaround on an unpatched
+artifact, with no rebuild. Use an inert rule,
+`--allowedTools='Glob(/nonexistent/**)'`, not `--allowedTools=Grep`: a bare `Grep` rule
+also pre-approves Grep on every path. That was measured on native 2.1.280: it
+read a file outside the working directory with no prompt.
+
+**What shipped.** `postprocess.py` rewrites the gate's declaration, and only the
+declaration: `isEnvTruthy("true")` becomes `false`. In the build log:
+
+```
+embedded search off    : 1  (gate zb() in chunk-1xqpf2j8.js: bun has no embedded ugrep/bfs; as native under its Glob/Grep opt-in)
+```
+
+Whether an artifact carries the rewrite:
+`grep -rl 'if(!false)return!1' build/extract/root | wc -l` on a code-split
+build, or `grep -c 'if(!false)return!1' build/extract/cli.original.cjs` on a
+legacy one. Both print 1 when the rewrite is there and 0 when it is not
+(measured 2026-09-23). It is found by the declaration's whole shape, never by one half:
+`Me("true")` occurs 7 times in the 2.1.280 tree and
+`CLAUDE_CODE_ENTRYPOINT!=="local-agent"` 4 times. The other six `Me("true")`
+guard the `.md` walker, ingress persistence, the installer and resume; which
+flags those are is inlined away and only inferred from context. The rewrite is also tied to
+the bug: the snapshot's generator (`gAn` / `ytb`) must be found, guarded by that
+same gate in the same module. Every state that cannot be proven while shadowing
+code is still present is **fatal**, and nothing is written. Unlike the image
+shim's refusals, shipping one ships the bug. The design of record, with every
+alternative measured and rejected, is
+[`docs/superpowers/specs/2026-09-23-embedded-search-gate-design.md`](./superpowers/specs/2026-09-23-embedded-search-gate-design.md).
+
+**What it is, precisely.** The artifact's search configuration is native's
+**opt-in** one, not native's default:
+
+| | native default | artifact (and native under its Glob/Grep opt-in) |
+|---|---|---|
+| tools | no Glob, no Grep | Glob and Grep, through the system `rg` |
+| Bash `grep` | embedded ugrep, `-G --ignore-files --hidden -I --exclude-dir=.git…` | the system's (GNU here, BSD on macOS) |
+| Bash `find` | embedded bfs, `-S dfs` | the system's |
+| prompts (interactive; read from source, 3 lines measured once 2026-09-23) | "use `grep` / `find` via Bash" | "use Grep / Glob" |
+
+The harness compares the artifact with native **under that opt-in**, still at
+zero tolerance: bodies, tool results and screens. Its
+`agentic:search-optin` check pins what the opt-in changes on native itself, in
+a `-p` turn:
+
+- the tools differ by exactly +Glob +Grep;
+- the first request is otherwise equal;
+- native's default Bash `grep` skips a `.gitignore`'d file and a binary file
+  that the system `grep` reports.
+
+If Anthropic changes any of those, the check goes red. It does not pin the
+prompt row of the table: a `-p` request carries none of the gate-dependent
+wording. The interactive prompts are compared only between the artifact and
+native under the opt-in, where the TUI checks require them to be equal.
+`agentic:bash-search` is the regression case: a Bash `grep`/`find` with no
+`--allowedTools`, which is the one shape every earlier harness case avoided.
+
+**Why not keep native's tools and prompts and just drop the shadowing?** Because
+that configuration matches nothing native runs. On a repo with a gitignored
+`node_modules/` and `dist/`, `grep -rn readFileSync .` produced:
+
+- native, and the artifact's Grep tool: 4 lines, 247 characters;
+- native's prompts with a system `grep`: 151 KB, saved to a file whose preview
+  held none of the four real hits.
+
+**What it needs.** `rg` on `PATH`, which point 4 already made a prerequisite.
+Without it Glob and Grep fail visibly: `is_error: true`, *"ripgrep not found on
+PATH"*.
 
 ---
 

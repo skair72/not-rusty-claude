@@ -94,6 +94,13 @@ unmodified artifact, `--allowedTools=Grep` gives 22 tools with Glob and Grep, a
 real `grep` (`grep is /usr/bin/grep`), and a Grep tool that answers through the
 system `rg`.
 
+**Changed after review:** a bare `Grep` rule is not only the opt-in. It is
+also an allow rule, and it pre-approves Grep on every path. Measured on native
+2.1.280 without `--dangerously-skip-permissions`, it read a file outside the
+working directory with no prompt. The inert `Glob(/nonexistent/**)` form was
+refused a permission there. So this document calls the configuration native's
+**Glob/Grep opt-in**, and every workaround it recommends uses the inert form.
+
 That makes the opt-in the **native twin** of the fix below. Native, started with
 an inert opt-in (`--allowedTools=Glob(/nonexistent-nrc/**)`), and the fixed
 artifact, started with no flags, were measured equal on this host by the design
@@ -119,14 +126,17 @@ function zb(){if(!false)return!1;if($Rr())return!1;return a.CLAUDE_CODE_ENTRYPOI
 
 The meaning is "this build has no embedded search tools", and that is true of a
 bun that carries neither ugrep nor bfs. `false` is chosen, like the image shim's
-`true`, because it is boring and greppable: `grep -c 'if(!false)return!1'`
-tells you whether an artifact is patched.
+`true`, because it is boring and greppable. **Changed after review:** a
+code-split artifact is a directory tree, so the check is per shape:
+`grep -rl 'if(!false)return!1' build/extract/root | wc -l` on a code-split
+build, and `grep -c` over `cli.original.cjs` on a legacy one. Either prints 1
+when patched and 0 when not.
 
 The declaration is found by its **whole shape**, never by its minified name and
 never by one of its halves:
 
 ```
-SEARCH_GATE_DEF = function\s+([\w$]+)\s*\(\s*\)\s*\{\s*if\s*\(\s*!\s*([\w$]+\s*\(\s*"true"\s*\))\s*\)\s*return\s*!1\s*;
+SEARCH_GATE_DEF = function\s+([\w$]+)\s*\(\s*\)\s*\{\s*if\s*\(\s*!\s*(([\w$]+)\s*\(\s*"true"\s*\))\s*\)\s*return\s*!1\s*;
                   \s*if\s*\(\s*[\w$]+\s*\(\s*\)\s*\)\s*return\s*!1\s*;
                   \s*return\s+[\w$.]+\.CLAUDE_CODE_ENTRYPOINT\s*!==\s*"local-agent"\s*\}
 ```
@@ -134,9 +144,11 @@ SEARCH_GATE_DEF = function\s+([\w$]+)\s*\(\s*\)\s*\{\s*if\s*\(\s*!\s*([\w$]+\s*\
 Measured: 1 match in the whole 2.1.280 tree, 1 in the 2.1.231 `cli.original.cjs`,
 and 1 in each native binary. Neither half is unique on its own:
 
-- `Me("true")` occurs **7** times in the 2.1.280 tree. The other six are other
-  inlined flags, such as the pure-JS `.md` walker, ingress persistence, the
-  installer and resume.
+- `Me("true")` occurs **7** times in the 2.1.280 tree. The other six guard the
+  pure-JS `.md` walker, ingress persistence, the installer and resume. Which
+  flags those are is inlined away and only inferred from context; only the
+  gate's identity is certain, from `searchToolsOptIn` and the generator it
+  guards.
 - `CLAUDE_CODE_ENTRYPOINT!=="local-agent"` occurs **4** times.
 
 `[\w$.]+` before `.CLAUDE_CODE_ENTRYPOINT` accepts both the alias both builds
@@ -157,10 +169,18 @@ the image shim's single-edit test still isolates the image gate.
 
 ### The safety property, enforced
 
-"Shadowing present" is proven by either **marker**: the literal
-`unalias grep 2>/dev/null || true`, or the snapshot comment
-`Shadow find/grep with embedded bfs/ugrep`. They are measured once and twice
-per build. The strings of S_e, the generic shadow-function builder (`exec -a`,
+"Shadowing present" is shown by any **marker**:
+
+- the literal `unalias grep 2>/dev/null || true`;
+- the snapshot comment `Shadow find/grep with embedded bfs/ugrep`;
+- the generator's two builder calls, `"grep","ugrep"` and `"find","bfs"`.
+
+They are measured 1, 2, 1 and 1 times per build. **Changed after review:** the
+first version had only the first two. A release that reshaped the gate and
+reworded both of those strings would then have passed as "not applicable" and
+shipped the bug. The builder calls name the binary each command becomes, which
+is the thing being guarded against. A hermetic test drifts all three together
+and requires the build to fail. The strings of S_e, the generic shadow-function builder (`exec -a`,
 `_cc_bin`, `ARGV0=`), are **not** markers: the ripgrep emitter uses S_e too, so
 they survive a correct build.
 
@@ -173,6 +193,7 @@ generators matched, M the number of marker hits.
 | D = 1, and G = 1 with its guard calling the declared gate in the same module | **rewrite**; the summary says `embedded search off    : 1` |
 | D = 1, G = 0, M = 0 | **rewrite**: the gate still steers tools and prompts, and flipping it is still native's opt-in configuration |
 | D = 0, M = 0 | not applicable, not fatal: `0  (not applicable: …)` |
+| code-split: a module could not be read | not looked for: `0  (not checked: …)`; the build fails on that module anyway (**added after review**: "not applicable" would describe modules nobody read) |
 | D = 0, M > 0 | **fatal**: the declaration drifted while the shadowing is still in the build, and shipping it runs bun as ugrep/bfs |
 | D > 1, or G > 1 | **fatal**: ambiguous, refusing to guess |
 | D = 1, M > 0, and G = 0, or the guard names another function, or it is in another module | **fatal**: cannot prove the flipped gate is the one guarding the shadowing |
@@ -256,13 +277,24 @@ runtime direction is Claude's own: nothing reaches the gate once it is `false`.
      `--allowedTools`, in a fixture holding a gitignored file, a binary file and
      a hidden directory. The artifact equals native under the opt-in, and its
      tool result never contains `Invalid Argument` or Bun's banner.
-   - **`agentic:search-optin`** pins what the opt-in changes on native itself.
-     Native's default first body equals its opt-in first body once the Glob and
-     Grep tool entries are removed, and those two are the only tools that
-     differ. Native's default Bash `grep` still skips the gitignored file, which
-     the opt-in does not. If Anthropic changes either configuration, this goes
-     red and the claim above gets re-measured.
-   - `build` requires `embedded search off    : 1`.
+   - **`agentic:search-optin`** pins what the opt-in changes on native itself,
+     in a `-p` turn:
+     - the Glob and Grep tool entries are the only tools that differ;
+     - with those removed, native's default first body equals its opt-in first
+       body;
+     - native's default Bash `grep` still skips the gitignored file and the
+       binary one, and the opt-in's does not.
+
+     **Changed after review:** a `-p` request carries none of the gate's prompt
+     wording, so this check does not pin the prompts. They are compared only
+     artifact against native under the opt-in, in the TUI checks. Native's
+     default interactive wording was measured once and is otherwise read from
+     source.
+   - `build` requires `embedded search off    : 1`, in both graph shapes
+     (**changed after review**: the first version checked code-split builds
+     only). A `not applicable` there is a failure too, with its own message: the
+     gate left the release, so the native side's opt-in and `search-optin` need
+     re-measuring before they mean anything.
 4. **Docs**, each reconciled with what the harness measured:
    - findings §6 changes from "not observed live" to observed and fixed;
    - findings §10 gains the consequence and what shipped;

@@ -35,7 +35,8 @@ that installs a `Bun.ant` polyfill. The details are in
 **How it is verified: `make harness`.** `scripts/harness.py` builds the
 artifact, then runs the same scenario through the native binary and the
 artifact, and compares what each one did. Measured on this host on 2026-09-22
-against `/usr/bin/claude` 2.1.280, under stock Bun 1.3.14:
+against `/usr/bin/claude` 2.1.280, under stock Bun 1.3.14, and re-run in full on
+2026-09-23 (30 checks, all PASS) once the search checks were added:
 
 | check | artifact vs native |
 |---|---|
@@ -44,13 +45,17 @@ against `/usr/bin/claude` 2.1.280, under stock Bun 1.3.14:
 | `--version`, `--help`, `mcp list`, `mcp add` → `get` → `remove` → `list`, `plugin list`, `auth status` | exit code, stdout **and** stderr equal, at every step |
 | `doctor` | equal bar the install-identity and search lines, which are the [equivalence gap](docs/findings.md) |
 | the Claude-in-Chrome MCP server, and Claude's own config for it spawned as Claude spawns it | an MCP `initialize` answered identically |
-| 8 mock-API agentic turns: text, Bash, Read, Read of a 3000×3000 PNG, Grep, Write, Glob, function hooks | tool results equal, and the full request bodies equal once per-run paths, session ids and the random device id are normalised |
+| 9 mock-API agentic turns: text, Bash, Read, Read of a 3000×3000 PNG, Grep, Write, Glob, function hooks, and a Bash `grep`/`find` | tool results equal, and the full request bodies equal once per-run paths, session ids and the random device id are normalised. Native runs these, and the TUI, under its own Glob/Grep opt-in; `search-optin` pins what that opt-in changes on native in a `-p` turn |
 | TUI under a pty: onboarding, a REPL turn, a REPL turn full of CJK, emoji, bidi text, a table and a code block | screens identical cell for cell, **styles and hyperlinks included** — bar the randomly chosen spinner verb and the clock, and onboarding compared below its randomly sparkling logo; same requests; the REPL exits 0 with the terminal restored |
 | `Bun.ant`, probed inside the native runtime with a real peer process | 27 answers identical |
 | `CellSegmenter`, fuzzed against the native class | 0 mismatches (3,000 cases per harness run; 610,000 in development) |
 
 **What it is not.** The same gaps apply as before: the sandbox is off, ripgrep
-is the system `rg` and install identity reads `unknown`. On top of that,
+is the system `rg` and install identity reads `unknown`. Search runs in the
+configuration native uses under its own Glob/Grep opt-in, not its default: the **Glob** and
+**Grep** tools are offered, and a Bash `grep`/`find` is the system's. Bun has
+no embedded ugrep or bfs, and before 2026-09-23 every Bash `grep` printed Bun's
+help ([findings §10](docs/findings.md), *Embedded search*). On top of that,
 startup is **3–8× slower** than native (`--help` takes 1.2 s against 0.16 s),
 because the native runtime runs JSC bytecode that a different WebKit build
 cannot load. A code-split build does **not** run under Node yet
@@ -97,7 +102,11 @@ Claude Code 2.1.222, on Linux** — a measurement, not a guarantee.
 its non-standalone branch at every site that asks (how many sites per binary is a
 row of [`docs/findings.md`](docs/findings.md) §6's table). Measured consequences:
 the **seccomp sandbox is off**, embedded ripgrep becomes a **system `rg`** (so
-`rg` is a de facto prerequisite), and install identity reports `unknown`. Both
+`rg` is a de facto prerequisite), and install identity reports `unknown`. One
+more gap is not a runtime check at all. Claude's embedded bfs/ugrep is switched
+on by a build-time constant, so `postprocess.py` switches it off. Glob and Grep
+are then offered, and Bash `grep`/`find` are the system's, exactly as native
+runs when an `--allowedTools` or `--tools` entry names Glob or Grep. Both
 addon loaders swallow failure, so **exit 0 is not evidence that the asset wiring
 works**.
 
@@ -106,7 +115,8 @@ call that guards native image processing, so a default build resizes a large
 image instead of erroring — scoped to that one call site because flipping
 `Bun.isStandaloneExecutable` globally is measured to make `Grep` answer `No
 matches found` for a string that exists: a wrong answer, not an error.
-`NRC_NO_IMAGE_SHIM` (any non-empty value) builds the old artifact;
+`NRC_NO_IMAGE_SHIM` (any non-empty value) builds the old artifact, bar the
+embedded-search gate rewrite, which has no opt-out;
 `scripts/ab-equivalence.sh` reproduces the three-way A/B against a committed
 loopback mock ([`docs/findings.md`](docs/findings.md) §10, Linux-only).
 
@@ -168,7 +178,12 @@ One consequence to know about: under a native install `process.execPath` *is*
 `claude`; here it is **bun**, and the CLI unconditionally exports
 `CLAUDE_CODE_EXECPATH=<bun>` into every shell it spawns. Setting that variable
 yourself does nothing — the CLI never reads it
-([`docs/runbook.md`](docs/runbook.md) § Shell integrations). Step-by-step and
+([`docs/runbook.md`](docs/runbook.md) § Shell integrations). The shell
+functions that ran it as `grep` and `find` are gone from every build since
+2026-09-23. On an older artifact, start it with
+`--allowedTools='Glob(/nonexistent/**)'`: naming Glob switches Claude's own opt-in on,
+and a rule for a directory that does not exist grants nothing. A bare
+`--allowedTools=Grep` works too, but it also pre-approves Grep on every path. Step-by-step and
 troubleshooting: [`docs/runbook.md`](docs/runbook.md); on a Mac, read the
 section below first.
 
@@ -361,7 +376,7 @@ its consequences.
   ([`docs/runbook.md`](docs/runbook.md) step 1); nothing on *this* host has ever
   unzipped or executed a darwin Bun.
 - **The rest of the equivalence gap on macOS** — sandbox, ripgrep, install
-  identity — and **the `Makefile`**, whose macOS dialect is enforced by
+  identity, and search, where a Bash `grep`/`find` is BSD's — and **the `Makefile`**, whose macOS dialect is enforced by
   `tests/test_makefile.py` on Linux but which the Mac run, predating that file,
   never invoked.
 

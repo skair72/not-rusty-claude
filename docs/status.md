@@ -24,7 +24,8 @@ embedded ripgrep becomes a system `rg`, and install identity reports `unknown`.
 Since 2026-08-23 `postprocess.py` rewrites the *one* gate call that guards native
 image processing, so a default build can resize a large image; every other gate
 stays false, deliberately, and `NRC_NO_IMAGE_SHIM` set to any non-empty value
-builds the old artifact. Read [findings.md](./findings.md) **§10** before relying
+builds the old artifact, bar the embedded-search gate rewrite, which has no
+opt-out. Read [findings.md](./findings.md) **§10** before relying
 on this build.
 
 Lead with `doctor` or `mcp list`, never `--version`: it initialises **0** lazy
@@ -48,7 +49,8 @@ between here and there is the record of the legacy single-file builds.
 
 Verified 2026-09-22 on linux-x64 `/usr/bin/claude` 2.1.280 under stock Bun
 1.3.14 by `scripts/harness.py` (`make harness`), which runs every scenario
-through the native binary **and** the artifact and compares them.
+through the native binary **and** the artifact and compares them. Re-run in
+full on 2026-09-23, 30 checks all PASS, once the search checks were added.
 
 | Capability | linux-x64 · ELF · 2.1.280 |
 |---|---|
@@ -57,11 +59,11 @@ through the native binary **and** the artifact and compares them.
 | Text modules | ✅ 84/84 `require()` to the native string |
 | Non-interactive commands | ✅ `--version`, `--help`, `mcp list`, `mcp add/get/remove`, `plugin list`, `auth status`: exit code, stdout and stderr equal at every step; `doctor` bar install identity and search |
 | Self-spawns | ✅ Claude's own Claude-in-Chrome MCP config, spawned as Claude spawns it, reaches the server — it needed the entry added to its args, because `process.execPath` is bun here (findings §14); the hooks Worker gets `Bun.ant` as the main thread does |
-| Agentic turns through a loopback mock | ✅ 8 turns: tool results equal and request bodies equal after normalising paths, session ids and the device id; the 3000×3000 PNG resized to the same 2000×2000 bytes |
+| Agentic turns through a loopback mock | ✅ 9 turns: tool results equal and request bodies equal after normalising paths, session ids and the device id; the 3000×3000 PNG resized to the same 2000×2000 bytes. A Bash `grep`/`find` answers as a system one does, where it used to print Bun's help. Native runs every session under its own Glob/Grep opt-in (`--allowedTools=Glob(…)`), and `agentic:search-optin` pins what that opt-in changes on native in a `-p` turn (findings §10, *Embedded search*) |
 | Interactive TUI (pty, screens through `scripts/vtscreen.py`) | ✅ onboarding, a REPL turn, and a REPL turn full of CJK/emoji/bidi/table/code — screens identical cell for cell with styles and links, bar the random spinner verb and clock (and onboarding's random logo sparkles); the REPL exits 0 with the terminal restored |
 | `Bun.ant` polyfill | ✅ `CellSegmenter` fuzzed against the native class; `getPeerPid`/`getPeerUid`/`setDumpable` via `bun:ffi`; `memoryPressureLevel` throws as native does off macOS |
 | Runs under Node ≥ 24 | ⛔ not yet: `import.meta.require`, ESM ignoring `NODE_PATH`, and `ERR_REQUIRE_CYCLE_MODULE` (findings §14) |
-| Behaves the same as the native binary | ⚠️ the legacy gaps (sandbox, ripgrep, install identity), plus 3–8× slower startup, plus one latent gap: built-in plugin hooks resolve to a dev-tree `hooks/register.ts` outside a standalone — not reachable in any configuration the harness can create (findings §14) |
+| Behaves the same as the native binary | ⚠️ the legacy gaps (sandbox, ripgrep, install identity), plus search tools: the artifact runs native's Glob/Grep opt-in configuration, with Glob and Grep offered and Bash `grep`/`find` the system's, because bun has no embedded ugrep/bfs (findings §10). Also 3–8× slower startup, plus one latent gap: built-in plugin hooks resolve to a dev-tree `hooks/register.ts` outside a standalone — not reachable in any configuration the harness can create (findings §14) |
 | darwin / win32 2.1.280 | not measured: no code-split Mach-O or PE has been examined |
 
 ---
@@ -309,6 +311,9 @@ exit path (findings §14).
   shim, selecting the image branch's own gate call by shape. A **global** flip is
   not the fix and never was — it breaks search silently, which is now a *case* in
   `scripts/ab-equivalence.sh` rather than a paragraph.
+- **Fixed differently, for search** ✅ (findings §10, *Embedded search*): Bash
+  `grep`/`find` ran bun. The embedded-search gate is rewritten to `false`, which
+  is native's own Glob/Grep opt-in configuration rather than its default.
 - **Still open, deliberately:** the seccomp sandbox, embedded ripgrep and install
   identity stay on their non-standalone branches; findings §10 tabulates why each
   refusal is a refusal. A shimmed build still reports `Running: unknown` and
@@ -356,11 +361,14 @@ findings §9.
 - **The remaining gate branches were read, not exercised.** Of the gate call
   sites findings §6 counts, the shim touches exactly one; four branches have an
   A/B measurement behind them, all reproducible with `scripts/ab-equivalence.sh`.
-- **`CLAUDE_CODE_EXECPATH`.** The CLI **never reads** it and unconditionally
-  *writes* it as `process.execPath` — now the bun binary — into every spawned
-  shell's environment, where the generated `find`/`grep` shell functions fall
-  back to it. Read from source, not observed live
-  ([runbook.md](./runbook.md) § Shell integrations, findings §6).
+- **The search configuration off Linux and off bash.** Since 2026-09-23 the
+  artifact runs native's Glob/Grep opt-in (findings §10, *Embedded search*): a
+  Bash `grep`/`find` is the host's own. That is measured here with GNU tools
+  under bash only. zsh and Windows shells use the same generator and the same
+  gate, so they are covered by construction, but they have not been run. BSD
+  `grep`/`find` on a Mac have not been run either. `CLAUDE_CODE_EXECPATH` is
+  still exported as bun into every spawned shell; nothing of Claude's reads it
+  once the shadowing is off ([runbook.md](./runbook.md) § Shell integrations).
 - **Universal vs thin addons.** Some darwin `.node` files are universal
   (x86_64 + arm64), others thin arm64; the linux ones are ELF. Matters only if
   you mix architectures.
