@@ -169,6 +169,7 @@ fi
 # anything: every rewritten module must parse and keep exactly the import
 # records it had (scripts/verify-tree.js). postprocess.py judges each
 # reference from the text around it; this is the check that does not.
+VERIFIED=
 if [ "$SHAPE" = esm ]; then
   if [ -n "$BUN_BIN" ] && [ -x "$BUN_BIN" ]; then
     info "verifying the rewired tree with bun's parser"
@@ -176,8 +177,28 @@ if [ "$SHAPE" = esm ]; then
       || die "the rewired tree failed verification - nothing was swapped in:
        $VERIFY_OUT"
     info "  $VERIFY_OUT"
+    VERIFIED=1
   else
     warn "no bun: the rewired tree was NOT checked by a parser (scripts/verify-tree.js)"
+  fi
+fi
+
+# 4''. original/ is the verbatim extraction: postprocess.py's input and the
+# parser check's reference, and as big as root/ itself (47 MB on 2.1.280).
+# Nothing reads it at runtime, so once the check has passed it goes. It stays
+# when NRC_KEEP_ORIGINAL is set (any non-empty value), to re-run the check on
+# a hand-edited root/ or diff against it - and when the check did not run,
+# because then it is the only way to run it later.
+if [ "$SHAPE" = esm ]; then
+  if [ -z "$VERIFIED" ]; then
+    warn "kept original/ so the check can still be run once bun is installed:"
+    warn "  bun $HERE/scripts/verify-tree.js $WORK"
+  elif [ -n "${NRC_KEEP_ORIGINAL:-}" ]; then
+    info "kept original/ (NRC_KEEP_ORIGINAL is set)"
+  else
+    rm -rf "$STAGE/original"
+    info "removed original/, the verbatim extraction, now the check has passed"
+    info "  (NRC_KEEP_ORIGINAL=1 keeps it, to re-check or diff a hand-edited root/)"
   fi
 fi
 

@@ -16,12 +16,21 @@
 // Our own files (the entry, the polyfill) and the text-module wrappers must
 // parse too. Prints one JSON line; exits 1 on any problem. Run by
 // scripts/build.sh before a build is swapped in, and by scripts/harness.py.
+// It needs original/, which build.sh deletes once this has passed unless
+// NRC_KEEP_ORIGINAL is set; without it, it exits 2 and says so.
 "use strict";
 const fs = require("fs");
 const path = require("path");
 
 const dir = path.resolve(process.argv[2] || ".");
 const manifest = JSON.parse(fs.readFileSync(path.join(dir, "manifest.json"), "utf8"));
+if (!fs.existsSync(path.join(dir, manifest.tree))) {
+  // exit 2, not 1: nothing was checked, so nothing was found wrong either
+  console.error(`verify-tree: ${path.join(dir, manifest.tree)} is gone - build.sh removes the ` +
+    "verbatim extraction once this check has passed. Rebuild with NRC_KEEP_ORIGINAL=1 to " +
+    "check the tree again (after editing root/, say).");
+  process.exit(2);
+}
 const JS = new Set(["js", "jsx", "ts", "tsx"]);
 const VFS = "/$bunfs/root/";
 const transpiler = new Bun.Transpiler({ loader: "js" });
