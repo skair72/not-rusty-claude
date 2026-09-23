@@ -724,12 +724,16 @@ A **missing-API error** — a `TypeError` naming a `Bun.*` property that does no
 exist — is the unambiguous signal. To tell them apart, rebuild in the
 pragma-preserving shape and try again: if that runs, the wrapper panic was ours.
 
-**The risk remains real going forward:** if a future Claude build uses Bun APIs
-newer than 1.3.14, its `cli.js` will not run on Zig, and the only newer Bun is
-the Rust rewrite. Nothing measured so far comes close. Mitigations: pin Claude
-to the last version that still runs on 1.3.14 (keep its `build/extract/`), or
-shim the newer APIs. If it ever happens, record the first version that breaks
-here.
+**The risk materialised with 2.1.280, in a softer form than feared** (§14).
+That build is compiled on Bun 1.4.3 - Anthropic's private fork of it - and
+calls `Bun.ant`, which no stock Bun has, so it does not run on 1.3.14 as
+extracted. It was recoverable because the missing surface is small enough to
+port and measure against the real thing: a JavaScript `Bun.ant`, validated
+against the native class through the binary's own `BUN_OPTIONS` preload. And
+the signal was not the `TypeError` this section predicted: `mcp list` printed
+nothing and died of `SIGKILL`, because the missing API was first reached in
+Claude's exit path. The general risk stands: a build that needs a Bun API too
+large or too native to port would force a pin to the last working version.
 
 ### Generalisation: newer Claude builds ✅
 
@@ -1429,7 +1433,34 @@ Widths come from a per-code-point scan of the native class over all of
 
 The port was fuzzed against the native class to equality. After that, 32,696
 generated cases in two index windows nobody had tuned against gave 0
-mismatches. The golden record the suite replays is 5,904 cases.
+mismatches. `make harness`'s own default window still found one case that
+differed (`paint()` at a negative x over a pre-filled row) in the port's
+revision of that hour; the next revision matched it. The final revision: 0
+mismatches over the characterisation's 51,636 corpus cases, 610,000 random
+cases, 1.2 million texts and full code-point and code-unit scans. On typical
+Claude lines `segment()` + `paint()` run at 1.12× native under Bun 1.3.14
+(1.66× under Node 24). The golden record the suite replays is 4,204 cases
+(every hand-built one, 300 generated), stored with their native answers'
+hashes.
+
+**Two self-spawns, and why they needed help.** Claude's Claude-in-Chrome MCP
+config is `{command: process.execPath, args: ["--claude-in-chrome-mcp"]}`,
+with no non-standalone branch in 2.1.280. Natively `process.execPath` is
+claude; here it is bun, and `bun --claude-in-chrome-mcp` prints Bun's help and
+exits 0 (measured), so the server never starts. `postprocess.py` adds the entry
+(`process.argv[1]`) to those args, as every other self-spawn in the build does
+outside a standalone. The harness calls Claude's own config function on both
+sides and spawns what it returns; with the rewrite undone, that check fails.
+The hooks Worker is a realm of its own, and the native Worker has `Bun.ant`, so
+the one JavaScript module reached by path rather than import gets the polyfill
+as its first import.
+
+**Checked by a parser, not only by regexes.** `postprocess.py` classifies each
+reference from the text around it. `scripts/verify-tree.js` checks the result
+with Bun's own parser: every rewritten module must parse, and must keep exactly
+the import records the original had - same count, kinds, order and targets.
+On 2.1.280 that is 140,332 records over 1,975 modules, in about 5 s. `build.sh`
+runs it before a build is swapped in.
 
 **A latent gap: built-in plugin hooks.** Outside a standalone, a built-in
 plugin registers its hooks module as `{module, folder: import.meta.dir}`

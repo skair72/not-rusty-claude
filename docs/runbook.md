@@ -236,9 +236,16 @@ requires `cli.original.cjs`), so `build/extract/cli.js` works in both shapes.
   build/extract/cli.original.cjs --outfile=/dev/null
 ```
 
-For a code-split build there are 2,062 modules to check, not one file:
-`scripts/harness.py --only structure,parse` parses every one of them with Bun's
-own transpiler and resolves every rewritten specifier and runtime path.
+For a code-split build there are 2,062 modules to check, not one file, and
+`build.sh` has already done it: `scripts/verify-tree.js` makes Bun's own parser
+accept every module and confirms each kept exactly its original import records.
+To re-run it, or the harness's structure check as well, point them at the
+artifact:
+
+```bash
+"$BUN_BIN" scripts/verify-tree.js build/extract
+scripts/harness.py --only structure,parse --artifact build/extract/cli.js
+```
 
 This is Bun's **own** parser/transpiler, the same one that will load the file —
 the authoritative syntax check (~2 s). `scripts/syntax-check.js` is a faster
@@ -250,7 +257,9 @@ Do not rely on it alone.
 
 ## 4. Run it — by full path
 
-Start with `doctor` or `mcp list`, **not** `--version`:
+Start with `doctor` or `mcp list`, **not** `--version`. The commands below name
+the legacy artifact; for a code-split build (2.1.280+) run
+`build/extract/cli.js` instead - it is also a valid entry for a legacy build.
 
 ```bash
 DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$(mktemp -d)" \
@@ -440,7 +449,7 @@ Two things to expect:
 | `Expected CommonJS module to have a function wrapper` | **Ambiguous** — Bun older than 1.3.14, *or* the pragma/IIFE transform did not apply, *or* the pragma was kept **and** the IIFE appended (findings §6's 2×2). Not a reliable "Claude needs a newer Bun" canary | Confirm `bun --version` ≥ 1.3.14; confirm `cli.original.cjs` starts with `(function` and ends with the `(exports, require, module, …)` call |
 | `TypeError: … is not a function` naming a `Bun.*` property | **This** is the missing-API signal — findings §9's risk | Pin to an older Claude version, or shim the API |
 | `mcp list` prints nothing and exits 137 (`SIGKILL`); or `This build of @anthropic-ai/bun-internal has no Bun.ant.CellSegmenter` | A code-split build run **without** its `Bun.ant` polyfill: Ink throws on unmount inside `process.exit()`, and Claude's `forceExit()` answers that with `SIGKILL` (findings §14) | Run `build/extract/cli.js`, not `root/cli.js`; rebuild if `bun-ant.mjs` is missing beside it |
-| `import.meta.require is not a function` / `ERR_REQUIRE_CYCLE_MODULE` under Node | A code-split (2.1.280+) build under Node. Not supported yet: Node has no `import.meta.require`, and refuses `require()` of an ES module inside an import cycle that Bun allows (findings §14) | Run it under Bun; `make node-run` refuses a code-split build for this reason |
+| `TypeError: (intermediate value).require is not a function` / `ERR_MODULE_NOT_FOUND` for `ws` / `ERR_REQUIRE_CYCLE_MODULE` under Node | A code-split (2.1.280+) build under Node. Not supported yet: Node has no `import.meta.require`, and refuses `require()` of an ES module inside an import cycle that Bun allows (findings §14) | Run it under Bun; `make node-run` refuses a code-split build for this reason |
 | Images are refused with *"Unable to resize image…"* | **Not expected in a default build.** It means the artifact predates the shim, was built with `NRC_NO_IMAGE_SHIM` non-empty, or the shim refused on this Claude release | `grep -o 'if(true)try' build/extract/cli.original.cjs \| wc -l` prints **1** for a shimmed build and **0** for an as-shipped one (measured on all three real binaries). If 0, rebuild without the env var and read the `image shim` lines: a refusal names which of three things drifted — the gate **declaration**'s minified shape, the **anchor** string, or the `if(<gate>())try{` branch shape (findings §10). Never "fix" it by flipping `Bun.isStandaloneExecutable` globally: measured, that silently breaks `Grep` |
 | `ripgrep not found on PATH` | Embedded ripgrep needs a standalone; this build uses a system `rg` (findings §10) | Install `ripgrep` |
 | Missing `rg` does **not** always announce itself | Observed 2026-08-26 on a Mac with no ripgrep: the file-scan spawns fail with `ENOENT` and the TUI simply never paints - no message, no error, no exit. The failure is silent because the spawn error arrives asynchronously; `scripts/node-trace.cjs` is what made it visible, and only after it learned to follow children to their exit | `command -v rg` before blaming the runtime. Note `USE_BUILTIN_RIPGREP` cannot substitute: the embedded copy is gated behind standalone mode, which this build is not |

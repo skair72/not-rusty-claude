@@ -53,14 +53,15 @@ through the native binary **and** the artifact and compares them.
 | Capability | linux-x64 · ELF · 2.1.280 |
 |---|---|
 | Extract (esm tree + manifest) | ✅ 2,196 modules: 1,975 js, 84 text (20 of them UTF-16LE), 135 file, 2 napi |
-| Rewire + parse | ✅ 138,198 relative specifiers and 485 runtime-absolute paths, all resolving; 2,062 modules parsed by Bun |
+| Rewire + parse | ✅ 138,195 specifiers made relative and 485 paths made runtime-absolute, all resolving; Bun's parser accepts all 2,062 modules and each keeps exactly its original import records (140,332) — `scripts/verify-tree.js`, run by `build.sh` before a build is swapped in |
 | Text modules | ✅ 84/84 `require()` to the native string |
-| Non-interactive commands | ✅ `--version`, `--help`, `mcp list`, `mcp add/get/remove`, `plugin list`, `auth status` byte-equal; `doctor` bar install identity |
-| Agentic turns through a loopback mock | ✅ 8 turns: tool results and full request bodies byte-equal, the 3000×3000 PNG resized to the same 2000×2000 bytes |
-| Interactive TUI (pty, screens through `scripts/vtscreen.py`) | ✅ onboarding, a REPL turn, and a REPL turn full of CJK/emoji/bidi/table/code — whole screens identical; clean exit |
+| Non-interactive commands | ✅ `--version`, `--help`, `mcp list`, `mcp add/get/remove`, `plugin list`, `auth status`: exit code, stdout and stderr equal at every step; `doctor` bar install identity and search |
+| Self-spawns | ✅ Claude's own Claude-in-Chrome MCP config, spawned as Claude spawns it, reaches the server — it needed the entry added to its args, because `process.execPath` is bun here (findings §14); the hooks Worker gets `Bun.ant` as the main thread does |
+| Agentic turns through a loopback mock | ✅ 8 turns: tool results equal and request bodies equal after normalising paths, session ids and the device id; the 3000×3000 PNG resized to the same 2000×2000 bytes |
+| Interactive TUI (pty, screens through `scripts/vtscreen.py`) | ✅ onboarding, a REPL turn, and a REPL turn full of CJK/emoji/bidi/table/code — screens identical cell for cell with styles and links, bar the random spinner verb and clock (and onboarding's random logo sparkles); the REPL exits 0 with the terminal restored |
 | `Bun.ant` polyfill | ✅ `CellSegmenter` fuzzed against the native class; `getPeerPid`/`getPeerUid`/`setDumpable` via `bun:ffi`; `memoryPressureLevel` throws as native does off macOS |
 | Runs under Node ≥ 24 | ⛔ not yet: `import.meta.require`, ESM ignoring `NODE_PATH`, and `ERR_REQUIRE_CYCLE_MODULE` (findings §14) |
-| Behaves the same as the native binary | ⚠️ the legacy gaps (sandbox, ripgrep, install identity), plus 4–7× slower startup, plus one latent gap: built-in plugin hooks resolve to a dev-tree `hooks/register.ts` outside a standalone — not reachable in any configuration the harness can create (findings §14) |
+| Behaves the same as the native binary | ⚠️ the legacy gaps (sandbox, ripgrep, install identity), plus 3–8× slower startup, plus one latent gap: built-in plugin hooks resolve to a dev-tree `hooks/register.ts` outside a standalone — not reachable in any configuration the harness can create (findings §14) |
 | darwin / win32 2.1.280 | not measured: no code-split Mach-O or PE has been examined |
 
 ---
@@ -292,7 +293,9 @@ wrapper` is **ambiguous** — it means the module *shape* was rejected, which
 covers a too-old Bun, a pragma/IIFE problem, *and* this project's own transform.
 Rebuild in the pragma-preserving shape to tell them apart (findings §9). Only a
 `TypeError` naming a missing `Bun.*` property means findings §9's risk
-materialised.
+materialised — or, as 2.1.280 showed, a command that prints nothing and dies
+of `SIGKILL` (exit 137), when the missing API is first reached inside Claude's
+exit path (findings §14).
 
 ### 3. Close the equivalence gap ⚠️
 
@@ -375,9 +378,12 @@ findings §9.
 
 - **Don't loosen the integration tests' hardcoded counts** to make a new Claude
   version pass. They are a tripwire; a failure means "go re-measure".
-- **Don't decode any module's stored content.** Stored content is *always* raw
-  bytes, whatever the loader id says — including a genuine `base64`-loader
-  module. The `.node` addons are `napi`-loader (byte 10) and are raw ELF/Mach-O
+- **Don't decode any module's stored content as its loader suggests.** Stored
+  content is *always* raw bytes, whatever the loader id says — including a
+  genuine `base64`-loader module. The one decoding this repo does is the one the
+  runtime does: a code-split build's JavaScript and `text` modules are read with
+  the encoding their own record gives (offset 48: Latin-1 or UTF-16LE,
+  findings §14). The `.node` addons are `napi`-loader (byte 10) and are raw ELF/Mach-O
   (findings §5a).
 - **Don't transcribe the loader enum from another extractor.** Read it from Bun's
   `src/bundler/options.zig` at the matching tag. Doing otherwise is how

@@ -3,7 +3,9 @@
 Run Claude Code on a **pre-Rust (Zig-era) Bun** — the runtime before Bun's
 Zig→Rust rewrite — by extracting its JavaScript out of the native binary and
 running it under a stock **Bun 1.3.14**. The signed binary is only ever *read*:
-never modified, never executed by this pipeline.
+never modified, never executed by this pipeline. (`make harness` does run it -
+that is what an artifact-vs-native comparison is - in a throwaway `HOME` with a
+loopback mock as its API.)
 
 > **Why.** Claude Code ships as a Bun *standalone* executable — runtime and app
 > baked into one signed binary (Mach-O on macOS, ELF on Linux, PE on Windows).
@@ -37,17 +39,19 @@ against `/usr/bin/claude` 2.1.280, under stock Bun 1.3.14:
 
 | check | artifact vs native |
 |---|---|
-| structure, parse | 138,198 specifiers and 485 runtime paths resolve; 2,062 modules parse |
+| build, structure, parse | 138,195 specifiers made relative and 485 paths made runtime-absolute; Bun's own parser accepts all 2,062 modules, and each keeps exactly the import records it had (140,332) |
 | text modules | all 84 `require()` to the native string (sha256 + length) |
-| `--version`, `--help`, `mcp list`, `mcp add`/`get`/`remove`, `plugin list`, `auth status` | stdout and exit code **equal** |
-| `doctor` | equal bar the install-identity lines, which are the [equivalence gap](docs/findings.md) |
-| 8 mock-API agentic turns: text, Bash, Read, Read of a 3000×3000 PNG, Grep, Write, Glob, function hooks | tool results **and the full request bodies** byte-equal |
-| TUI under a pty: onboarding, a REPL turn, a REPL turn full of CJK, emoji, bidi text, a table and a code block | **whole screens identical**; exit code 0; terminal restored |
-| `Bun.ant` members, probed inside the native runtime | identical answers |
+| `--version`, `--help`, `mcp list`, `mcp add` → `get` → `remove` → `list`, `plugin list`, `auth status` | exit code, stdout **and** stderr equal, at every step |
+| `doctor` | equal bar the install-identity and search lines, which are the [equivalence gap](docs/findings.md) |
+| the Claude-in-Chrome MCP server, and Claude's own config for it spawned as Claude spawns it | an MCP `initialize` answered identically |
+| 8 mock-API agentic turns: text, Bash, Read, Read of a 3000×3000 PNG, Grep, Write, Glob, function hooks | tool results equal, and the full request bodies equal once per-run paths, session ids and the random device id are normalised |
+| TUI under a pty: onboarding, a REPL turn, a REPL turn full of CJK, emoji, bidi text, a table and a code block | screens identical cell for cell, **styles and hyperlinks included** — bar the randomly chosen spinner verb and the clock, and onboarding compared below its randomly sparkling logo; same requests; the REPL exits 0 with the terminal restored |
+| `Bun.ant`, probed inside the native runtime with a real peer process | 27 answers identical |
+| `CellSegmenter`, fuzzed against the native class | 0 mismatches (3,000 cases per harness run; 610,000 in development) |
 
 **What it is not.** The same gaps apply as before: the sandbox is off, ripgrep
 is the system `rg` and install identity reads `unknown`. On top of that,
-startup is **4–7× slower** than native (`--help` takes 1.2 s against 0.16 s),
+startup is **3–8× slower** than native (`--help` takes 1.2 s against 0.16 s),
 because the native runtime runs JSC bytecode that a different WebKit build
 cannot load. A code-split build does **not** run under Node yet
 ([§ Under Node](#under-node-instead-of-bun)). The table below is the record for
@@ -154,9 +158,11 @@ Claude's own code resolves a sibling `cli.js` for two MCP self-spawns.)
 **No native `claude` on this machine?** Download one — no install, no npm, no
 Mac needed. The manifest lists **eight** platforms, `linux-x64` and `linux-arm64`
 among them plus `-musl` variants; the runnable fetch → verify →
-delete-on-mismatch flow is [`docs/findings.md`](docs/findings.md) §8. Nothing
-here has *extracted* a downloaded Linux copy: the Linux figures come from the
-pre-installed `/usr/bin/claude` 2.1.222.
+delete-on-mismatch flow is [`docs/findings.md`](docs/findings.md) §8. The
+legacy Linux figures came from the pre-installed `/usr/bin/claude` 2.1.222;
+since that became 2.1.280, the legacy-shape tests run on a downloaded 2.1.231
+(`~/.cache/not-rusty-claude/claude-linux-x64.bin`), extracted here like any
+other.
 
 One consequence to know about: under a native install `process.execPath` *is*
 `claude`; here it is **bun**, and the CLI unconditionally exports
@@ -450,7 +456,10 @@ BUN_BIN=/nonexistent/bun HOME="$(mktemp -d)" \
 (Where pytest is installed system-wide, `--user-site` names a directory that
 need not exist and the `PYTHONPATH` is a harmless no-op.)
 
-Point the tests at binaries with `NRC_TEST_ELF` (default `/usr/bin/claude`) and
+Point the tests at binaries with `NRC_TEST_ELF` (a **legacy**-shape ELF; by
+default the first of `/usr/bin/claude` and the cached
+`~/.cache/not-rusty-claude/claude-linux-x64.bin` whose entry module is CommonJS),
+`NRC_TEST_ESM` (a **code-split** ELF, 2.1.280+; default `/usr/bin/claude`) and
 `NRC_TEST_MACHO` (default `/tmp/ccmac/package/claude-darwin-arm64.bin`; the older
 `/tmp/ccmac/package/claude` is still accepted), and at a Bun with `BUN_BIN`
 (default `~/.bun-1.3.14/bun`, then `bun` on `PATH`). The integration tests'

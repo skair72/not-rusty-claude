@@ -1,11 +1,13 @@
 # Claude Code 2.1.280: a code-split ESM build on a private Bun
 
 **Date:** 2026-09-22
-**Status:** design of record for branch `claude/claude-2-1-280`. Work in
-progress; the verification harness below is the definition of done.
+**Status:** design of record for branch `claude/claude-2-1-280`. Implemented,
+and reconciled with a four-dimension review of the branch: what the review
+changed is marked **Changed after review**. The verification harness below is
+the definition of done.
 
 The host's `/usr/bin/claude` moved from 2.1.222 to **2.1.280**, and the
-pipeline stopped working on it: `build.sh` failed with five fatal errors.
+pipeline stopped working on it: `build.sh` failed with four fatal errors.
 Two changes in how Anthropic builds the binary explain all of them:
 
 1. **The graph is code-split ESM.** The legacy shape was one CommonJS entry
@@ -47,11 +49,23 @@ ASCII), 2 = **UTF-16LE** (20 text modules; UTF-8 decoding rejects 16 of them).
 | `Re("…")` (`Re = import.meta.require` of the shared helper chunk), path constants, `HOOKS_WORKER_URL` | `(import.meta.dirname+"/…")` | these resolve against *another* module, or reach `fs` |
 | a `text` module | a CommonJS wrapper `<name>.cjs` exporting the exact string | native `require()` returns the raw string; stock Bun returns `{default}` and renders `.md` **to HTML** |
 
-The extensionless entry becomes `root/cli.js`. A bare VFS prefix constant
+The extensionless entry becomes `root/cli.js`. The Windows VFS prefix constant
 (`"B:/~BUN/root/"`) is left alone and counted. Fatal: an unknown target, a
-text module reached other than by a call, any surviving `/$bunfs/` path, a
+text module reached other than by a call to `import.meta.require` or a name
+bound to it, any surviving `/$bunfs/` path (a bare POSIX prefix included), a
 module that cannot be decoded with its recorded encoding, a sha256 mismatch
-between `original/` and the manifest.
+between `original/` and the manifest, two modules bound for one output file.
+
+**Changed after review:**
+- `root/` is built in a staging directory, so a failed re-run leaves the
+  previous artifact whole.
+- The regex-driven rewrite is checked by a parser: `scripts/verify-tree.js`
+  makes Bun accept every module and keep exactly the import records it had.
+  `build.sh` runs it before swapping a build in.
+- Two self-spawn concerns were added: the Claude-in-Chrome MCP config gains the
+  entry as its first argument, since `process.execPath` is bun here. The one
+  module reached by path (the hooks Worker) gets the polyfill as its first
+  import.
 
 The artifact's entry is **`extract/cli.js`**, ours:
 
@@ -75,7 +89,9 @@ binary.
   native class until byte-equal (cells, runs, tables, painted screens, return
   values).
 - `getPeerPid/Uid` — `SO_PEERCRED` via `bun:ffi` on Linux; `null` where the
-  native returns `null` (not a socket), measured.
+  native returns `null` (not a socket), measured. **Changed after review:** the
+  argument is coerced like ToNumber, as native does, measured with a real peer
+  process on the socket.
 - `setDumpable` — `prctl(PR_SET_DUMPABLE)` via `bun:ffi`; throws where FFI is
   unavailable, which the call site reports as "prctl unavailable".
 - `memoryPressureLevel` — throws the native Linux message verbatim; macOS is
@@ -95,14 +111,19 @@ native binary where comparison is meaningful, and prints PASS/FAIL with
 evidence plus a JSON report. The development loop is: run it, fix the first
 failure, run it again, until it is green.
 
-1. extract + post-process succeed, with the counts above;
-2. every emitted module parses under Bun 1.3.14;
+1. extract + post-process succeed, with counts that add up to the manifest;
+2. every emitted module parses under Bun 1.3.14 and keeps its import records;
 3. all 84 text modules `require()` to the same string as native;
-4. `--version`, `--help`, `mcp list`, `config ls`: stdout and exit code equal
-   to native; `doctor` equal bar the documented lines;
+4. `--version`, `--help`, `mcp list`, an `mcp add`/`get`/`remove`/`list`
+   round trip, `plugin list`, `auth status`: exit code, stdout and stderr equal
+   to native at every step; `doctor` equal bar the documented lines; the
+   Claude-in-Chrome MCP server, started directly and through Claude's own
+   config for it;
 5. mock-API agentic turns (Bash, Read of a text file, Read of a 3000×3000 PNG,
-   Grep, Write) produce equivalent tool results to native;
-6. the interactive TUI under a pty: onboarding renders; the authenticated REPL
-   answers a prompt through the mock and exits cleanly;
+   Grep, Write, Glob, function hooks) produce equal tool results and request
+   bodies;
+6. the interactive TUI under a pty: onboarding, a REPL turn and a unicode-heavy
+   REPL turn draw identical screens, styles and links included, and exit
+   cleanly;
 7. `Bun.ant.CellSegmenter`: the fuzz corpus is byte-equal to native;
 8. the pytest suite passes.
