@@ -421,7 +421,7 @@ def test_without_bun_original_is_kept_for_the_check_that_did_not_run(tmp_path):
 
 # The embedded-search gate, its find/grep shadow generator and the snapshot
 # builder's comment, cut down from 2.1.280's chunk-1xqpf2j8.js. A build that
-# rewrites the gate runs what native runs under --allowedTools=Grep - Glob and
+# rewrites the gate runs what native runs under its Glob/Grep opt-in - Glob and
 # Grep offered, Bash grep/find the system's - which is a difference from the
 # native DEFAULT, so the summary has to name it (docs/findings.md 10).
 SEARCH_GATE_JS = (

@@ -9,15 +9,15 @@ path is bun, so every Bash-tool grep printed Bun's help text and was reported
 as success (docs/findings.md §10). One gate decides it, and its first clause is
 the build-time constant EMBEDDED_SEARCH_TOOLS, inlined as `isEnvTruthy("true")`.
 postprocess.py rewrites that constant to `false` in the gate's declaration, so
-the artifact runs the configuration native runs under its own
-`--allowedTools=Grep` opt-in.
+the artifact runs the configuration native runs under its own Glob/Grep
+opt-in (any --allowedTools or --tools entry naming Glob or Grep).
 
 Three properties are under test.
 
 *One edit, in the declaration.* Not asserted by spot checks alone: the output
 is reconstructed with the single known edit undone and must equal the input.
-The gate's call sites and the other `isEnvTruthy("true")` flags (2.1.280 has
-seven, six of them something else) must not move.
+The gate's call sites and the other `isEnvTruthy("true")` sites (2.1.280 has
+seven) must not move.
 
 *Tied to the bug.* The rewrite is licensed because this gate guards the
 find/grep shadowing, so the generator is located too and its guard must call
@@ -63,7 +63,9 @@ CONSUMER_280 = ('function vAn(){let g="";let h=gAn();if(h!==null)g+=`\n'
 # one of the 16 call sites: the Glob/Grep tool disallow set
 CALLS_280 = ('var GJt=new Set,qJt=new Set(["Glob","Grep"]);'
              'function $ae(){if(!zb()||!ea())return GJt;return qJt}')
-# a DIFFERENT inlined flag in the same call shape: the pure-JS .md walker @345904
+# another isEnvTruthy("true") site in the same call shape: the pure-JS .md
+# walker @345904 (which flag it inlined is lost to the build; only the gate's
+# own identity is certain)
 DECOY_280 = 'async function dR(e,n){let r=Me("true");return r}'
 
 # 2.1.231, cli.original.cjs @5476325 and @6864232: the same shapes, other names
@@ -146,13 +148,15 @@ def test_nothing_but_the_constant_in_the_declaration_moves(postprocess, shape):
     assert SHAPES[shape]["calls"] in out and SHAPES[shape]["gen"] in out
 
 
-@pytest.mark.parametrize("image_shim", [True, False])
-def test_both_image_shim_modes_apply_it(postprocess, image_shim):
-    """NRC_NO_IMAGE_SHIM builds the as-shipped half of the image A/B; it must
-    not also bring back the bun-as-ugrep bug, and the two halves must differ
-    only in the image gate."""
-    out, counts = postprocess.transform(_legacy(), image_shim=image_shim)
-    assert counts["search_gate"] == 1 and out.count(REWRITTEN) == 1
+def test_both_image_shim_modes_apply_it(postprocess):
+    """NRC_NO_IMAGE_SHIM rebuilds the image A/B's unshimmed half; it must not
+    also bring back the bun-as-ugrep bug. With no image gate in the module the
+    two modes must then produce the same bytes (with one, test_image_shim's
+    real-binary single-edit tests show the image gate is all that differs)."""
+    on, on_counts = postprocess.transform(_legacy(), image_shim=True)
+    off, off_counts = postprocess.transform(_legacy(), image_shim=False)
+    assert on_counts["search_gate"] == off_counts["search_gate"] == 1
+    assert on.count(REWRITTEN) == 1 and on == off
 
 
 def test_a_build_with_no_gate_and_no_shadowing_is_not_applicable(postprocess):
@@ -183,6 +187,11 @@ FATAL = {
     "guard calls another gate": dict(gen=GEN_231.replace("if(!HP())", "if(!HQ())")),
     "generator drifted": dict(gen=GEN_231.replace("return null;", "return null;let q=1;")),
     "two generators": dict(decoy=GEN_231.replace("ytb", "ztb")),
+    # the gate AND both original markers drift at once; the generator's calls
+    # of the shadow-function builder still name ugrep and bfs
+    "gate and markers drifted": dict(
+        gate=GATE_231.replace('fn("true")', "fn(!0)"), consumer="",
+        gen=GEN_231.replace("unalias grep 2>/dev/null || true", "unalias grep || :")),
 }
 
 
@@ -288,6 +297,21 @@ def test_a_generator_in_another_module_than_the_gate_is_fatal(extract_bun, postp
 
     assert any("embedded-search gate" in e for e in errors), errors
     assert not (out / "root").exists(), "a failed tree build writes nothing"
+
+
+def test_an_unread_module_is_not_reported_as_a_build_without_the_gate(extract_bun, tmp_path):
+    """The graph is incomplete, so "no gate here" would describe modules
+    nobody looked at. The build fails on the unread module either way."""
+    out = _tree(extract_bun, tmp_path)
+    with open(out / "original" / "chunk-search.js", "ab") as fh:
+        fh.write(b" ")
+    r = subprocess.run([sys.executable, str(ROOT / "tools" / "postprocess.py"), str(out)],
+                       capture_output=True, text=True, env=BASE_ENV)
+
+    assert r.returncode != 0 and "sha256" in r.stderr
+    line = next(l for l in r.stdout.splitlines() if l.startswith("embedded search off"))
+    assert line.startswith("embedded search off    : 0  (not checked: 1 module(s) could not be read")
+    assert "not applicable" not in line
 
 
 def test_a_drifted_declaration_in_a_tree_is_fatal(extract_bun, postprocess, tmp_path):

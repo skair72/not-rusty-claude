@@ -32,17 +32,17 @@ What it compares, by group:
   tui        the interactive TUI under a pty, screens compared through
              scripts/vtscreen.py with styles and links: onboarding, a REPL
              turn and a REPL turn full of unicode, request bodies, clean exit
-
-Native runs every agentic and TUI session under Claude's own search-tools
-opt-in, NATIVE_SEARCH_OPTIN, because the artifact has the embedded-search gate
-rewritten to false: bun has no embedded ugrep/bfs for Bash grep/find to run
-(docs/findings.md 10). The comparison stays exact; agentic:search-optin pins
-the difference from native's default.
   bunant     Bun.ant: the polyfill against the native members, with a real
              peer process on the socket (the native binary honours
              BUN_OPTIONS=--preload, so probes run inside it)
   segmenter  CellSegmenter differential fuzz, native vs polyfill, every case
   pytest     the repo's own suite, pointed at the same native binary
+
+Native runs every agentic and TUI session under Claude's own Glob/Grep opt-in,
+NATIVE_SEARCH_OPTIN, because the artifact has the embedded-search gate
+rewritten to false: bun has no embedded ugrep/bfs for Bash grep/find to run
+(docs/findings.md 10). The comparison stays exact; agentic:search-optin pins
+what the opt-in changes on native in a -p turn.
 
 SAFETY. The native binary is executed here, unlike in the build pipeline -
 that is the point of an A/B. Every run gets a throwaway HOME and
@@ -383,11 +383,18 @@ def check_build(ctx):
                                 % (counts["modules"], len(manifest["modules"])))
         if not str(counts.get("self-spawns given entry", "")).startswith("1"):
             problems.append("the Claude-in-Chrome self-spawn was not given the entry")
-        if not str(counts.get("embedded search off", "")).startswith("1"):
-            problems.append("the embedded-search gate was not rewritten, so Bash grep/find "
-                            "would run bun as ugrep/bfs")
         if "verifying the rewired tree" not in log:
             problems.append("build.sh did not run scripts/verify-tree.js")
+    # Both graph shapes print it (docs/findings.md 10). Anything but 1 fails:
+    # without the rewrite the native side's search opt-in compares the
+    # artifact with a configuration it no longer has.
+    search = str(counts.get("embedded search off", ""))
+    if "not applicable" in search:
+        problems.append("this Claude release has no embedded-search gate: re-measure "
+                        "NATIVE_SEARCH_OPTIN and agentic:search-optin before trusting them")
+    elif not search.startswith("1"):
+        problems.append("the embedded-search gate was not rewritten (%r), so Bash grep/find "
+                        "would run bun as ugrep/bfs" % (search or "no line"))
     return [Result("build", "FAIL" if problems else "PASS",
                    "artifact %s%s" % (entry, "; " + "; ".join(problems) if problems else ""),
                    {"counts": counts})]
