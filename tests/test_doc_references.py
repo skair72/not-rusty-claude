@@ -35,7 +35,7 @@ ALLOWED = {
     "scripts/mock-messages-api.mjs": {"equivalence gap"},
     "tools/postprocess.py": {"equivalence gap", "Post-processing", "code-split"},
     "tests/test_image_shim.py": {"equivalence gap"},
-    "tests/test_build_script.py": {"equivalence gap"},
+    "tests/test_build_script.py": {"equivalence gap", "code-split"},
 }
 
 
