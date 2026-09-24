@@ -190,7 +190,7 @@ def first_diff(a, b):
 class Mock:
     """scripts/mock-messages-api.mjs on an ephemeral loopback port."""
 
-    def __init__(self, ctx, tag, tool="none", tool_input=None, text="MOCK-DONE"):
+    def __init__(self, ctx, tag, tool="none", tool_input=None, text="MOCK-DONE", extra_argv=()):
         d = ctx.scratch("mock", tag)
         self.ready = os.path.join(d, "ready")
         self.log = os.path.join(d, "requests.log")
@@ -200,6 +200,7 @@ class Mock:
                 "--log", self.log, "--log-bodies", self.bodies]
         if tool_input is not None:
             argv += ["--tool-input", json.dumps(tool_input)]
+        argv += list(extra_argv)
         self.proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL, env={"PATH": "/usr/bin:/bin"})
         try:

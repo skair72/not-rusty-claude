@@ -171,13 +171,22 @@ for (let c = 0; c < 256; c++) SIMPLE.push(makeEntry(String(c), SLOT[c], END_OF[c
 const FIELDS = new Float64Array(33);
 
 // Canonical entry objects for extended colours and opaque sequences (so the key trie can use
-// object identity); bounded caches.
+// object identity); bounded caches. A clear gives every string seen before a NEW object, and a
+// trie keyed by the old ones would grow a second branch per list, per clear, without bound
+// (sgrKeys, deduplicated by string, stays flat, so nothing outside notices). So a clear starts a
+// new generation: the parse cache, which holds entries, is emptied with it, and internKey drops
+// a trie built in an older one.
 const ENTRY_CACHE = new Map();
+let entryGen = 0;
 function entryFor(s, slot, end, opaque) {
   const k = opaque ? "\u0001" + s : s;
   let e = ENTRY_CACHE.get(k);
   if (e === undefined) {
-    if (ENTRY_CACHE.size >= 8192) ENTRY_CACHE.clear();
+    if (ENTRY_CACHE.size >= 8192) {
+      ENTRY_CACHE.clear();
+      SGR_CACHE_KEYS.fill(null); SGR_CACHE_OPS.fill(null);
+      entryGen++;
+    }
     e = makeEntry(s, slot, end, opaque);
     ENTRY_CACHE.set(k, e);
   }
@@ -880,7 +889,7 @@ function makeState(opts) {
     amb: true, subMin: 0x7fffffff, subMax: -1, sub: null, repl: "�", replGid: 97, replWord: 1 | 512,
     MASK: 3, NARROW: 0, WIDE: 1, TAIL: 2, HEAD: 3, EC: 0, SC: 1, EW: 0, TW: 8,
     gList: [], gTab: new Int32Array(1024).fill(-1), gHash: new Int32Array(1024), g1: new Int32Array(0x10000).fill(-1), graphemes: [],
-    kList: [""], cList: [""], kMap: new Map([["", 0]]), kTrie: { idx: 0, next: null }, sgrKeys: [""], sgrCloseKeys: [""],
+    kList: [""], cList: [""], kMap: new Map([["", 0]]), kTrie: { idx: 0, next: null }, kTrieGen: entryGen, sgrKeys: [""], sgrCloseKeys: [""],
     uList: [""], uMap: new Map([["", 0]]), uris: [""],
     ucKeys: new Array(UCACHE).fill(null), ucIds: new Int32Array(UCACHE),
     // per-call scratch; last validated (cells, runs) pair
@@ -1000,6 +1009,7 @@ function internUnit(S, u) {
 function internKey(S, list) {
   const L = list.length;
   if (L === 0) return 0;
+  if (S.kTrieGen !== entryGen) { S.kTrie = { idx: 0, next: null }; S.kTrieGen = entryGen; }
   let node = S.kTrie;
   for (let r = 0; r < L; r++) {
     const e = list[r];

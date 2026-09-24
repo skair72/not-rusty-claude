@@ -1631,6 +1631,97 @@ A preload hook (`module.registerHooks`) clears the first two. The third means
 changing module evaluation order. Separately, the shim would also need
 `Bun.sliceAnsi` (Ink's clipping path) and `Bun.Image` (Read of images).
 
+## 15. Memory over a long session: no leak of the artifact's own on Linux; macOS open ⚠️
+
+**The report**, 2026-09-24: on an Apple Silicon Mac, the 2.1.280 artifact
+under stock Bun 1.3.14 held **about 18 GB after about 5 hours** of work. That
+is about 3.6 GB/h, or 60 MB/min.
+
+**How it was measured.** `scripts/memsoak.py` runs one interactive session
+through the native binary and one through the artifact, side by side under a
+pty and against the loopback mock. `scripts/memprobe.cjs` is preloaded into
+both through `BUN_OPTIONS`, which the native binary honours (§14). After a
+forced full GC it records the JSC heap with a live count per object type,
+`extraMemorySize`, RSS and mimalloc's committed bytes, so a leak shows *in
+what* as well as *how much*.
+
+**Linux, 2026-09-24**: `/usr/bin/claude` 2.1.280 against the artifact under
+Bun 1.3.14. "Retained" is RSS after the forced GC.
+
+| workload | length | native | artifact |
+|---|---|---|---|
+| 200 turns: a Bash step, then a markdown answer streamed in 40 pieces | 6-7 min | 348 MB at the end; +262 KB RSS and +93 KB heap per turn | 357 MB; +286 KB RSS and -0.7 KB heap per turn |
+| 2 turns whose Bash step sleeps 500 s, spinner animating | 17.7 min | 255 → 292 MB; retained +2.4 MB/min | 286 → 303 MB; retained +1.5 MB/min |
+| 99-108 turns, each a workflow of 4 in-process agents | 25 min | retained +4.7 MB/min, heap +1.8 MB/min; 514 MB | retained +5.7 MB/min, heap +1.7 MB/min; 618 MB |
+| 31 turns over TLS (`NODE_EXTRA_CA_CERTS`), each answer streamed for 30 s in 1,500 pieces | 15 min | retained +1.25 MB/min, heap +0.14 MB/min; 328 MB | retained +1.64 MB/min, heap +0.32 MB/min; 356 MB |
+
+Both sides grow, and by the same objects at the same rates, because a
+session keeps its transcript and its agents' transcripts. The artifact holds
+100-150 MB more outside the JS heap, which does not grow with time: in the
+workflow run it was 375 MB at 4 min and 356 MB at 25 min. Nothing here comes
+within a factor of ten of 60 MB/min. Do not compare mimalloc's `commit`
+across Buns: in the TLS run it reached 4.5 GB on native's 1.4.3 while its RSS
+stayed at 330 MB, because 1.4 counts purged pages there. On the artifact it
+held at 116 MB.
+
+**Ruled out on the way**, each by measurement or by reading the bundle:
+
+- The pipeline's rewrites. Relative and absolute specifiers resolve and cache
+  alike, no `import()` busts the module cache, text modules are evaluated
+  once, and no self-spawn runs per turn.
+- The platform-folded darwin tree (2,213 modules). It has the same fast timers
+  as linux (1, 50, 150 and 200 ms), and its macOS-only periodic work
+  (caffeinate, the MDM poll, the keychain, pbpaste) runs too rarely.
+- `Bun.ant.memoryPressureLevel`, which only feeds the background-session
+  low-memory check. The polyfill throwing there means "no data".
+- The CellSegmenter port's intern tables. They are append-only in native too,
+  and Ink resets the instance past 16,384 keys.
+
+**Found and fixed: the CellSegmenter port's key trie.** The trie was keyed by
+the identity of canonical entry objects, and those come from a module-wide
+cache cleared at 8,192 entries. After a clear, the same strings parsed to new
+objects, and the trie grew a second branch per list on every wrap. `sgrKeys`,
+which is deduplicated by string, stayed flat, so Ink's resets never saw it.
+One segmenter with a 1,500-list working set, replayed across six wraps, went
+from 1,508 to 10,508 live `Map`s. After the fix it stays at 1,508, with
+identical output (`tests/test_cell_segmenter.py`). Real palettes rarely wrap
+the cache: a 5-hour, 20 fps spinner simulation used 284 keys. So this is a
+real divergence, but not the 18 GB.
+
+**Stock Bun 1.3.14 does leak, just not on this path.** Cloning a fetch
+`Response` and reading the clone leaks natively. 20 rounds of 400 requests
+with a 50 KB JSON body, read as `r.clone().json()`:
+
+| runtime | RSS over the 20 rounds | mimalloc commit | plain `r.json()` |
+|---|---|---|---|
+| 1.3.14 | 88 → 250 MB, linear | 59 → 318 MB | 41-54 MB, flat |
+| 1.4.0 | flat around 28-40 MB (6 rounds) | | flat |
+| 1.4.3, native's runtime, through the preload | flat around 45-50 MB (6 rounds) | | flat |
+
+The Anthropic SDK clones only in its middleware path, and only the Bedrock,
+Vertex and Foundry clients install middleware. A direct-API session parses
+through `Cr`, which reads a streamed or JSON body without a clone. The other
+two clone-and-read sites answer an MCP `needs_consent` error. A second 1.3.14
+leak, `releaseLock()` without `cancel()` on a partly read body (Bun PR
+#32582), is reached only through remote transports and the AWS and Azure
+helpers.
+
+**macOS: what is known.** The native binary runs Anthropic's Bun 1.4.3 (§14).
+Bun 1.4.0 moved JavaScriptCore from libpas onto mimalloc and added a
+scavenger thread that returns memory while JavaScript idles; stock 1.3.14 has
+neither. The native binary has a `mi-scavenger` thread; the artifact under
+1.3.14 has none. On macOS, mimalloc tags its regions VM_MEMORY_IOACCELERATOR
+(tag 100), so `vmmap` files Bun's native allocations under "IOAccelerator".
+The open Bun reports of Ink apps growing on Apple Silicon (#28234, #28318)
+describe that growth. So does an opencode report of about 1 GB/h on stock
+Bun. All of this points at the runtime on macOS, and **none of it is
+measured on the Mac that saw 18 GB**.
+
+**What would settle it** is [the runbook's recipe](runbook.md#measuring-memory-macos-included):
+the probe in a real session, `vmmap -summary` at two points in time, and the
+same artifact under a Bun 1.4. A flat JS heap under a climbing footprint puts
+the growth in the runtime. A climbing heap names the object types that grow.
+
 ---
 
 ## Appendix: exact commands used ✅

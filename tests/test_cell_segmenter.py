@@ -60,3 +60,46 @@ def test_the_port_is_not_a_native_passthrough(bun_bin, tmp_path):
     r = subprocess.run([bun_bin, str(probe)], capture_output=True, text=True, timeout=60,
                        env={"PATH": "/usr/bin:/bin"})
     assert r.stdout.strip() == "undefined", "this Bun already has Bun.ant - the test would prove nothing"
+
+
+TRIE_PROBE = r"""
+import { CellSegmenter } from "%s";
+import { heapStats } from "bun:jsc";
+// One segmenter, as Ink keeps one per Output. The working set is W two-entry
+// SGR lists (a truecolour foreground over one fixed background), so every
+// first-level node of the key trie owns a Map. Between replays of that set,
+// 9000 fresh truecolours wrap the module's 8192-entry cache of canonical
+// entries - after which the same strings parse to NEW entry objects.
+const seg = new CellSegmenter();
+const cells = new Int32Array(4096), runs = new Int32Array(4096);
+const W = 1500;
+const work = (i) => `\x1b[38;2;${i & 255};${i >> 8};7m\x1b[48;5;17mx`;
+const fresh = (round, i) => `\x1b[38;2;${i & 255};${(i >> 8) & 255};${100 + round}mx`;
+const maps = () => { Bun.gc(true); return heapStats().objectTypeCounts.Map ?? 0; };
+for (let i = 0; i < W; i++) seg.segment(work(i), cells, runs);
+const before = maps();
+for (let round = 0; round < 6; round++) {
+  for (let i = 0; i < 9000; i++) seg.segment(fresh(round, i), cells, runs);
+  for (let i = 0; i < W; i++) seg.segment(work(i), cells, runs);
+}
+console.log(JSON.stringify({ W, before, after: maps(), sgrKeys: seg.sgrKeys.length }));
+"""
+
+
+def test_the_key_trie_does_not_grow_when_the_entry_cache_wraps(bun_bin, tmp_path):
+    """The port interns SGR lists through a per-instance trie keyed by the
+    IDENTITY of canonical entry objects, which come from a module-wide cache
+    cleared at 8192 entries. Once it wraps, the same strings parse to new
+    objects: the trie grew a second branch for every list it knew, on every
+    wrap, while sgrKeys (deduplicated by string) stayed flat - so Ink's
+    size-based resets never saw it. Native has no such trie. Measured before
+    the fix: +W Maps per wrap, without bound."""
+    probe = tmp_path / "trie.mjs"
+    probe.write_text(TRIE_PROBE % os.path.join(ROOT, "scripts", "bun-ant-cell-segmenter.mjs"))
+    r = subprocess.run([bun_bin, str(probe)], capture_output=True, text=True, timeout=120,
+                       env={"PATH": "/usr/bin:/bin"})
+    assert r.returncode == 0, r.stderr
+    m = json.loads(r.stdout)
+    # the lists themselves are all new, so sgrKeys grows exactly as native's does
+    assert m["sgrKeys"] == 1 + m["W"] + 6 * 9000, m
+    assert m["after"] - m["before"] < m["W"] // 4, m
