@@ -541,7 +541,9 @@ objects and ArrayBuffers, and `MALLOC_*` is the system allocator.
 **4. The same artifact on a Bun 1.4.** Unpack a Bun 1.4.x into its own
 directory, off `PATH`, as in step 1, and run the same `build/extract/cli.js`
 with it for the same kind of work. If the growth disappears, Bun 1.3.14's
-allocators are the cause. `scripts/memsoak.py` automates this comparison with
+allocators are the cause. Compare `footprint`, not `mimalloc`: a Bun 1.4
+counts purged pages in the latter, and native's reached 4.5 GB at an RSS of
+330 MB in a 15-minute run. `scripts/memsoak.py` automates this comparison with
 a loopback mock:
 
 ```bash

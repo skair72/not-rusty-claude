@@ -1653,12 +1653,16 @@ Bun 1.3.14. "Retained" is RSS after the forced GC.
 | 200 turns: a Bash step, then a markdown answer streamed in 40 pieces | 6-7 min | 348 MB at the end; +262 KB RSS and +93 KB heap per turn | 357 MB; +286 KB RSS and -0.7 KB heap per turn |
 | 2 turns whose Bash step sleeps 500 s, spinner animating | 17.7 min | 255 → 292 MB; retained +2.4 MB/min | 286 → 303 MB; retained +1.5 MB/min |
 | 99-108 turns, each a workflow of 4 in-process agents | 25 min | retained +4.7 MB/min, heap +1.8 MB/min; 514 MB | retained +5.7 MB/min, heap +1.7 MB/min; 618 MB |
+| 31 turns over TLS (`NODE_EXTRA_CA_CERTS`), each answer streamed for 30 s in 1,500 pieces | 15 min | retained +1.25 MB/min, heap +0.14 MB/min; 328 MB | retained +1.64 MB/min, heap +0.32 MB/min; 356 MB |
 
 Both sides grow, and by the same objects at the same rates, because a
 session keeps its transcript and its agents' transcripts. The artifact holds
 100-150 MB more outside the JS heap, which does not grow with time: in the
 workflow run it was 375 MB at 4 min and 356 MB at 25 min. Nothing here comes
-within a factor of ten of 60 MB/min.
+within a factor of ten of 60 MB/min. Do not compare mimalloc's `commit`
+across Buns: in the TLS run it reached 4.5 GB on native's 1.4.3 while its RSS
+stayed at 330 MB, because 1.4 counts purged pages there. On the artifact it
+held at 116 MB.
 
 **Ruled out on the way**, each by measurement or by reading the bundle:
 
