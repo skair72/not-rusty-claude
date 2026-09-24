@@ -35,12 +35,28 @@
 //   --log-bodies PATH   NRC_MOCK_LOG_BODIES  append every request body as JSONL
 //   --ready-file PATH   NRC_MOCK_READY_FILE  write the chosen port here once listening
 //
+// Soak flags (scripts/memsoak.py), all off by default:
+//   --every-turn        NRC_MOCK_EVERY_TURN  call the tool on EVERY user turn, not
+//                                            only until the first tool_result
+//   --deltas N          NRC_MOCK_DELTAS      stream the final text in N pieces
+//   --delta-ms M        NRC_MOCK_DELTA_MS    ... M ms apart
+//   A "{turn}" in --text becomes the number of user turns in the transcript.
+//   --sub-marker STR    NRC_MOCK_SUB_MARKER  a transcript whose user text holds STR
+//                                            is a subagent's: it is answered with
+//   --sub-tool NAME     NRC_MOCK_SUB_TOOL    this tool (a preset name or any tool,
+//   --sub-tool-input J  NRC_MOCK_SUB_TOOL_INPUT  with this input), then with
+//   --sub-text STR      NRC_MOCK_SUB_TEXT    this text (default SUBAGENT-DONE)
+//   --tls-cert PATH     NRC_MOCK_TLS_CERT    serve HTTPS with this PEM certificate
+//   --tls-key PATH      NRC_MOCK_TLS_KEY     ... and this key (the client must trust
+//                                            the certificate: NODE_EXTRA_CA_CERTS)
+//
 // On listen it prints two lines to stdout, in this order:
 //   PORT <n>
 //   BASE_URL http://127.0.0.1:<n>
 // A caller that wants the port without parsing stdout should use --ready-file.
 
 import http from "node:http";
+import https from "node:https";
 import fs from "node:fs";
 
 // ---------------------------------------------------------------- arguments
@@ -68,6 +84,11 @@ const PORT = Number(opt("port", "NRC_MOCK_PORT", 0));
 const LOG = opt("log", "NRC_MOCK_LOG", null);
 const LOG_BODIES = opt("log-bodies", "NRC_MOCK_LOG_BODIES", null);
 const READY_FILE = opt("ready-file", "NRC_MOCK_READY_FILE", null);
+const EVERY_TURN = !!opt("every-turn", "NRC_MOCK_EVERY_TURN", "");
+const DELTAS = Math.max(1, Number(opt("deltas", "NRC_MOCK_DELTAS", 1)) | 0);
+const DELTA_MS = Math.max(0, Number(opt("delta-ms", "NRC_MOCK_DELTA_MS", 0)));
+const SUB_MARKER = opt("sub-marker", "NRC_MOCK_SUB_MARKER", null);
+const SUB_TEXT = String(opt("sub-text", "NRC_MOCK_SUB_TEXT", "SUBAGENT-DONE"));
 
 // Presets keyed by lowercase alias. `name` is the tool name as Claude Code
 // registers it; sending anything else makes the CLI answer its own request with
@@ -110,6 +131,22 @@ if (TOOL && TOOL !== "none") {
       process.exit(2);
     }
   }
+}
+
+function makeToolCall(name, inputRaw) {
+  if (!name || name === "none") return null;
+  const preset = PRESETS[String(name).toLowerCase()];
+  const call = preset ? { name: preset.name, input: preset.input } : { name, input: {} };
+  if (inputRaw) call.input = JSON.parse(inputRaw);
+  return call;
+}
+
+let subToolCall = null;
+try {
+  subToolCall = makeToolCall(opt("sub-tool", "NRC_MOCK_SUB_TOOL", null), opt("sub-tool-input", "NRC_MOCK_SUB_TOOL_INPUT", null));
+} catch (e) {
+  console.error(`mock: --sub-tool-input is not JSON: ${e.message}`);
+  process.exit(2);
 }
 
 function log(line) {
@@ -234,6 +271,32 @@ function textBlock(res, index, text) {
   sse(res, "content_block_stop", { type: "content_block_stop", index });
 }
 
+// The same block in DELTAS pieces, DELTA_MS apart; then done().
+function streamTextBlock(res, index, text, done) {
+  sse(res, "content_block_start", {
+    type: "content_block_start",
+    index,
+    content_block: { type: "text", text: "" },
+  });
+  const size = Math.ceil(text.length / DELTAS);
+  let at = 0;
+  const step = () => {
+    if (at >= text.length) {
+      sse(res, "content_block_stop", { type: "content_block_stop", index });
+      done();
+      return;
+    }
+    sse(res, "content_block_delta", {
+      type: "content_block_delta",
+      index,
+      delta: { type: "text_delta", text: text.slice(at, at + size) },
+    });
+    at += size;
+    setTimeout(step, DELTA_MS);
+  };
+  step();
+}
+
 function toolUseBlock(res, index, id, name, input) {
   sse(res, "content_block_start", {
     type: "content_block_start",
@@ -276,6 +339,43 @@ function messageEnd(res, stopReason, outputTokens) {
 // keep the run off the network. A failing request is re-sent on top of that. A
 // counter would answer the wrong request in one configuration or the other and
 // the loop would never reach its final text.
+// A user turn is a user message that is not only tool results.
+function userTurns(body) {
+  const messages = Array.isArray(body?.messages) ? body.messages : [];
+  let n = 0;
+  for (const m of messages) {
+    if (m?.role !== "user") continue;
+    const c = m.content;
+    if (!Array.isArray(c) || c.some((b) => b && b.type !== "tool_result")) n++;
+  }
+  return n;
+}
+
+// The last user message, that is: a system-role message may follow it.
+// The text a user typed (or an agent was prompted with): text blocks only,
+// never tool results, which may quote anything.
+function userText(body) {
+  const messages = Array.isArray(body?.messages) ? body.messages : [];
+  let out = "";
+  for (const m of messages) {
+    if (m?.role !== "user") continue;
+    if (typeof m.content === "string") out += m.content;
+    else if (Array.isArray(m.content)) for (const b of m.content) if (b?.type === "text") out += b.text;
+  }
+  return out;
+}
+
+function lastMessageHasToolResult(body) {
+  const messages = Array.isArray(body?.messages) ? body.messages : [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m?.role === "system") continue;
+    const c = m?.role === "user" ? m.content : null;
+    return Array.isArray(c) && c.some((b) => b && b.type === "tool_result");
+  }
+  return false;
+}
+
 function transcriptHasToolResult(body) {
   const messages = Array.isArray(body?.messages) ? body.messages : [];
   for (const m of messages) {
@@ -306,12 +406,16 @@ function handleMessages(req, res, bodyText) {
   // this request is the agentic loop, and it holds whether or not the title
   // request was suppressed.
   const offersTools = Array.isArray(body.tools) && body.tools.length > 0;
-  const wantToolCall = toolCall !== null && offersTools && !transcriptHasToolResult(body);
+  const answered = EVERY_TURN ? lastMessageHasToolResult(body) : transcriptHasToolResult(body);
+  const sub = SUB_MARKER !== null && userText(body).includes(SUB_MARKER);
+  const call = sub ? subToolCall : toolCall;
+  const wantToolCall = call !== null && offersTools && !answered;
+  const finalText = (sub ? SUB_TEXT : FINAL_TEXT).replaceAll("{turn}", String(userTurns(body)));
 
   log(
     `REQ ${req.method} ${req.url} stream=${body.stream === true} ` +
       `msgs=${(body.messages || []).length} toolResult=${transcriptHasToolResult(body)} ` +
-      `-> ${wantToolCall ? "tool_use:" + toolCall.name : "text"}`,
+      `${sub ? "sub " : ""}-> ${wantToolCall ? "tool_use:" + call.name : "text"}`,
   );
 
   // Diagnostic only - we still send the tool_use. Measured on 2.1.222: the CLI
@@ -323,8 +427,8 @@ function handleMessages(req, res, bodyText) {
   // tells you that is what happened.
   if (wantToolCall) {
     const offered = body.tools.map((t) => t && t.name);
-    if (!offered.includes(toolCall.name)) {
-      log(`WARN client did not offer tool ${toolCall.name}; offered: ${offered.join(",")}`);
+    if (!offered.includes(call.name)) {
+      log(`WARN client did not offer tool ${call.name}; offered: ${offered.join(",")}`);
     }
   }
 
@@ -333,8 +437,8 @@ function handleMessages(req, res, bodyText) {
     // POST with 404, the CLI re-sent the identical body with `stream` absent.
     // A non-streaming request answered with an SSE body has no reason to parse.
     const content = wantToolCall
-      ? [{ type: "tool_use", id: `toolu_mock_${++messageSeq}`, name: toolCall.name, input: toolCall.input }]
-      : [{ type: "text", text: FINAL_TEXT }];
+      ? [{ type: "tool_use", id: `toolu_mock_${++messageSeq}`, name: call.name, input: call.input }]
+      : [{ type: "text", text: finalText }];
     const payload = {
       id: `msg_mock_${messageSeq}`,
       type: "message",
@@ -358,17 +462,28 @@ function handleMessages(req, res, bodyText) {
 
   messageStart(res, model);
   if (wantToolCall) {
-    toolUseBlock(res, 0, `toolu_mock_${messageSeq}`, toolCall.name, toolCall.input);
+    toolUseBlock(res, 0, `toolu_mock_${messageSeq}`, call.name, call.input);
     messageEnd(res, "tool_use", 8);
+  } else if (DELTAS > 1) {
+    streamTextBlock(res, 0, finalText, () => messageEnd(res, "end_turn", 4));
   } else {
-    textBlock(res, 0, FINAL_TEXT);
+    textBlock(res, 0, finalText);
     messageEnd(res, "end_turn", 4);
   }
 }
 
 // ------------------------------------------------------------------ server
 
-const server = http.createServer((req, res) => {
+const TLS_CERT = opt("tls-cert", "NRC_MOCK_TLS_CERT", null);
+const TLS_KEY = opt("tls-key", "NRC_MOCK_TLS_KEY", null);
+const SCHEME = TLS_CERT ? "https" : "http";
+
+function createServer(handler) {
+  if (!TLS_CERT) return http.createServer(handler);
+  return https.createServer({ cert: fs.readFileSync(TLS_CERT), key: fs.readFileSync(TLS_KEY) }, handler);
+}
+
+const server = createServer((req, res) => {
   const chunks = [];
   req.on("data", (c) => chunks.push(c));
   req.on("end", () => {
@@ -415,7 +530,7 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, "127.0.0.1", () => {
   const port = server.address().port;
   process.stdout.write(`PORT ${port}\n`);
-  process.stdout.write(`BASE_URL http://127.0.0.1:${port}\n`);
+  process.stdout.write(`BASE_URL ${SCHEME}://127.0.0.1:${port}\n`);
   if (READY_FILE) fs.writeFileSync(READY_FILE, String(port));
 });
 
