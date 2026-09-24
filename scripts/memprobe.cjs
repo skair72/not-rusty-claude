@@ -14,11 +14,19 @@
 //   heapSize   JSC's live heap after the GC - what JavaScript retains
 //   extra      JSC's extraMemorySize: buffers and strings owned outside the
 //              cell heap but reported to the GC
-//   malloc     bun:jsc memoryUsage(): WebKit's allocator (bmalloc/libpas),
-//              current and committed bytes. Memory the GC freed but the
-//              allocator kept shows up here and not in heapSize.
+//   malloc     bun:jsc memoryUsage(), which is mimalloc's process info:
+//              `current` is the process RSS again, `commit` what mimalloc
+//              itself holds committed - Bun's native side (sockets, fetch and
+//              stream buffers). Measured under 1.3.14: it does not move for
+//              JS strings, objects, Buffers or Response bodies, which JSC
+//              allocates elsewhere (libpas). Compare it within one Bun only:
+//              on 1.4 it also counts purged pages.
 //   objects    live cell count after the GC
 //   types      every object type with its live count, for diffing two samples
+//
+// Every line carries the pid: BUN_OPTIONS reaches every bun a session spawns,
+// so a log can hold more than one process. (`bun --preload` on the command
+// line does not propagate; that is the way to probe one real session.)
 //
 // The GC is forced so that a sample measures what is retained, not how far
 // behind the collector happens to be. Main thread only; the timer is unref'd,
@@ -69,6 +77,7 @@ if (out && isMain) {
     const h = jsc.heapStats();
     const m = typeof jsc.memoryUsage === "function" ? jsc.memoryUsage() : null;
     fs.appendFileSync(out, JSON.stringify({
+      pid: process.pid,
       t: Date.now() - t0,
       rss,
       rssGc: process.memoryUsage.rss(),

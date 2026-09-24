@@ -480,6 +480,75 @@ Two things to expect:
 
 ---
 
+## Measuring memory (macOS included)
+
+A long session that grows to many gigabytes has been reported on macOS and
+not reproduced on Linux ([findings §15](findings.md)). These steps decide
+where the memory is. None of them has been run on a Mac from this repo yet.
+
+**1. Which number is large, and in which process.** Activity Monitor's
+"Memory" column is the physical footprint; `ps` shows resident memory, which
+leaves compressed and swapped pages out. With the session running:
+
+```bash
+ps -axo pid,ppid,rss,etime,command | grep '[c]li.js'    # one process, or several?
+vmmap -summary <pid> | grep 'Physical footprint'
+```
+
+**2. Probe a real session.** `--preload` on the command line reaches this one
+process and not the children it spawns. The probe forces a full GC once a
+minute, which costs a pause of tens of milliseconds.
+
+```bash
+NRC_MEMPROBE_OUT="$HOME/claude-mem.jsonl" NRC_MEMPROBE_MS=60000 DISABLE_AUTOUPDATER=1 \
+  "$BUN_BIN" --no-install --preload "$PWD/scripts/memprobe.cjs" build/extract/cli.js
+```
+
+Work as usual, then summarise the log (sizes in MB):
+
+```bash
+python3 - "$HOME/claude-mem.jsonl" <<'EOF'
+import json, sys
+mb = lambda x: round((x or 0) / 2**20)
+for line in open(sys.argv[1]):
+    r = json.loads(line)
+    print(r["pid"], "%4d min" % (r["t"] // 60000), "footprint", mb(r["footprint"]),
+          "heap", mb(r["heapSize"]), "extra", mb(r["extra"]),
+          "mimalloc", mb((r["malloc"] or {}).get("commit")))
+EOF
+```
+
+| what grows | where the memory is |
+|---|---|
+| `heap` | JavaScript keeps it. Diff `types` between an early line and a late one to see which objects grow |
+| `footprint` while `heap` and `extra` stay flat | the runtime's allocators, not Claude's objects |
+| ... and `mimalloc` climbs with it | Bun's native side: sockets, fetch and stream buffers |
+| ... and `mimalloc` stays flat | JavaScriptCore's own allocator (libpas) |
+
+`footprint` is read through `proc_pid_rusage`. If it prints 0 on every line,
+that read failed; use `vmmap` instead.
+
+**3. The allocator rows**, twice, an hour apart:
+
+```bash
+vmmap -summary <pid> | grep -E 'Physical footprint|IOAccelerator|WebKit Malloc|JS VM Gigacage|MALLOC_|TOTAL'
+```
+
+On macOS, mimalloc tags its memory as `IOAccelerator`, so that row is Bun's
+native side, not a GPU. `WebKit Malloc` is libpas, `JS VM Gigacage` holds JS
+objects and ArrayBuffers, and `MALLOC_*` is the system allocator.
+
+**4. The same artifact on a Bun 1.4.** Unpack a Bun 1.4.x into its own
+directory, off `PATH`, as in step 1, and run the same `build/extract/cli.js`
+with it for the same kind of work. If the growth disappears, Bun 1.3.14's
+allocators are the cause. `scripts/memsoak.py` automates this comparison with
+a loopback mock:
+
+```bash
+scripts/memsoak.py --native ~/.local/bin/claude --bun "$BUN_BIN" --mode workflow --minutes 30 \
+  --sides native,artifact,artifact@"$HOME/.bun-1.4.x/bun"
+```
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
